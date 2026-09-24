@@ -8,7 +8,7 @@ import urllib.error
 from datetime import datetime, timedelta
 
 # 🔑 DEINEN GOOGLE API KEY HIER EINFÜGEN ODER ALS UMGEBUNGSVARIABLE SETZEN:
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "DEIN_API_KEY_HIER")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCOHKdh3i_QjAaiM2On-5fEjbogeSLXOZ0")
 DB_NAME = "buecherei_system.db"
 
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
