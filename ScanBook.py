@@ -13,7 +13,7 @@ DB_NAME = "buecherei_system.db"
 
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
 # Ersetze DEIN_GITHUB_BENUTZERNAME durch deinen echten GitHub-Namen
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/denismikucewicz/ScanBook/main/scanbook.py"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/djdenioooo/scanbook/refs/heads/main/ScanBook.py"
 
 # --- AUTOMATISCHES UPDATE SYSTEM ---
 def checkForUpdates():
@@ -375,7 +375,7 @@ def main():
     init_db()
 
     while True:
-        print("\n=== 📚 BÜCHEREI- & AUSLEIH-SYSTEM ===")
+        print("\n=== 📚 ScanBook SGA ===")
         print("1. Bücher scannen / Bestand aufstocken")
         print("2. Gesamten Katalog anzeigen (nach Autor)")
         print("3. Buch AUSLEIHEN")
