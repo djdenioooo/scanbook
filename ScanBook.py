@@ -16,89 +16,6 @@ DB_NAME = "buecherei_system.db"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/djdenioooo/scanbook/refs/heads/main/ScanBook.py"
 
 
- # NEU: Tabelle für Stammdaten / Einstellungen
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS einstellungen (
-            schluessel TEXT PRIMARY KEY,
-            wert TEXT
-        )
-    ''')
-
-    # Standard-Stammdaten anlegen, falls noch nicht vorhanden
-    defaults = {
-        "schulname": "Muster-Gymnasium",
-        "bib_name": "Schulbibliothek",
-        "adresse": "Schulstraße 1, 12345 Musterstadt",
-        "kontakt_email": "bibliothek@schule.de"
-    }
-
-    for key, val in defaults.items():
-        cursor.execute("INSERT OR IGNORE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (key, val))
-
-    conn.commit()
-    conn.close()
-
-# --- HELFER: STAMMDATEN LADEN & SPEICHERN ---
-def get_einstellung(schluessel, default=""):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT wert FROM einstellungen WHERE schluessel = ?", (schluessel,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-def set_einstellung(schluessel, wert):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (schluessel, wert))
-    conn.commit()
-    conn.close()
-
-# --- STAMMDATEN VERWALTEN (MENÜ) ---
-def manage_stammdaten():
-    while True:
-        schulname = get_einstellung("schulname")
-        bib_name = get_einstellung("bib_name")
-        adresse = get_einstellung("adresse")
-        email = get_einstellung("kontakt_email")
-
-        print("\n" + "=" * 50)
-        print("⚙️ STAMMDATEN VERWALTEN")
-        print("=" * 50)
-        print(f"1. Schulname:       {schulname}")
-        print(f"2. Bibliotheksname: {bib_name}")
-        print(f"3. Adresse:         {adresse}")
-        print(f"4. E-Mail:          {email}")
-        print("5. Zurück zum Hauptmenü")
-
-        wahl = input("\nWelchen Eintrag möchtest du ändern? (1-5): ").strip()
-
-        if wahl == "1":
-            neu = input("Neuer Schulname: ").strip()
-            if neu:
-                set_einstellung("schulname", neu)
-                print("✅ Schulname aktualisiert!")
-        elif wahl == "2":
-            neu = input("Neuer Bibliotheksname: ").strip()
-            if neu:
-                set_einstellung("bib_name", neu)
-                print("✅ Bibliotheksname aktualisiert!")
-        elif wahl == "3":
-            neu = input("Neue Adresse: ").strip()
-            if neu:
-                set_einstellung("adresse", neu)
-                print("✅ Adresse aktualisiert!")
-        elif wahl == "4":
-            neu = input("Neue Kontakt-E-Mail: ").strip()
-            if neu:
-                set_einstellung("kontakt_email", neu)
-                print("✅ E-Mail aktualisiert!")
-        elif wahl == "5":
-            break
-        else:
-            print("Ungültige Eingabe.")
-
-
 # --- AUTOMATISCHES UPDATE SYSTEM ---
 def checkForUpdates():
     print("\n" + "=" * 50)
@@ -195,6 +112,90 @@ def init_db():
             FOREIGN KEY(isbn) REFERENCES buecher(isbn)
         )
     ''')
+
+ # NEU: Tabelle für Stammdaten / Einstellungen
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS einstellungen (
+            schluessel TEXT PRIMARY KEY,
+            wert TEXT
+        )
+    ''')
+
+    # Standard-Stammdaten anlegen, falls noch nicht vorhanden
+    defaults = {
+        "schulname": "Muster-Gymnasium",
+        "bib_name": "Schulbibliothek",
+        "adresse": "Schulstraße 1, 12345 Musterstadt",
+        "kontakt_email": "bibliothek@schule.de"
+    }
+
+    for key, val in defaults.items():
+        cursor.execute("INSERT OR IGNORE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (key, val))
+
+    conn.commit()
+    conn.close()
+
+# --- HELFER: STAMMDATEN LADEN & SPEICHERN ---
+def get_einstellung(schluessel, default=""):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT wert FROM einstellungen WHERE schluessel = ?", (schluessel,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_einstellung(schluessel, wert):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (schluessel, wert))
+    conn.commit()
+    conn.close()
+
+# --- STAMMDATEN VERWALTEN (MENÜ) ---
+def manage_stammdaten():
+    while True:
+        schulname = get_einstellung("schulname")
+        bib_name = get_einstellung("bib_name")
+        adresse = get_einstellung("adresse")
+        email = get_einstellung("kontakt_email")
+
+        print("\n" + "=" * 50)
+        print("⚙️ STAMMDATEN VERWALTEN")
+        print("=" * 50)
+        print(f"1. Schulname:       {schulname}")
+        print(f"2. Bibliotheksname: {bib_name}")
+        print(f"3. Adresse:         {adresse}")
+        print(f"4. E-Mail:          {email}")
+        print("5. Zurück zum Hauptmenü")
+
+        wahl = input("\nWelchen Eintrag möchtest du ändern? (1-5): ").strip()
+
+        if wahl == "1":
+            neu = input("Neuer Schulname: ").strip()
+            if neu:
+                set_einstellung("schulname", neu)
+                print("✅ Schulname aktualisiert!")
+        elif wahl == "2":
+            neu = input("Neuer Bibliotheksname: ").strip()
+            if neu:
+                set_einstellung("bib_name", neu)
+                print("✅ Bibliotheksname aktualisiert!")
+        elif wahl == "3":
+            neu = input("Neue Adresse: ").strip()
+            if neu:
+                set_einstellung("adresse", neu)
+                print("✅ Adresse aktualisiert!")
+        elif wahl == "4":
+            neu = input("Neue Kontakt-E-Mail: ").strip()
+            if neu:
+                set_einstellung("kontakt_email", neu)
+                print("✅ E-Mail aktualisiert!")
+        elif wahl == "5":
+            break
+        else:
+            print("Ungültige Eingabe.")
+
+ 
     conn.commit()
     conn.close()
 
