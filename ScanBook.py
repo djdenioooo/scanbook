@@ -44,7 +44,7 @@ def checkForUpdates():
         if bestaetigung == 'j':
             # 1. Backup erstellen
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = f"{current_script}.bak_{timestamp}"
+            backup_file = f"{current_script}.bak_{timestamp}.py"
             with open(backup_file, 'w', encoding='utf-8') as f:
                 f.write(local_code)
             print(f"📦 Backup gespeichert unter: {os.path.basename(backup_file)}")
