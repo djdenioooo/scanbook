@@ -1,4 +1,4 @@
-import os
+    import os
 import re
 import sys
 import csv
@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # 🔑 DEINEN GOOGLE API KEY HIER EINFÜGEN ODER ALS UMGEBUNGSVARIABLE SETZEN:
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCOHKdh3i_QjAaiM2On-5fEjbogeSLXOZ0")
@@ -983,6 +983,34 @@ def exportiere_csv(praefix, kopfzeile, zeilen):
     print(f"✅ {len(zeilen)} Zeile(n) exportiert nach: {pfad}")
 
 
+def export_daten(typ):
+    """Liefert (Kopfzeile, Zeilen) für 'katalog', 'ausleihen' oder 'mahnliste'."""
+    with db_connection() as conn:
+        if typ == "katalog":
+            zeilen = conn.execute('''
+                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar
+                FROM buecher ORDER BY autor_nachname, titel
+            ''').fetchall()
+            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Exemplare", "Verfügbar"], zeilen
+
+        sql = '''
+            SELECT a.ausleiher, b.titel, a.isbn, a.ausgeliehen_am, a.rueckgabe_bis
+            FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn
+            WHERE a.status = 'aktiv'
+        '''
+        params = ()
+        if typ == "mahnliste":
+            sql += " AND a.rueckgabe_bis < ?"
+            params = (heute().isoformat(),)
+        rohdaten = conn.execute(sql + " ORDER BY a.ausleiher, a.rueckgabe_bis", params).fetchall()
+
+    zeilen = [
+        (name, titel, isbn, de_datum(von), de_datum(bis), max(0, (heute() - date.fromisoformat(bis)).days))
+        for name, titel, isbn, von, bis in rohdaten
+    ]
+    return ["Ausleiher", "Titel", "ISBN", "Geliehen am", "Rückgabe bis", "Tage überfällig"], zeilen
+
+
 def export_menu():
     ueberschrift("📄 EXPORT (CSV / EXCEL)")
     print("1. Gesamter Katalog")
@@ -991,35 +1019,11 @@ def export_menu():
     print("4. Zurück zum Hauptmenü")
     wahl = input("\nWähle eine Option (1-4): ").strip()
 
-    with db_connection() as conn:
-        if wahl == "1":
-            zeilen = conn.execute('''
-                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar
-                FROM buecher ORDER BY autor_nachname, titel
-            ''').fetchall()
-            kopf = ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Exemplare", "Verfügbar"]
-            praefix = "katalog"
-        elif wahl in ("2", "3"):
-            sql = '''
-                SELECT a.ausleiher, b.titel, a.isbn, a.ausgeliehen_am, a.rueckgabe_bis
-                FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn
-                WHERE a.status = 'aktiv'
-            '''
-            params = ()
-            if wahl == "3":
-                sql += " AND a.rueckgabe_bis < ?"
-                params = (heute().isoformat(),)
-            rohdaten = conn.execute(sql + " ORDER BY a.ausleiher, a.rueckgabe_bis", params).fetchall()
-            zeilen = [
-                (name, titel, isbn, de_datum(von), de_datum(bis), max(0, (heute() - date.fromisoformat(bis)).days))
-                for name, titel, isbn, von, bis in rohdaten
-            ]
-            kopf = ["Ausleiher", "Titel", "ISBN", "Geliehen am", "Rückgabe bis", "Tage überfällig"]
-            praefix = "mahnliste" if wahl == "3" else "ausleihen"
-        else:
-            return
-
-    exportiere_csv(praefix, kopf, zeilen)
+    typ = {"1": "katalog", "2": "ausleihen", "3": "mahnliste"}.get(wahl)
+    if not typ:
+        return
+    kopf, zeilen = export_daten(typ)
+    exportiere_csv(typ, kopf, zeilen)
 
 
 # --- DATENBANK-BACKUP ---

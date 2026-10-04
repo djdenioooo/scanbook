@@ -22,6 +22,14 @@ Möglicherweise, wird daraus ein Großprojekt, alles Kostenlos und für jeden zu
    python3 ScanBook.py
    ```
 
+### Oberfläche im Browser (empfohlen)
+
+```
+python3 ScanBook_Web.py
+```
+
+Der Browser öffnet sich automatisch mit der ScanBook-Oberfläche. Beenden mit Strg+C im Terminal. Die Oberfläche läuft nur auf dem eigenen Rechner (`localhost`) und ist von anderen Geräten im Netzwerk nicht erreichbar. Beide Varianten – Terminal und Browser – benutzen dieselbe Datenbank und können abwechselnd verwendet werden.
+
 Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`exporte/`) werden automatisch im selben Ordner wie das Programm angelegt – egal, von wo aus es gestartet wird.
 
 ## Funktionen
