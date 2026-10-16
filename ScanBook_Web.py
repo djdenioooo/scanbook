@@ -94,11 +94,19 @@ def api_books(params):
         werte = (muster,) * 6
     with sb.db_connection() as conn:
         rows = conn.execute(sql + " ORDER BY autor_nachname, titel", werte).fetchall()
-    return [
-        {"autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
-         "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10]}
-        for r in rows
-    ]
+    plan = sb.regal_plan()
+    orte = sb.standorte(plan)
+    regal_nr = {r["id"]: i for i, r in enumerate(plan["regale"])}
+    regal_name = {r["id"]: r["name"] for r in plan["regale"]}
+    buecher = []
+    for r in rows:
+        ort, regal_id, geplant = orte.get(r[6], ("", None, False))
+        buecher.append({
+            "autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
+            "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10],
+            "standort": ort, "geplant": geplant, "regal": regal_name.get(regal_id, ""), "regal_nr": regal_nr.get(regal_id, -1),
+        })
+    return buecher
 
 
 def api_book(params):
@@ -421,7 +429,42 @@ def api_settings_save(body):
 
 
 def api_backup(_):
-    return {"pfad": sb.erstelle_backup()}
+    pfad = sb.erstelle_backup()
+    return {"pfad": pfad, "kopie_fehler": sb.backup_status["kopie_fehler"]}
+
+
+def api_backups(_):
+    liste = sb.backups_liste()
+    return {
+        "ordner": sb.BACKUP_DIR,
+        "anzahl": len(liste),
+        "letztes": liste[0][1].isoformat(timespec="minutes") if liste else "",
+        "behalten": sb.MAX_AUTO_BACKUPS,
+        "zweiter_ordner": sb.zweiter_backup_ordner(),
+        "kopie_fehler": sb.backup_status["kopie_fehler"],
+    }
+
+
+def api_backup_ordner(body):
+    ordner = text(body, "ordner").strip('"')
+    if ordner:
+        fehler = sb.backup_ordner_pruefen(ordner)
+        if fehler:
+            raise ApiFehler(fehler)
+    sb.set_einstellung(sb.BACKUP_ORDNER_EINSTELLUNG, ordner)
+    if ordner:
+        sb.erstelle_backup()  # gleich eine erste Kopie dorthin legen
+    return api_backups(None)
+
+
+def backups_im_hintergrund():
+    """Läuft ScanBook über Nacht weiter, wird trotzdem jeden Tag gesichert."""
+    while True:
+        time.sleep(15 * 60)
+        try:
+            sb.auto_backup()
+        except Exception as e:  # eine fehlgeschlagene Sicherung darf den Server nicht stoppen
+            print(f"⚠️ Automatisches Backup fehlgeschlagen: {e}")
 
 
 # --- REGALE ---
@@ -789,6 +832,7 @@ DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten}
 GET_ROUTEN = {
     "info": api_info,
     "books": api_books,
+    "backups": api_backups,
     "book": api_book,
     "refresh_status": api_refresh_status,
     "loans": api_loans,
@@ -816,6 +860,7 @@ POST_ROUTEN = {
     "extend": api_extend,
     "settings": api_settings_save,
     "backup": api_backup,
+    "backup_ordner": api_backup_ordner,
     "regal_save": api_regal_save,
     "regal_delete": api_regal_delete,
     "regal_move": api_regal_move,
@@ -943,6 +988,7 @@ def main():
 
     server, port = starte_server()
     server_ref["server"] = server
+    threading.Thread(target=backups_im_hintergrund, daemon=True).start()
     url = f"http://localhost:{port}/"
     print(f"📚 ScanBook {sb.VERSION} – Oberfläche läuft unter: {url}")
     print("   Zum Beenden hier im Terminal Strg+C drücken.")
@@ -1152,6 +1198,11 @@ dialog h2 { margin: 0 0 4px; font-size: 22px; font-weight: 700; letter-spacing: 
 .check input:checked { background: #34c759; }
 .check input:checked::after { transform: translateX(15px); }
 tr.serie-zeile td { background: transparent; }
+.ort { white-space: nowrap; }
+.ort.geplant { color: var(--muted); }
+/* Auf dem Handy ist die Standort-Spalte weit rechts – dort steht er zusätzlich unter dem Titel */
+.ort-mobil { display: none; margin-top: 2px; font-size: 13px; }
+@media (max-width: 860px) { .ort-mobil { display: block; } }
 tr.serie-zeile .pfeil { display: inline-block; width: 1em; color: var(--muted); transition: transform .15s; }
 tr.serie-zeile.offen .pfeil { transform: rotate(90deg); }
 tr.band-zeile td:nth-child(2) { padding-left: 34px; }
@@ -1242,7 +1293,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .mehr button { margin-left: 8px; }
 .chips.zeile { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; }
 .chips.zeile .chip { flex: none; }
-#katalog-filter .chip, #klassen-chips .chip { padding: 4px 12px; font-size: 13px; }
+#katalog-filter .chip, #regal-filter .chip, #klassen-chips .chip { padding: 4px 12px; font-size: 13px; }
 td.titel-zelle { min-width: 220px; }
 @keyframes rein { from { opacity: 0; transform: translateY(6px); } }
 @keyframes toast { from { opacity: 0; transform: translateY(-12px) scale(.96); } }
@@ -1322,11 +1373,12 @@ td.titel-zelle { min-width: 220px; }
   <section id="tab-katalog">
     <div class="card">
       <div class="row">
-        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag oder ISBN …" autocomplete="off">
+        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag, Regal oder ISBN …" autocomplete="off">
         <span class="sub" id="katalog-anzahl" style="color:var(--muted)"></span>
       </div>
       <div class="toolbar">
         <div class="chips" id="katalog-filter" style="margin:0"></div>
+        <div class="chips hidden" id="regal-filter" style="margin:0"></div>
         <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
       </div>
       <div class="nachladen hidden" id="nachladen-box">
@@ -1335,7 +1387,7 @@ td.titel-zelle { min-width: 220px; }
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Genre</th><th>Verfügbar</th></tr></thead>
+          <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Genre</th><th>Standort</th><th>Verfügbar</th></tr></thead>
           <tbody id="katalog-body"></tbody>
         </table>
         <div class="mehr hidden" id="katalog-mehr"></div>
@@ -1473,8 +1525,14 @@ td.titel-zelle { min-width: 220px; }
           <a href="/export/mahnliste.csv"><button class="btn secondary" type="button">Mahnliste</button></a>
         </div>
         <h3 style="margin-top:22px">💾 Datensicherung</h3>
-        <p class="hint">Einmal täglich wird automatisch gesichert. Hier kannst du zusätzlich ein Backup erstellen.</p>
-        <button class="btn secondary" type="button" id="backup-btn">Backup jetzt erstellen</button>
+        <p class="hint" id="backup-info">Einmal täglich wird automatisch gesichert. Hier kannst du zusätzlich ein Backup erstellen.</p>
+        <p class="hint hidden" id="backup-warnung" style="color:var(--danger)"></p>
+        <label for="backup-ordner">Zusätzlich sichern nach (z. B. USB-Stick, OneDrive oder Netzlaufwerk)</label>
+        <div class="row">
+          <input id="backup-ordner" class="grow" placeholder="z. B. E:\ScanBook-Backups oder C:\Users\…\OneDrive\ScanBook" autocomplete="off">
+          <button class="btn secondary" type="button" id="backup-ordner-btn">Speichern</button>
+        </div>
+        <div class="actions"><button class="btn secondary" type="button" id="backup-btn">Backup jetzt erstellen</button></div>
       </div>
     </div>
     <div class="card">
@@ -1765,7 +1823,7 @@ const LADER = {
   regale: () => ladeRegale(),
   ausleihe: () => { ladeAusleihen(); ladeNamen(); (ausleihPerson ? $("#co-isbn") : $("#co-name")).focus(); },
   schueler: () => (schuelerAnsicht === "verlauf" ? ladePersonen() : ladeSchueler()),
-  verwaltung: () => { ladeStatistik(); ladeCodesStatus(); ladeEinstellungen(); },
+  verwaltung: () => { ladeStatistik(); ladeCodesStatus(); ladeEinstellungen(); ladeBackups(); },
 };
 // Alte Lesezeichen weiter unterstützen
 const ALTE_TABS = { personen: "schueler", statistik: "verwaltung", einstellungen: "verwaltung" };
@@ -1959,12 +2017,24 @@ function buchZeile(b, alsBand = false) {
   const verlag = !alsBand && b.verlag && !LEERWERTE.includes(b.verlag) ? `${esc(b.verlag)} · ` : "";
   return `
       <tr class="clickable${alsBand ? " band-zeile" : ""}" data-isbn="${esc(b.isbn)}">
-        <td class="titel-zelle">${titel}<div class="sub">${verlag}${esc(b.isbn)}</div></td>
+        <td class="titel-zelle">${titel}<div class="sub">${verlag}${esc(b.isbn)}</div>${b.standort ? `<div class="ort-mobil">${ortHtml(b.standort, b.geplant)}</div>` : ""}</td>
         <td>${esc(b.autor)}</td>
         <td class="num">${esc(b.jahr)}</td>
         <td>${esc(b.genre)}</td>
+        <td>${ortHtml(b.standort, b.geplant)}</td>
         <td class="num"><span class="badge ${b.verfuegbar > 0 ? "ok" : "danger"}">${b.verfuegbar} von ${b.gesamt}</span></td>
       </tr>`;
+}
+function ortHtml(text, geplant = false) {
+  if (!text) return "";
+  return `<span class="ort${geplant ? " geplant" : ""}" title="${geplant ? "Geplanter Platz, noch nicht eingeräumt" : "Steht hier im Regal"}">📍 ${esc(text)}${geplant ? " (geplant)" : ""}</span>`;
+}
+// Serie: ein gemeinsamer Platz, sonst das Regal oder „mehrere Regale“
+function serienOrt(baende) {
+  const orte = [...new Set(baende.map((b) => b.standort).filter(Boolean))];
+  if (orte.length <= 1) return ortHtml(orte[0] || "", baende.some((b) => b.standort && b.geplant));
+  const regale = [...new Set(baende.map((b) => b.regal).filter(Boolean))];
+  return ortHtml(regale.length === 1 ? `${regale[0]}, mehrere Fächer` : "mehrere Regale");
 }
 
 function serienZeilen(g, offen) {
@@ -1980,21 +2050,24 @@ function serienZeilen(g, offen) {
         <td>${esc(autoren.length > 2 ? autoren.slice(0, 2).join(", ") + " u. a." : autoren.join(", "))}</td>
         <td class="num">${jahre.length ? (von === bis ? von : `${von}–${bis}`) : ""}</td>
         <td>${esc(genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
+        <td>${serienOrt(g.baende)}</td>
         <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar} von ${gesamt}</span></td>
       </tr>` + (offen ? g.baende.map((b) => buchZeile(b, true)).join("") : "");
 }
 
 // Der Katalog wird einmal geladen und dann im Browser durchsucht – das geht ohne Wartezeit
-let katalog = [], katalogGeladen = false, katalogFilter = "alle";
+let katalog = [], katalogGeladen = false, katalogFilter = "alle", regalFilter = "alle";
 function passtZurSuche(b, worte) {
-  const text = `${b.titel} ${b.autoren} ${b.autor} ${b.genre} ${b.isbn} ${b.verlag} ${b.serie}`.toLowerCase();
+  const text = `${b.titel} ${b.autoren} ${b.autor} ${b.genre} ${b.isbn} ${b.verlag} ${b.serie} ${b.standort}`.toLowerCase();
   return worte.every((w) => text.includes(w) || text.includes(w.replace(/-/g, "")));
 }
 function zeichneKatalog(behalten = false) {
   const suche = $("#katalog-suche").value.trim().toLowerCase();
   const worte = suche.split(/\s+/).filter(Boolean);
+  zeichneRegalFilter();
   const liste = katalog.filter((b) =>
     (katalogFilter === "alle" || (katalogFilter === "da" ? b.verfuegbar > 0 : b.verfuegbar === 0)) &&
+    (regalFilter === "alle" || (regalFilter === "ohne" ? !b.regal : "r:" + b.regal === regalFilter)) &&
     (!worte.length || passtZurSuche(b, worte)));
   $("#katalog-anzahl").textContent = liste.length === katalog.length ? `${katalog.length} Titel` : `${liste.length} von ${katalog.length} Titeln`;
   const weg = katalog.filter((b) => b.verfuegbar === 0).length;
@@ -2022,8 +2095,23 @@ function zeichneKatalog(behalten = false) {
     e.baende.sort(nachBand);
     return serienZeilen(e, Boolean(suche) || offeneSerien.has(e.schluessel));
   };
-  const leer = `<tr><td colspan="5" class="empty">${suche || katalogFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“."}</td></tr>`;
+  const leer = `<tr><td colspan="6" class="empty">${suche || katalogFilter !== "alle" || regalFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“."}</td></tr>`;
   stueckweise($("#katalog-body"), $("#katalog-mehr"), eintraege, zeile, leer, behalten);
+}
+
+// Regal-Filter: nur sichtbar, wenn Regale angelegt sind; Reihenfolge wie im Tab „Regale“
+function zeichneRegalFilter() {
+  const regale = [...new Map(katalog.filter((b) => b.regal).map((b) => [b.regal, b.regal_nr])).entries()]
+    .sort((a, b) => a[1] - b[1]).map(([name]) => name);
+  if (regalFilter.startsWith("r:") && !regale.includes(regalFilter.slice(2))) regalFilter = "alle";
+  const ohne = katalog.filter((b) => !b.regal).length;
+  if (regalFilter === "ohne" && !ohne) regalFilter = "alle";
+  const box = $("#regal-filter");
+  box.classList.toggle("hidden", !regale.length);
+  if (!regale.length) return;
+  const chips = [["alle", "Alle Regale"], ...regale.map((r) => ["r:" + r, `📍 ${r}`]), ...(ohne ? [["ohne", `Ohne Platz · ${ohne}`]] : [])];
+  box.innerHTML = chips.map(([k, t]) =>
+    `<button class="chip ${k === regalFilter ? "active" : ""}" type="button" data-regal="${esc(k)}">${esc(t)}</button>`).join("");
 }
 
 // Vorschläge für das Serien-Feld, damit derselbe Name immer gleich geschrieben wird
@@ -2051,6 +2139,12 @@ $("#katalog-suche").addEventListener("input", debounce(() => zeichneKatalog(), 1
 $("#katalog-filter").addEventListener("click", (e) => {
   if (!e.target.dataset.filter) return;
   katalogFilter = e.target.dataset.filter;
+  zeichneKatalog();
+});
+$("#regal-filter").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-regal]");
+  if (!chip) return;
+  regalFilter = chip.dataset.regal;
   zeichneKatalog();
 });
 $("#serien-gruppieren").addEventListener("change", (e) => {
@@ -2832,6 +2926,23 @@ async function ladeStatistik() {
 $("#backup-btn").addEventListener("click", () => versuche(async () => {
   const r = await post("backup");
   toast("Backup gespeichert: " + r.pfad.split(/[\\/]/).slice(-2).join("/"));
+  ladeBackups();
+}));
+function zeigeBackups(d) {
+  const zeit = d.letztes ? new Date(d.letztes).toLocaleString("de-DE", { dateStyle: "medium", timeStyle: "short" }) : "";
+  $("#backup-info").textContent = `Einmal täglich wird automatisch gesichert, die letzten ${d.behalten} Tage bleiben erhalten. `
+    + (zeit ? `Letztes Backup: ${zeit} · ${d.anzahl} Backup${d.anzahl === 1 ? "" : "s"} im Ordner „backups“.` : "Noch kein Backup vorhanden.");
+  if (document.activeElement !== $("#backup-ordner")) $("#backup-ordner").value = d.zweiter_ordner;
+  $("#backup-warnung").classList.toggle("hidden", !d.kopie_fehler);
+  $("#backup-warnung").textContent = d.kopie_fehler ? `⚠️ Kopie in den zweiten Ordner hat nicht geklappt: ${d.kopie_fehler}` : "";
+}
+async function ladeBackups() {
+  await versuche(async () => zeigeBackups(await get("backups")));
+}
+$("#backup-ordner-btn").addEventListener("click", () => versuche(async () => {
+  const d = await post("backup_ordner", { ordner: $("#backup-ordner").value.trim() });
+  zeigeBackups(d);
+  toast(d.zweiter_ordner ? "Backups werden ab jetzt auch dorthin kopiert" : "Es wird nur noch im Ordner „backups“ gesichert");
 }));
 
 // --- Einstellungen ---
