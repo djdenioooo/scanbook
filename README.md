@@ -10,7 +10,7 @@ Möglicherweise, wird daraus ein Großprojekt, alles Kostenlos und für jeden zu
 ## Voraussetzungen
 
 - Python 3.8 oder neuer (keine zusätzlichen Pakete nötig)
-- Internetverbindung zum Nachschlagen von Buchdaten (Google Books, ersatzweise Open Library)
+- Internetverbindung zum Nachschlagen von Buchdaten (Google Books, ersatzweise Deutsche Nationalbibliothek und Open Library)
 - Optional: ein Barcode-Scanner, der wie eine Tastatur funktioniert (USB oder Bluetooth)
 
 ## Installation & Start
