@@ -4,6 +4,7 @@ import sys
 import csv
 import json
 import sqlite3
+import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -12,10 +13,11 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
-# 🔑 DEINEN GOOGLE API KEY HIER EINFÜGEN ODER ALS UMGEBUNGSVARIABLE SETZEN:
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCOHKdh3i_QjAaiM2On-5fEjbogeSLXOZ0")
+# 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
+# Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 # 📁 ALLE DATEIEN LIEGEN IM ORDNER DES PROGRAMMS (egal, von wo es gestartet wird)
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -30,7 +32,9 @@ MAX_UPDATE_BACKUPS = 3
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
 GITHUB_REPO = "djdenioooo/scanbook"
 GITHUB_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-GITHUB_RAW_TEMPLATE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{{ref}}/ScanBook.py"
+GITHUB_RAW_TEMPLATE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{{ref}}/{{datei}}"
+# Dateien, die beim Update ersetzt werden (Datei auf GitHub, Präfix für Backups)
+UPDATE_DATEIEN = [("ScanBook.py", "ScanBook_"), ("ScanBook_Web.py", "ScanBookWeb_")]
 
 USER_AGENT = f"ScanBook/{VERSION}"
 
@@ -188,17 +192,27 @@ def version_tupel(version):
     return tuple(int(teil) for teil in re.findall(r"\d+", version))
 
 
-def hole_update_code():
-    """Holt bevorzugt das neueste offizielle Release, sonst den main-Branch."""
+def update_quelle():
+    """Bevorzugt das neueste offizielle Release, sonst den main-Branch."""
     try:
-        release = json.loads(http_get(GITHUB_RELEASE_API))
-        tag = release["tag_name"]
-        return f"Release {tag}", http_get(GITHUB_RAW_TEMPLATE.format(ref=tag))
+        tag = json.loads(http_get(GITHUB_RELEASE_API))["tag_name"]
+        return f"Release {tag}", tag
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
     # Noch kein Release vorhanden → main-Branch
-    return "main-Branch", http_get(GITHUB_RAW_TEMPLATE.format(ref="refs/heads/main"))
+    return "main-Branch", "refs/heads/main"
+
+
+def hole_update_datei(ref, datei):
+    return http_get(GITHUB_RAW_TEMPLATE.format(ref=ref, datei=datei))
+
+
+def neu_starten(skript):
+    # os.execv setzt unter Windows Pfade mit Leerzeichen nicht in Anführungszeichen
+    if os.name == "nt":
+        sys.exit(subprocess.call([sys.executable, skript] + sys.argv[1:]))
+    os.execv(sys.executable, [sys.executable, skript] + sys.argv[1:])
 
 
 def checkForUpdates():
@@ -208,7 +222,8 @@ def checkForUpdates():
     current_script = os.path.realpath(__file__)
 
     try:
-        quelle, remote_code = hole_update_code()
+        quelle, ref = update_quelle()
+        remote_code = hole_update_datei(ref, "ScanBook.py")
         remote_version = lies_version(remote_code)
 
         if not remote_version:
@@ -221,38 +236,46 @@ def checkForUpdates():
             warte()
             return
 
-        # Sicherstellen, dass der heruntergeladene Code überhaupt lauffähig ist
-        try:
-            compile(remote_code, "ScanBook.py", "exec")
-        except SyntaxError as e:
-            print(f"⚠️ Die neue Version ist fehlerhaft ({e}) – Update wird nicht installiert.")
-            warte()
-            return
+        # Alle Programmdateien laden und prüfen, bevor irgendetwas ersetzt wird
+        neue_dateien = []
+        for datei, backup_praefix in UPDATE_DATEIEN:
+            code = remote_code if datei == "ScanBook.py" else hole_update_datei(ref, datei)
+            try:
+                compile(code, datei, "exec")
+            except SyntaxError as e:
+                print(f"⚠️ Die neue Version ist fehlerhaft ({e}) – Update wird nicht installiert.")
+                warte()
+                return
+            neue_dateien.append((os.path.join(BASE_DIR, datei), backup_praefix, code))
 
         print(f"✨ Neue Version {remote_version} gefunden ({quelle})!")
         if not ja_nein("Möchtest du das Update jetzt installieren?"):
             print("Update abgebrochen.")
             return
 
-        # 1. Backup erstellen (nur die letzten paar werden behalten)
+        # 1. Backups erstellen (nur die letzten paar werden behalten)
         os.makedirs(BACKUP_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = os.path.join(BACKUP_DIR, f"ScanBook_{timestamp}_v{VERSION}.py")
-        with open(current_script, "r", encoding="utf-8") as f:
-            local_code = f.read()
-        with open(backup_file, "w", encoding="utf-8") as f:
-            f.write(local_code)
-        alte_dateien_aufraeumen(BACKUP_DIR, "ScanBook_", MAX_UPDATE_BACKUPS)
-        print(f"📦 Backup gespeichert unter: backups/{os.path.basename(backup_file)}")
+        for pfad, backup_praefix, _ in neue_dateien:
+            if not os.path.exists(pfad):
+                continue
+            backup_file = os.path.join(BACKUP_DIR, f"{backup_praefix}{timestamp}_v{VERSION}.py")
+            with open(pfad, "r", encoding="utf-8") as f:
+                local_code = f.read()
+            with open(backup_file, "w", encoding="utf-8") as f:
+                f.write(local_code)
+            alte_dateien_aufraeumen(BACKUP_DIR, backup_praefix, MAX_UPDATE_BACKUPS)
+            print(f"📦 Backup gespeichert unter: backups/{os.path.basename(backup_file)}")
 
-        # 2. Datei überschreiben
-        with open(current_script, "w", encoding="utf-8") as f:
-            f.write(remote_code)
+        # 2. Dateien überschreiben
+        for pfad, _, code in neue_dateien:
+            with open(pfad, "w", encoding="utf-8") as f:
+                f.write(code)
         print("🚀 Update erfolgreich installiert!")
         print("🔄 Das Programm wird jetzt neu gestartet...\n")
 
         # 3. Programm automatisch neu starten
-        os.execv(sys.executable, [sys.executable, current_script] + sys.argv[1:])
+        neu_starten(current_script)
 
     except Exception as e:
         print(f"⚠️ Fehler beim Suchen nach Updates: {e}")
