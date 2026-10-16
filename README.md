@@ -52,7 +52,8 @@ Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`export
 | 13 | Backup | Sicherungskopie der Datenbank. Zusätzlich wird einmal täglich beim Start automatisch gesichert. |
 | 14 | Stammdaten | Schulname, Standard-Leihdauer, Löschfrist usw. |
 | 15 | Buchdaten nachladen | Sucht für Bücher, die schon im Katalog sind, online nach Beschreibung, Cover und Serie. Von Hand eingetragene Angaben bleiben unverändert. |
-| 16 | Updates | Prüft auf GitHub, ob es eine neuere Version gibt. |
+| 16 | Regale & Standorte | Regale mit Fächern anlegen; ScanBook sagt für jedes Buch, wo es hingehört (siehe unten). |
+| 17 | Updates | Prüft auf GitHub, ob es eine neuere Version gibt. In der Browser-Oberfläche unter „Einstellungen“ → „Programm-Update“. |
 
 ## Buchvorschau und Serien
 
@@ -61,6 +62,18 @@ In der Browser-Oberfläche öffnet ein Klick auf ein Buch im Katalog eine Vorsch
 Serie und Band werden beim Scannen aus Google Books und der Deutschen Nationalbibliothek übernommen, soweit die Quellen sie kennen (Verlagsreihen wie „dtv“ oder „rororo“ werden ignoriert). Fehlt die Serie, lässt sie sich unter „Bearbeiten“ eintragen; das Feld schlägt bereits vorhandene Seriennamen vor, damit alle Bände gleich geschrieben werden. Im Katalog werden die Bände einer Serie zu einer Zeile zusammengefasst, die sich aufklappen lässt („Serien zusammenfassen“ ein- oder ausschalten).
 
 Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog den Knopf „Alle Bücher nachladen“ (Terminal: Menüpunkt 15). Er ergänzt nur leere Angaben. Die Cover werden direkt im Browser von Google Books, Open Library oder der DNB geladen.
+
+## Regale und Standorte
+
+Im Tab „Regale“ (Terminal: Menüpunkt 16) legst du einmal deine Regale an: Name, Anzahl Fächer, ungefähr wie viele Bücher in ein Fach passen, und welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf.
+
+ScanBook verteilt die Bücher dann selbst:
+
+- Ein Buch kommt in das erste Regal, das eines seiner Genres hat. Mit den Pfeilen legst du fest, welches Regal zuerst dran ist.
+- Innerhalb eines Regals wird nach Genre (in der eingetragenen Reihenfolge) und dann nach Autor sortiert. Bände einer Serie stehen zusammen in der richtigen Reihenfolge.
+- Ist ein Regal voll, kommen die übrigen Bücher ins nächste Regal, das ihr Genre (oder alle übrigen Bücher) aufnimmt. Was nirgends hinpasst, steht unter „Ohne Platz“.
+
+Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau.
 
 ## ISBN-Prüfung
 
@@ -79,6 +92,8 @@ Die Datenbank enthält Namen von Ausleihern und wird deshalb über `.gitignore` 
 3. Empfohlen: auf GitHub ein **Release** mit einem Tag erstellen (z. B. `v2.1.0`). Das Programm holt bevorzugt das neueste Release. Gibt es noch keins, wird der `main`-Branch verwendet.
 
 Ein Update ersetzt `ScanBook.py` und `ScanBook_Web.py`. Es wird nur installiert, wenn die Versionsnummer in `ScanBook.py` höher ist und beide Dateien fehlerfrei geladen werden können. Die letzten 3 alten Versionen werden in `backups/` aufbewahrt.
+
+In der Browser-Oberfläche gibt es dafür unter „Einstellungen“ den Bereich „Programm-Update“. Ist eine neue Version da, erscheint oben neben der Versionsnummer ein Knopf. Nach dem Installieren startet ScanBook von selbst neu und die Seite lädt sich neu.
 
 Die Updates werden ohne Anmeldung von GitHub geladen. Das Repository muss deshalb **öffentlich** sein.
 
