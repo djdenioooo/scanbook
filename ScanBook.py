@@ -7,11 +7,12 @@ import sqlite3
 import urllib.request
 import urllib.parse
 import urllib.error
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 # 🔑 DEINEN GOOGLE API KEY HIER EINFÜGEN ODER ALS UMGEBUNGSVARIABLE SETZEN:
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyCOHKdh3i_QjAaiM2On-5fEjbogeSLXOZ0")
@@ -466,8 +467,103 @@ def fetch_from_openlibrary(isbn):
     return None
 
 
+DNB_SRU_URL = "https://services.dnb.de/sru/dnb"
+MARC_NS = {"m": "http://www.loc.gov/MARC21/slim"}
+
+
+def marc_unterfelder(feld, codes):
+    return [(u.text or "").strip() for u in feld.findall("m:subfield", MARC_NS) if u.get("code") in codes]
+
+
+def marc_text(text):
+    """Entfernt Nichtsortierzeichen und Trennzeichen, die MARC ans Feldende hängt."""
+    text = re.sub(r"[\u0098\u009c]", "", text or "")
+    return re.sub(r"\s*[/:;,=]+$", "", text.strip()).strip()
+
+
+def marc_person(name):
+    """'Tolkien, J. R. R.' -> 'J. R. R. Tolkien' (so wie bei Google Books)."""
+    name = marc_text(name)
+    if name.count(",") == 1:
+        nachname, vorname = (t.strip() for t in name.split(","))
+        return f"{vorname} {nachname}"
+    return name
+
+
+def parse_dnb_marc(record):
+    def felder(tag):
+        return record.findall(f"m:datafield[@tag='{tag}']", MARC_NS)
+
+    titel = None
+    for feld in felder("245"):
+        teile = [marc_text(t) for t in marc_unterfelder(feld, "anp")]
+        untertitel = [marc_text(t) for t in marc_unterfelder(feld, "b")]
+        titel = ". ".join(t for t in teile if t)
+        if untertitel and untertitel[0]:
+            titel += f": {untertitel[0]}"
+
+    autoren = []
+    for feld in felder("100") + felder("700"):
+        if marc_unterfelder(feld, "t"):
+            continue  # Verweis auf ein anderes Werk (z. B. Originaltitel)
+        rollen = marc_unterfelder(feld, "4e")
+        if feld.get("tag") == "700" and not any(r in ("aut", "Verfasser") for r in rollen):
+            continue  # Übersetzer, Illustratoren usw.
+        for name in marc_unterfelder(feld, "a"):
+            person = marc_person(name)
+            if person and person not in autoren:
+                autoren.append(person)
+    if not autoren:
+        autoren = [marc_text(n) for f in felder("110") for n in marc_unterfelder(f, "a")]
+
+    verlag, jahr = None, None
+    veroeffentlichung = [f for f in felder("264") if f.get("ind2") == "1"] + felder("260")
+    for feld in veroeffentlichung:
+        verlag = verlag or ", ".join(marc_text(v) for v in marc_unterfelder(feld, "b")) or None
+        treffer = re.search(r"\d{4}", " ".join(marc_unterfelder(feld, "c")))
+        jahr = jahr or (treffer.group(0) if treffer else None)
+    if not jahr:
+        feld008 = record.find("m:controlfield[@tag='008']", MARC_NS)
+        if feld008 is not None and re.fullmatch(r"\d{4}", (feld008.text or "")[7:11]):
+            jahr = feld008.text[7:11]
+
+    schlagwoerter = []
+    for feld in felder("650") + felder("689"):
+        for wort in marc_unterfelder(feld, "a"):
+            wort = marc_text(wort)
+            if wort and wort not in schlagwoerter:
+                schlagwoerter.append(wort)
+
+    if not titel:
+        return None
+    return neue_buchdaten(titel, ', '.join(autoren), verlag, jahr, ', '.join(schlagwoerter[:3]))
+
+
+def fetch_from_dnb(isbn):
+    params = urllib.parse.urlencode({
+        "version": "1.1",
+        "operation": "searchRetrieve",
+        "query": f"num={isbn}",
+        "recordSchema": "MARC21-xml",
+        "maximumRecords": "1",
+    })
+    try:
+        wurzel = ET.fromstring(http_get(f"{DNB_SRU_URL}?{params}"))
+        record = wurzel.find(".//m:record", MARC_NS)
+        if record is not None:
+            return parse_dnb_marc(record)
+    except Exception as e:
+        print(f"⚠️ DNB-Abfrage fehlgeschlagen: {e}")
+    return None
+
+
 def fetch_book_data(isbn):
-    for name, quelle in (("Google Books", fetch_from_google), ("Open Library", fetch_from_openlibrary)):
+    quellen = (
+        ("Google Books", fetch_from_google),
+        ("Deutsche Nationalbibliothek", fetch_from_dnb),
+        ("Open Library", fetch_from_openlibrary),
+    )
+    for name, quelle in quellen:
         daten = quelle(isbn)
         if daten:
             print(f"📡 Gefunden bei {name}.")
