@@ -8,6 +8,7 @@ import io
 import csv
 import sys
 import json
+import threading
 import webbrowser
 from datetime import date, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -59,7 +60,9 @@ def tage_bis(iso_datum):
 
 
 def buchdaten_aus(body):
-    return sb.neue_buchdaten(*(text(body, feld) for feld, _ in sb.BUCH_FELDER))
+    return sb.neue_buchdaten(*(text(body, feld) for feld, _ in sb.BUCH_FELDER),
+                             *(text(body, feld) for feld, _ in sb.SERIEN_FELDER),
+                             *(text(body, feld) for feld in sb.ZUSATZ_FELDER))
 
 
 def fehlende_felder(daten):
@@ -82,19 +85,38 @@ def api_books(params):
     werte = ()
     if suche:
         muster = f"%{sb.normalize_isbn(suche) or suche}%"
-        sql += " WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ? OR verlag LIKE ?"
-        werte = (muster,) * 5
+        sql += " WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ? OR verlag LIKE ? OR serie LIKE ?"
+        werte = (muster,) * 6
     with sb.db_connection() as conn:
         rows = conn.execute(sql + " ORDER BY autor_nachname, titel", werte).fetchall()
     return [
         {"autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
-         "verfuegbar": r[5], "isbn": r[6], "autoren": r[7], "verlag": r[8]}
+         "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10]}
         for r in rows
     ]
 
 
 def api_book(params):
-    return buch_oder_fehler(isbn_pruefen(params.get("isbn")))
+    """Ein Buch mit allem, was die Vorschau braucht: aktuelle Ausleihen und die anderen Bände der Serie."""
+    isbn = isbn_pruefen(params.get("isbn"))
+    buch = buch_oder_fehler(isbn)
+    with sb.db_connection() as conn:
+        buch["ausleihen"] = [
+            {"name": name, "bis": bis, "tage": tage_bis(bis)}
+            for name, bis in conn.execute(
+                "SELECT ausleiher, rueckgabe_bis FROM ausleihen WHERE isbn = ? AND status = 'aktiv' ORDER BY rueckgabe_bis",
+                (isbn,))
+        ]
+        baende = []
+        if buch["serie"]:
+            baende = [
+                {"isbn": r[0], "titel": r[1], "band": r[2] or "", "verfuegbar": r[3], "gesamt": r[4]}
+                for r in conn.execute(
+                    "SELECT isbn, titel, band, anzahl_verfuegbar, anzahl_gesamt FROM buecher WHERE serie = ? COLLATE NOCASE",
+                    (buch["serie"],))
+            ]
+    buch["serie_baende"] = sorted(baende, key=lambda b: (sb.band_sortierwert(b["band"]), b["titel"]))
+    return buch
 
 
 def api_loans(params):
@@ -202,7 +224,8 @@ def api_book_create(body):
         raise ApiFehler("Bitte einen Titel eingeben.")
     if sb.lade_buch(isbn):
         raise ApiFehler("Dieses Buch ist schon im Katalog. Zum Aufstocken einfach scannen.")
-    sb.buch_speichern(isbn, buchdaten_aus(body), positive_zahl(body.get("anzahl"), 1))
+    sb.buch_speichern(isbn, buchdaten_aus(body), positive_zahl(body.get("anzahl"), 1),
+                      nachgeladen=body.get("nachgeladen") in (True, "1"))
     return buch_oder_fehler(isbn)
 
 
@@ -212,15 +235,48 @@ def api_book_update(body):
     if not text(body, "titel"):
         raise ApiFehler("Bitte einen Titel eingeben.")
     daten = buchdaten_aus(body)
-    sort_key, formatiert = sb.get_sort_name(daten["autoren"])
-    with sb.db_connection() as conn:
-        conn.execute('''
-            UPDATE buecher SET titel = ?, autoren = ?, autor_nachname = ?, autor_formatiert = ?,
-                verlag = ?, erscheinungsjahr = ?, genre = ?
-            WHERE isbn = ?
-        ''', (daten["titel"], daten["autoren"], sort_key, formatiert,
-              daten["verlag"], daten["erscheinungsjahr"], daten["genre"], isbn))
+    felder = [f for f, _ in sb.BUCH_FELDER + sb.SERIEN_FELDER] + ["beschreibung"]
+    sb.buch_aktualisieren(isbn, {f: daten[f] for f in felder})
     return buch_oder_fehler(isbn)
+
+
+def api_book_refresh(body):
+    isbn = isbn_pruefen(body.get("isbn"))
+    buch_oder_fehler(isbn)
+    ergaenzt = sb.daten_nachladen(isbn)
+    return {"gefunden": ergaenzt is not None, "ergaenzt": ergaenzt or [], "nicht_erreichbar": sb.letzte_fehler()}
+
+
+# Nachladen für den ganzen Katalog läuft im Hintergrund, die Oberfläche fragt den Fortschritt ab
+nachladen_status = {"laeuft": False, "erledigt": 0, "gesamt": 0, "titel": "", "ergaenzt": 0, "fehler": ""}
+nachladen_sperre = threading.Lock()
+
+
+def nachladen_im_hintergrund():
+    def fortschritt(nr, gesamt, titel):
+        nachladen_status.update(erledigt=nr, gesamt=gesamt, titel=titel)
+    try:
+        _, ergaenzt = sb.alle_nachladen(fortschritt)
+        nachladen_status["ergaenzt"] = ergaenzt
+    except Exception as e:
+        print(f"⚠️ Nachladen abgebrochen: {e}")
+        nachladen_status["fehler"] = str(e)
+    finally:
+        nachladen_status["laeuft"] = False
+
+
+def api_refresh_all(_):
+    with nachladen_sperre:
+        if not nachladen_status["laeuft"]:
+            offen = len(sb.noch_nicht_nachgeladen())
+            nachladen_status.update(laeuft=bool(offen), erledigt=0, gesamt=offen, titel="", ergaenzt=0, fehler="")
+            if offen:
+                threading.Thread(target=nachladen_im_hintergrund, daemon=True).start()
+    return api_refresh_status(None)
+
+
+def api_refresh_status(_):
+    return dict(nachladen_status, offen=len(sb.noch_nicht_nachgeladen()))
 
 
 def api_book_remove_copy(body):
@@ -347,6 +403,7 @@ GET_ROUTEN = {
     "info": api_info,
     "books": api_books,
     "book": api_book,
+    "refresh_status": api_refresh_status,
     "loans": api_loans,
     "borrowers": api_borrowers,
     "borrower": api_borrower,
@@ -360,6 +417,8 @@ POST_ROUTEN = {
     "book_update": api_book_update,
     "book_remove_copy": api_book_remove_copy,
     "book_delete": api_book_delete,
+    "book_refresh": api_book_refresh,
+    "refresh_all": api_refresh_all,
     "checkout": api_checkout,
     "return": api_return,
     "extend": api_extend,
@@ -545,11 +604,12 @@ section.active { display: block; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row > .grow { flex: 1; min-width: 180px; }
 label { display: block; font-size: 13px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
-input {
+input, textarea {
   width: 100%; font: inherit; color: var(--text); background: var(--surface-2);
   border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--surface); }
+textarea { resize: vertical; min-height: 90px; line-height: 1.45; }
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--surface); }
 input.big { font-size: 20px; padding: 12px 14px; letter-spacing: .02em; }
 input.missing { border-color: var(--warn); background: var(--warn-soft); }
 .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 14px; }
@@ -615,6 +675,46 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
   background: var(--text); color: var(--bg); box-shadow: 0 6px 24px rgba(0,0,0,.2); animation: rein .2s ease-out;
 }
 .toast.error { background: var(--danger); color: #fff; }
+/* Katalog: Serien */
+.toolbar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 10px 0 14px; }
+.toolbar .hint { margin: 0; }
+.check { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-size: 14px; color: var(--text); font-weight: 400; cursor: pointer; }
+.check input { width: auto; margin: 0; }
+tr.serie-zeile td { background: var(--surface-2); }
+tr.serie-zeile .pfeil { display: inline-block; width: 1em; color: var(--muted); transition: transform .15s; }
+tr.serie-zeile.offen .pfeil { transform: rotate(90deg); }
+tr.band-zeile td:nth-child(2) { padding-left: 34px; }
+.band-nr { display: inline-block; min-width: 2.4em; margin-right: 6px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; text-align: center; }
+.serie-tag { color: var(--accent); font-size: 13px; }
+.nachladen { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 14px; border-radius: 10px; background: var(--accent-soft); margin-bottom: 14px; font-size: 14px; }
+.nachladen .grow { flex: 1; min-width: 200px; }
+.balken { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 6px; }
+.balken > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+
+/* Buchvorschau */
+dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
+.vorschau-kopf { display: grid; grid-template-columns: 150px 1fr; gap: 22px; }
+@media (max-width: 560px) { .vorschau-kopf { grid-template-columns: 1fr; } .cover-box { max-width: 160px; } }
+.cover-box { aspect-ratio: 2 / 3; border-radius: 8px; overflow: hidden; background: var(--surface-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
+.cover-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover-leer { color: var(--muted); font-size: 44px; }
+.vorschau-titel { margin: 0 0 4px; font-size: 21px; line-height: 1.25; }
+.vorschau-autor { color: var(--muted); margin-bottom: 10px; }
+.daten { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font-size: 14px; margin: 12px 0 0; }
+.daten dt { color: var(--muted); }
+.daten dd { margin: 0; }
+.beschreibung { margin-top: 18px; font-size: 14px; line-height: 1.6; white-space: pre-line; max-height: 260px; overflow-y: auto; padding-right: 6px; }
+.beschreibung.leer { color: var(--muted); font-style: italic; }
+.vorschau-block { margin-top: 18px; }
+.vorschau-block h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+.baende { list-style: none; margin: 0; padding: 0; }
+.baende li { display: flex; gap: 8px; align-items: center; padding: 5px 8px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+.baende li:hover { background: var(--surface-2); }
+.baende li.aktuell { background: var(--accent-soft); cursor: default; font-weight: 600; }
+.baende li .badge { margin-left: auto; }
+.nb-vorschau { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
+.nb-vorschau .cover-box { width: 70px; flex: none; }
+.nb-vorschau .sub { color: var(--muted); font-size: 13px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 @keyframes rein { from { opacity: 0; transform: translateY(8px); } }
 </style>
 </head>
@@ -652,6 +752,11 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
       <h2 id="new-book-title">Neues Buch</h2>
       <p class="hint" id="new-book-hint"></p>
       <form id="new-book-form">
+        <div class="nb-vorschau hidden" id="nb-vorschau">
+          <div class="cover-box"><img alt="" referrerpolicy="no-referrer"><span class="cover-leer hidden">📖</span></div>
+          <div class="sub" id="nb-beschreibung"></div>
+        </div>
+        <input type="hidden" name="beschreibung"><input type="hidden" name="cover_url"><input type="hidden" name="nachgeladen">
         <div class="form-grid">
           <div><label for="nb-isbn">ISBN</label><input id="nb-isbn" name="isbn" autocomplete="off"></div>
           <div><label for="nb-anzahl">Anzahl Exemplare</label><input id="nb-anzahl" name="anzahl" type="number" min="1" value="1"></div>
@@ -660,6 +765,8 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
           <div><label for="nb-verlag">Verlag</label><input id="nb-verlag" name="verlag"></div>
           <div><label for="nb-erscheinungsjahr">Erscheinungsjahr</label><input id="nb-erscheinungsjahr" name="erscheinungsjahr"></div>
           <div class="full"><label for="nb-genre">Genre</label><input id="nb-genre" name="genre"></div>
+          <div><label for="nb-serie">Serie (leer = keine)</label><input id="nb-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+          <div><label for="nb-band">Band</label><input id="nb-band" name="band" inputmode="numeric" autocomplete="off"></div>
         </div>
         <div class="actions">
           <button class="btn" type="submit" id="nb-save">Speichern</button>
@@ -678,10 +785,17 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
   <section id="tab-katalog">
     <div class="card">
       <div class="row">
-        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Genre, Verlag oder ISBN …" autocomplete="off">
+        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag oder ISBN …" autocomplete="off">
         <span class="sub" id="katalog-anzahl" style="color:var(--muted)"></span>
       </div>
-      <p class="hint" style="margin:10px 0 14px">Klicke auf ein Buch, um es zu bearbeiten oder zu löschen.</p>
+      <div class="toolbar">
+        <p class="hint">Klicke auf ein Buch für die Vorschau. Von dort aus lässt es sich auch bearbeiten.</p>
+        <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
+      </div>
+      <div class="nachladen hidden" id="nachladen-box">
+        <div class="grow"><span id="nachladen-text"></span><div class="balken hidden" id="nachladen-balken"><div></div></div></div>
+        <button class="btn small" type="button" id="nachladen-btn">Alle Bücher nachladen</button>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Autor</th><th>Titel</th><th>Jahr</th><th>Genre</th><th>Bestand</th><th>ISBN</th></tr></thead>
@@ -791,6 +905,9 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
       <div><label for="ed-verlag">Verlag</label><input id="ed-verlag" name="verlag"></div>
       <div><label for="ed-erscheinungsjahr">Erscheinungsjahr</label><input id="ed-erscheinungsjahr" name="erscheinungsjahr"></div>
       <div class="full"><label for="ed-genre">Genre</label><input id="ed-genre" name="genre"></div>
+      <div><label for="ed-serie">Serie (leer = keine)</label><input id="ed-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+      <div><label for="ed-band">Band</label><input id="ed-band" name="band" inputmode="numeric" autocomplete="off"></div>
+      <div class="full"><label for="ed-beschreibung">Beschreibung</label><textarea id="ed-beschreibung" name="beschreibung" rows="5"></textarea></div>
     </div>
     <div class="actions">
       <button class="btn" type="submit">Speichern</button>
@@ -801,12 +918,37 @@ dialog h2 { margin: 0 0 4px; font-size: 18px; }
   </form>
 </dialog>
 
+<!-- BUCHVORSCHAU -->
+<dialog id="preview-dialog" class="vorschau">
+  <div class="dlg-body">
+    <div class="vorschau-kopf">
+      <div class="cover-box" id="pv-cover"><img alt="" referrerpolicy="no-referrer"><span class="cover-leer hidden">📖</span></div>
+      <div>
+        <h2 class="vorschau-titel" id="pv-titel"></h2>
+        <div class="vorschau-autor" id="pv-autor"></div>
+        <div id="pv-bestand"></div>
+        <dl class="daten" id="pv-daten"></dl>
+      </div>
+    </div>
+    <div class="beschreibung" id="pv-beschreibung"></div>
+    <div class="vorschau-block hidden" id="pv-baende-block"><h3 id="pv-baende-titel"></h3><ul class="baende" id="pv-baende"></ul></div>
+    <div class="vorschau-block hidden" id="pv-ausleihen-block"><h3>Gerade ausgeliehen</h3><ul class="log" id="pv-ausleihen"></ul></div>
+    <div class="actions">
+      <button class="btn" type="button" id="pv-edit">Bearbeiten</button>
+      <button class="btn secondary" type="button" id="pv-refresh">Daten online nachladen</button>
+      <button class="btn secondary" type="button" id="pv-close" style="margin-left:auto">Schließen</button>
+    </div>
+  </div>
+</dialog>
+
+<datalist id="serien-liste"></datalist>
 <div id="toasts"></div>
 
 <script>
 "use strict";
 const $ = (sel) => document.querySelector(sel);
 const FELDER = ["titel", "autoren", "verlag", "erscheinungsjahr", "genre"];
+const SERIEN_FELDER = ["serie", "band"];
 const LEERWERTE = ["", "Unbekannt", "Unbekannter Titel", "N/A", "Keine Angabe"];
 let info = { standard_leihdauer: 14 };
 
@@ -853,6 +995,37 @@ function formDaten(form) {
 function debounce(fn, ms = 200) {
   let t;
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+function speicherLesen(name, standard) {
+  try { const w = localStorage.getItem(name); return w === null ? standard : w; } catch { return standard; }
+}
+function speicherSchreiben(name, wert) {
+  try { localStorage.setItem(name, wert); } catch { /* egal */ }
+}
+// Cover: gespeicherte Adresse, sonst Open Library und DNB nach ISBN fragen
+function zeigeCover(box, b) {
+  const img = box.querySelector("img"), leer = box.querySelector(".cover-leer");
+  const quellen = [b.cover_url, b.isbn && `https://covers.openlibrary.org/b/isbn/${b.isbn}-M.jpg?default=false`,
+    b.isbn && `https://portal.dnb.de/opac/mvb/cover?isbn=${b.isbn}`].filter(Boolean);
+  let i = 0;
+  const weiter = () => {
+    if (i < quellen.length) { img.src = quellen[i++]; return; }
+    img.removeAttribute("src"); img.classList.add("hidden"); leer.classList.remove("hidden");
+  };
+  img.onerror = weiter;
+  img.onload = () => { if (img.naturalWidth < 20) weiter(); };  // 1×1-Platzhalter überspringen
+  img.classList.remove("hidden"); leer.classList.add("hidden");
+  weiter();
+}
+function bandWert(band) {
+  const n = parseInt(band, 10);
+  return Number.isNaN(n) ? Infinity : n;
+}
+function nachBand(a, b) {
+  return bandWert(a.band) - bandWert(b.band) || String(a.band).localeCompare(String(b.band)) || a.titel.localeCompare(b.titel, "de");
+}
+function serieText(serie, band) {
+  return serie ? (band ? `${serie} · Band ${band}` : serie) : "";
 }
 async function versuche(fn) {
   try { return await fn(); } catch (e) { toast(e.message, true); }
@@ -903,6 +1076,14 @@ function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
     form[f].value = LEERWERTE.includes(wert) ? "" : wert;
     form[f].classList.toggle("missing", fehlend.includes(f));
   }
+  for (const f of [...SERIEN_FELDER, "beschreibung", "cover_url"]) form[f].value = daten?.[f] ?? "";
+  form.nachgeladen.value = daten ? "1" : "";
+  const vorschau = $("#nb-vorschau");
+  vorschau.classList.toggle("hidden", !daten);
+  if (daten) {
+    zeigeCover(vorschau.querySelector(".cover-box"), { ...daten, isbn });
+    $("#nb-beschreibung").textContent = daten.beschreibung || "Keine Beschreibung gefunden.";
+  }
   $("#new-book-title").textContent = daten ? (daten.titel || "Neues Buch") : "Neues Buch eintragen";
   $("#new-book-hint").textContent = hinweis;
   $("#new-book-card").classList.remove("hidden");
@@ -951,39 +1132,217 @@ $("#new-book-form").addEventListener("submit", (e) => {
     toast(`„${b.titel}“ gespeichert`);
     logEintrag(`✨ <b>${esc(b.titel)}</b> neu hinzugefügt (${b.anzahl_gesamt}×)`);
     schliesseNeuesBuch();
+    if (b.serie) get("books").then(setzeSerienListe).catch(() => {});
   });
 });
 
 // --- Katalog ---
-async function ladeKatalog() {
-  await versuche(async () => {
-    const buecher = await get("books", { q: $("#katalog-suche").value });
-    $("#katalog-anzahl").textContent = `${buecher.length} Titel`;
-    $("#katalog-body").innerHTML = buecher.length ? buecher.map((b) => `
-      <tr class="clickable" data-isbn="${esc(b.isbn)}">
+const offeneSerien = new Set();
+$("#serien-gruppieren").checked = speicherLesen("serienGruppieren", "1") === "1";
+
+function buchZeile(b, alsBand = false) {
+  const titel = alsBand
+    ? `${b.band ? `<span class="band-nr">${esc(b.band)}</span>` : ""}<b>${esc(b.titel)}</b>`
+    : `<b>${esc(b.titel)}</b>${b.serie ? `<div class="serie-tag">📚 ${esc(serieText(b.serie, b.band))}</div>` : ""}`;
+  const verlag = !alsBand && b.verlag && b.verlag !== "N/A" ? `<div class="sub">${esc(b.verlag)}</div>` : "";
+  return `
+      <tr class="clickable${alsBand ? " band-zeile" : ""}" data-isbn="${esc(b.isbn)}">
         <td>${esc(b.autor)}</td>
-        <td><b>${esc(b.titel)}</b>${b.verlag && b.verlag !== "N/A" ? `<div class="sub">${esc(b.verlag)}</div>` : ""}</td>
+        <td>${titel}${verlag}</td>
         <td class="num">${esc(b.jahr)}</td>
         <td>${esc(b.genre)}</td>
         <td class="num"><span class="badge ${b.verfuegbar > 0 ? "ok" : "danger"}">${b.verfuegbar}/${b.gesamt} verfügbar</span></td>
         <td class="num sub">${esc(b.isbn)}</td>
-      </tr>`).join("") : `<tr><td colspan="6" class="empty">${$("#katalog-suche").value ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch im Tab „Scannen“."}</td></tr>`;
+      </tr>`;
+}
+
+function serienZeilen(g, offen) {
+  const autoren = [...new Set(g.baende.map((b) => b.autor))];
+  const jahre = g.baende.map((b) => parseInt(b.jahr, 10)).filter((j) => !Number.isNaN(j));
+  const von = Math.min(...jahre), bis = Math.max(...jahre);
+  const verfuegbar = g.baende.reduce((n, b) => n + b.verfuegbar, 0);
+  const gesamt = g.baende.reduce((n, b) => n + b.gesamt, 0);
+  const genres = [...new Set(g.baende.map((b) => b.genre).filter((x) => !LEERWERTE.includes(x)))];
+  return `
+      <tr class="clickable serie-zeile${offen ? " offen" : ""}" data-serie="${esc(g.schluessel)}">
+        <td>${esc(autoren.length > 2 ? autoren.slice(0, 2).join(", ") + " u. a." : autoren.join(", "))}</td>
+        <td><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände im Katalog</div></td>
+        <td class="num">${jahre.length ? (von === bis ? von : `${von}–${bis}`) : ""}</td>
+        <td>${esc(genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
+        <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar}/${gesamt} verfügbar</span></td>
+        <td class="num sub">${offen ? "zuklappen" : "aufklappen"}</td>
+      </tr>` + (offen ? g.baende.map((b) => buchZeile(b, true)).join("") : "");
+}
+
+let katalog = [];
+function zeichneKatalog() {
+  const suche = $("#katalog-suche").value.trim();
+  let html = "";
+  if (!$("#serien-gruppieren").checked) {
+    html = katalog.map((b) => buchZeile(b)).join("");
+  } else {
+    // Bände einer Serie an der Stelle des ersten Bandes zusammenfassen
+    const gruppen = new Map(), eintraege = [];
+    for (const b of katalog) {
+      const schluessel = b.serie.trim().toLowerCase();
+      if (!schluessel) { eintraege.push(b); continue; }
+      if (!gruppen.has(schluessel)) {
+        const g = { schluessel, serie: b.serie, baende: [] };
+        gruppen.set(schluessel, g);
+        eintraege.push(g);
+      }
+      gruppen.get(schluessel).baende.push(b);
+    }
+    html = eintraege.map((e) => {
+      if (!e.baende) return buchZeile(e);
+      if (e.baende.length === 1) return buchZeile(e.baende[0]);
+      e.baende.sort(nachBand);
+      return serienZeilen(e, Boolean(suche) || offeneSerien.has(e.schluessel));
+    }).join("");
+  }
+  $("#katalog-body").innerHTML = html || `<tr><td colspan="6" class="empty">${suche ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch im Tab „Scannen“."}</td></tr>`;
+}
+
+// Vorschläge für das Serien-Feld, damit derselbe Name immer gleich geschrieben wird
+function setzeSerienListe(buecher) {
+  const serien = [...new Set(buecher.map((b) => b.serie).filter(Boolean))].sort((a, b) => a.localeCompare(b, "de"));
+  $("#serien-liste").innerHTML = serien.map((s) => `<option value="${esc(s)}">`).join("");
+}
+
+async function ladeKatalog() {
+  await versuche(async () => {
+    katalog = await get("books", { q: $("#katalog-suche").value });
+    $("#katalog-anzahl").textContent = `${katalog.length} Titel`;
+    zeichneKatalog();
+    if (!$("#katalog-suche").value.trim()) setzeSerienListe(katalog);
   });
+  zeigeNachladen(await get("refresh_status").catch(() => null));
 }
 $("#katalog-suche").addEventListener("input", debounce(ladeKatalog));
+$("#serien-gruppieren").addEventListener("change", (e) => {
+  speicherSchreiben("serienGruppieren", e.target.checked ? "1" : "0");
+  zeichneKatalog();
+});
 $("#katalog-body").addEventListener("click", (e) => {
+  const serie = e.target.closest("tr[data-serie]");
+  if (serie) {
+    const s = serie.dataset.serie;
+    offeneSerien.has(s) ? offeneSerien.delete(s) : offeneSerien.add(s);
+    zeichneKatalog();
+    return;
+  }
   const zeile = e.target.closest("tr[data-isbn]");
-  if (zeile) oeffneBearbeiten(zeile.dataset.isbn);
+  if (zeile) oeffneVorschau(zeile.dataset.isbn);
 });
 
-// --- Bearbeiten-Dialog ---
+// --- Fehlende Angaben für den ganzen Katalog nachladen ---
+let nachladenTimer = null;
+function zeigeNachladen(st) {
+  const box = $("#nachladen-box");
+  if (!st) return;
+  clearTimeout(nachladenTimer);
+  const balken = $("#nachladen-balken");
+  if (st.laeuft) {
+    box.classList.remove("hidden");
+    balken.classList.remove("hidden");
+    balken.firstElementChild.style.width = `${st.gesamt ? Math.round(100 * st.erledigt / st.gesamt) : 0}%`;
+    $("#nachladen-text").textContent = `Lade Cover, Beschreibung und Serie … ${st.erledigt} von ${st.gesamt}` + (st.titel ? ` (zuletzt: ${st.titel})` : "");
+    $("#nachladen-btn").disabled = true;
+    nachladenTimer = setTimeout(async () => {
+      const neu = await get("refresh_status").catch(() => null);
+      if (neu && !neu.laeuft) {
+        toast(neu.fehler ? `Nachladen abgebrochen: ${neu.fehler}`
+          : `Fertig: ${neu.gesamt} Bücher geprüft, bei ${neu.ergaenzt} Angaben ergänzt.`
+            + (neu.offen ? ` Bei ${neu.offen} war eine Quelle nicht erreichbar, später noch einmal versuchen.` : ""), Boolean(neu.fehler));
+        if ($("#tab-katalog").classList.contains("active")) { ladeKatalog(); return; }
+      }
+      zeigeNachladen(neu);
+    }, 1500);
+    return;
+  }
+  balken.classList.add("hidden");
+  $("#nachladen-btn").disabled = false;
+  box.classList.toggle("hidden", !st.offen);
+  $("#nachladen-text").textContent = st.offen === 1
+    ? "Für 1 Buch wurden Cover, Beschreibung und Serie noch nicht gesucht."
+    : `Für ${st.offen} Bücher wurden Cover, Beschreibung und Serie noch nicht gesucht. Deine eigenen Angaben bleiben dabei unverändert.`;
+}
+$("#nachladen-btn").addEventListener("click", () => versuche(async () => zeigeNachladen(await post("refresh_all"))));
+
+// --- Buchvorschau ---
 let aktuelleIsbn = null;
+async function oeffneVorschau(isbn) {
+  await versuche(async () => {
+    const b = await get("book", { isbn });
+    aktuelleIsbn = isbn;
+    const leer = (w) => !w || LEERWERTE.includes(w);
+    zeigeCover($("#pv-cover"), { ...b, isbn });
+    $("#pv-titel").textContent = b.titel;
+    $("#pv-autor").textContent = leer(b.autoren) ? "Autor unbekannt" : b.autoren;
+    $("#pv-bestand").innerHTML = `<span class="badge ${b.anzahl_verfuegbar > 0 ? "ok" : "danger"}">${b.anzahl_verfuegbar} von ${b.anzahl_gesamt} verfügbar</span>`;
+    const daten = [
+      ["Serie", serieText(b.serie, b.band)], ["Genre", b.genre], ["Verlag", b.verlag],
+      ["Erschienen", b.erscheinungsjahr], ["ISBN", isbn],
+    ].filter(([, w]) => !leer(w));
+    $("#pv-daten").innerHTML = daten.map(([k, w]) => `<dt>${k}</dt><dd>${esc(w)}</dd>`).join("");
+    const beschreibung = $("#pv-beschreibung");
+    beschreibung.textContent = b.beschreibung || (b.nachgeladen
+      ? "Keine Beschreibung gefunden. Unter „Bearbeiten“ kannst du selbst eine eintragen."
+      : "Noch keine Beschreibung – „Daten online nachladen“ sucht danach.");
+    beschreibung.classList.toggle("leer", !b.beschreibung);
+
+    const baende = b.serie_baende || [];
+    $("#pv-baende-block").classList.toggle("hidden", baende.length < 2);
+    $("#pv-baende-titel").textContent = `${b.serie} – ${baende.length} Bände im Katalog`;
+    $("#pv-baende").innerHTML = baende.map((x) => `
+      <li data-isbn="${esc(x.isbn)}" class="${x.isbn === isbn ? "aktuell" : ""}">
+        <span class="band-nr">${esc(x.band || "–")}</span><span>${esc(x.titel)}</span>
+        <span class="badge ${x.verfuegbar > 0 ? "ok" : "danger"}">${x.verfuegbar}/${x.gesamt}</span>
+      </li>`).join("");
+
+    $("#pv-ausleihen-block").classList.toggle("hidden", !b.ausleihen.length);
+    $("#pv-ausleihen").innerHTML = b.ausleihen.map((a) =>
+      `<li><span>${esc(a.name)}</span><span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
+
+    const dlg = $("#preview-dialog");
+    if (!dlg.open) dlg.showModal();
+    dlg.querySelector(".dlg-body").scrollTop = 0;
+  });
+}
+$("#pv-close").addEventListener("click", () => $("#preview-dialog").close());
+$("#pv-baende").addEventListener("click", (e) => {
+  const li = e.target.closest("li[data-isbn]");
+  if (li && li.dataset.isbn !== aktuelleIsbn) oeffneVorschau(li.dataset.isbn);
+});
+$("#pv-edit").addEventListener("click", () => {
+  $("#preview-dialog").close();
+  oeffneBearbeiten(aktuelleIsbn);
+});
+$("#pv-refresh").addEventListener("click", () => versuche(async () => {
+  const knopf = $("#pv-refresh");
+  knopf.disabled = true;
+  knopf.textContent = "Suche online …";
+  try {
+    const r = await post("book_refresh", { isbn: aktuelleIsbn });
+    if (r.ergaenzt.length) toast("Fehlende Angaben ergänzt.");
+    else if (r.nicht_erreichbar.length) toast(`Nicht erreichbar: ${r.nicht_erreichbar.join(", ")}. Bitte später noch einmal versuchen.`, true);
+    else toast(r.gefunden ? "Nichts Neues gefunden." : "Online nicht gefunden.");
+    await oeffneVorschau(aktuelleIsbn);
+    ladeKatalog();
+  } finally {
+    knopf.disabled = false;
+    knopf.textContent = "Daten online nachladen";
+  }
+}));
+
+// --- Bearbeiten-Dialog ---
 async function oeffneBearbeiten(isbn) {
   await versuche(async () => {
     const b = await get("book", { isbn });
     aktuelleIsbn = isbn;
     const form = $("#edit-form");
     for (const f of FELDER) form[f].value = LEERWERTE.includes(b[f]) ? "" : b[f];
+    for (const f of [...SERIEN_FELDER, "beschreibung"]) form[f].value = b[f] || "";
     $("#edit-hint").textContent = `ISBN ${isbn} · Bestand: ${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar`;
     $("#edit-dialog").showModal();
   });
@@ -996,6 +1355,7 @@ $("#edit-form").addEventListener("submit", (e) => {
     toast(`„${b.titel}“ gespeichert`);
     $("#edit-dialog").close();
     ladeKatalog();
+    oeffneVorschau(aktuelleIsbn);
   });
 });
 $("#ed-remove").addEventListener("click", () => versuche(async () => {
@@ -1236,6 +1596,7 @@ $("#settings-form").addEventListener("submit", (e) => {
 
 // --- Start ---
 ladeInfo().catch((e) => toast(e.message, true));
+get("books").then(setzeSerienListe).catch(() => {});
 zeigeTab(location.hash.slice(1));
 </script>
 </body>

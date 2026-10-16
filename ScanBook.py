@@ -1,5 +1,8 @@
 import os
 import re
+import html
+import time
+import threading
 import sys
 import csv
 import json
@@ -14,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -50,6 +53,15 @@ BUCH_FELDER = [
     ("genre", "Genre"),
 ]
 
+# Freiwillige Angaben – leer heißt "gehört zu keiner Serie"
+SERIEN_FELDER = [
+    ("serie", "Serie"),
+    ("band", "Band"),
+]
+
+# Angaben, die online gefunden werden (Beschreibung lässt sich im Browser auch von Hand ändern)
+ZUSATZ_FELDER = ["beschreibung", "cover_url"]
+
 STAMMDATEN = [
     ("schulname", "Schulname", None),
     ("bib_name", "Bibliotheksname", None),
@@ -68,7 +80,7 @@ DEFAULT_EINSTELLUNGEN = {
     "loeschfrist_monate": "12",
 }
 
-BUCH_SPALTEN = "autor_formatiert, titel, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar, isbn"
+BUCH_SPALTEN = "autor_formatiert, titel, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar, isbn, serie, band"
 
 
 # --- ALLGEMEINE HELFER ---
@@ -361,7 +373,12 @@ def init_db():
                 erscheinungsjahr TEXT,
                 genre TEXT,
                 anzahl_gesamt INTEGER DEFAULT 1,
-                anzahl_verfuegbar INTEGER DEFAULT 1
+                anzahl_verfuegbar INTEGER DEFAULT 1,
+                serie TEXT DEFAULT '',
+                band TEXT DEFAULT '',
+                beschreibung TEXT DEFAULT '',
+                cover_url TEXT DEFAULT '',
+                nachgeladen INTEGER DEFAULT 0
             )
         ''')
 
@@ -387,6 +404,14 @@ def init_db():
         ''')
 
         # Spalten nachrüsten, die ältere Versionen noch nicht hatten
+        buch_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(buecher)")}
+        for spalte in ("serie", "band", "beschreibung", "cover_url"):
+            if spalte not in buch_spalten:
+                cursor.execute(f"ALTER TABLE buecher ADD COLUMN {spalte} TEXT DEFAULT ''")
+        if "nachgeladen" not in buch_spalten:
+            # 0 = Beschreibung, Cover und Serie wurden noch nicht online gesucht
+            cursor.execute("ALTER TABLE buecher ADD COLUMN nachgeladen INTEGER DEFAULT 0")
+
         vorhandene_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(ausleihen)")}
         if "zurueckgegeben_am" not in vorhandene_spalten:
             cursor.execute("ALTER TABLE ausleihen ADD COLUMN zurueckgegeben_am DATE")
@@ -591,16 +616,79 @@ def genre_ermitteln(begriffe, klassen=(), schlagwoerter=()):
     return genres_zusammenfuehren(roh), False
 
 
-def neue_buchdaten(titel, autoren, verlag, jahr, genre):
+def neue_buchdaten(titel, autoren, verlag, jahr, genre, serie=None, band=None, beschreibung=None, cover_url=None):
+    serie = (serie or "").strip()
     return {
         'titel': titel or 'Unbekannter Titel',
         'autoren': autoren or 'Unbekannt',
         'verlag': verlag or 'N/A',
         'erscheinungsjahr': jahr or 'N/A',
         'genre': genre or 'Keine Angabe',
+        'serie': serie,
+        'band': band_normalisieren(band) if serie else '',
+        'beschreibung': (beschreibung or '').strip(),
+        'cover_url': (cover_url or '').strip(),
     }
 
 
+# --- SERIEN ERKENNEN ---
+# Verlagsreihen wie "dtv ; 14040" sind keine Buchserien und werden ignoriert
+VERLAGSREIHEN = re.compile(
+    r"^(dtv|rororo|btb|kiwi|goldmann|heyne|fischer|ullstein|piper|knaur|diogenes|blanvalet|"
+    r"bastei|lübbe|suhrkamp|insel|reclam|aufbau|droemer|list|cbj|cbt|ravensburger|carlsen|"
+    r"arena|oetinger|beltz|fischer klassik|penguin|vintage)\b|taschenbuch|bibliothek|edition|"
+    r"universal-bibliothek|paperback|klassiker", re.I)
+
+
+def band_normalisieren(band):
+    """'Bd. 3' -> '3', '[Bd. 2].' -> '2'; ohne Zahl bleibt der Text (z. B. 'Sonderband')."""
+    band = marc_text(str(band or "")).strip("[](). ")
+    zahl = re.search(r"\d+", band)
+    if not zahl:
+        return band
+    return zahl.group(0).lstrip("0") or "0"
+
+
+def band_sortierwert(band):
+    zahl = re.match(r"\d+", band or "")
+    return (0, int(zahl.group(0)), band) if zahl else (1, 0, band or "")
+
+
+def ist_buchserie(name, band=""):
+    if not name or VERLAGSREIHEN.search(name):
+        return False
+    zahl = re.search(r"\d+", band or "")
+    return not (zahl and int(zahl.group(0)) >= 1000)  # vierstellige Nummern = Verlagsreihe
+
+
+def serie_aus_titel(titel):
+    """Erkennt Titel wie 'Die Tribute von Panem 2. Gefährliche Liebe',
+    'Harry Potter 2: Harry Potter und die Kammer des Schreckens' oder '... (Warrior Cats, Band 3)'."""
+    titel = titel or ""
+    treffer = re.search(r"\(([^()]+?)[,;:]?\s+(?:Bd\.?|Band|Teil|Folge|Buch|Book|Vol\.?|Volume|Nr\.?|#)\s*(\d{1,3})\)", titel)
+    if treffer:
+        return treffer.group(1).strip(), treffer.group(2)
+    treffer = re.match(r"^(.+?)[,\s]+(?:(?:Bd\.?|Band|Teil|Folge|Buch|Book|Vol\.?|Volume|Nr\.?|#)\s*)?(\d{1,2})\s*([.:])\s+(.+)$", titel)
+    if treffer:
+        serie, band, trenner, rest = treffer.groups()
+        serie = serie.strip()
+        if re.match(r"(Klasse|Schuljahr|Jahrgang|Auflage|Jahrhundert|Kapitel)\b", rest, re.I):
+            return None, None  # z. B. "Mathe 7. Klasse"
+        if len(serie.split()) < 2 and (len(serie) < 5 or serie.lower() in ("der", "die", "das", "the")):
+            return None, None  # z. B. "Die 5. Welle"
+        # Bei ":" nur, wenn der Serienname danach wiederkommt (sonst z. B. "Catch 22: ...")
+        if trenner == "." or serie.split()[0].lower() in rest.lower():
+            return serie, band
+    return None, None
+
+
+def text_ohne_html(text):
+    text = re.sub(r"<br\s*/?>|</p>", "\n", text or "", flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# --- QUELLEN ---
 def fetch_from_google(isbn):
     params = f"q=isbn:{isbn}"
     if GOOGLE_API_KEY and GOOGLE_API_KEY != "DEIN_API_KEY_HIER":
@@ -613,17 +701,28 @@ def fetch_from_google(isbn):
             # Kategorien wie "Fiction / Fantasy / Epic" in Einzelteile zerlegen
             begriffe = [t for k in info.get('categories', []) for t in k.split("/")]
             genres, sicher = genre_ermitteln(begriffe)
+            titel = info.get('title')
+            serie, band = serie_aus_titel(" ".join(filter(None, [titel, info.get('subtitle')])))
+            if serie and not ist_buchserie(serie, band):
+                serie, band = None, None
+            bilder = info.get('imageLinks', {})
+            cover = bilder.get('thumbnail') or bilder.get('smallThumbnail') or ''
+            cover = cover.replace("http://", "https://", 1).replace("&edge=curl", "")
             daten = neue_buchdaten(
-                info.get('title'),
+                titel,
                 ', '.join(info.get('authors', [])),
                 info.get('publisher'),
                 info.get('publishedDate', '')[:4],
                 ', '.join(genres),
+                serie, band,
+                text_ohne_html(info.get('description')),
+                cover,
             )
             daten['_genres'], daten['_genre_sicher'] = genres, sicher
             return daten
     except Exception as e:
         print(f"⚠️ Google-Books-Abfrage fehlgeschlagen: {e}")
+        fehler_merken("Google Books")
         zertifikat_hinweis(e)
     return None
 
@@ -635,17 +734,25 @@ def fetch_from_openlibrary(isbn):
         if eintrag:
             jahr = re.search(r"\d{4}", eintrag.get("publish_date", ""))
             genres, sicher = genre_ermitteln([s["name"] for s in eintrag.get("subjects", [])])
+            serie, band = serie_aus_titel(eintrag.get("title"))
+            if serie and not ist_buchserie(serie, band):
+                serie, band = None, None
+            cover = eintrag.get("cover", {})
             daten = neue_buchdaten(
                 eintrag.get("title"),
                 ', '.join(a["name"] for a in eintrag.get("authors", [])),
                 ', '.join(p["name"] for p in eintrag.get("publishers", [])),
                 jahr.group(0) if jahr else None,
                 ', '.join(genres),
+                serie, band,
+                None,
+                cover.get("medium") or cover.get("large") or cover.get("small"),
             )
             daten['_genres'], daten['_genre_sicher'] = genres, sicher
             return daten
     except Exception as e:
         print(f"⚠️ Open-Library-Abfrage fehlgeschlagen: {e}")
+        fehler_merken("Open Library")
         zertifikat_hinweis(e)
     return None
 
@@ -679,7 +786,8 @@ def parse_dnb_marc(record):
 
     titel = None
     for feld in felder("245"):
-        teile = [marc_text(t) for t in marc_unterfelder(feld, "anp")]
+        # "[Bd. 2]." -> "Bd. 2", damit der Titel nicht "Panem. [Bd. 2].. Gefährliche Liebe" lautet
+        teile = [marc_text(t).strip("[] ").rstrip(".") for t in marc_unterfelder(feld, "anp")]
         untertitel = [marc_text(t) for t in marc_unterfelder(feld, "b")]
         titel = ". ".join(t for t in teile if t)
         if untertitel and untertitel[0]:
@@ -723,8 +831,27 @@ def parse_dnb_marc(record):
 
     if not titel:
         return None
+
+    # Serie: Gesamttitel (830/800/490), sonst mehrteiliges Werk wie "Die Tribute von Panem. [Bd. 2]. Gefährliche Liebe"
+    serie, band = None, None
+    for tag in ("830", "800", "810", "490"):
+        for feld in felder(tag):
+            name = marc_text(" ".join(marc_unterfelder(feld, "t" if tag in ("800", "810") else "a")))
+            nummer = " ".join(marc_unterfelder(feld, "v"))
+            if not serie and ist_buchserie(name, nummer):
+                serie, band = name, nummer
+    if not serie:
+        for feld in felder("245"):
+            name = marc_text(" ".join(marc_unterfelder(feld, "a")))
+            nummer = marc_unterfelder(feld, "n")
+            if name and nummer:
+                serie, band = name, nummer[0]
+
+    beschreibung = "\n\n".join(t for f in felder("520") for t in marc_unterfelder(f, "a") if t)
+
     genres, sicher = genre_ermitteln(gattungen, klassen, schlagwoerter)
-    daten = neue_buchdaten(titel, ', '.join(autoren), verlag, jahr, ', '.join(genres))
+    daten = neue_buchdaten(titel, ', '.join(autoren), verlag, jahr, ', '.join(genres),
+                           serie, band, beschreibung)
     daten['_genres'], daten['_genre_sicher'] = genres, sicher
     return daten
 
@@ -744,28 +871,80 @@ def fetch_from_dnb(isbn):
             return parse_dnb_marc(record)
     except Exception as e:
         print(f"⚠️ DNB-Abfrage fehlgeschlagen: {e}")
+        fehler_merken("Deutsche Nationalbibliothek")
         zertifikat_hinweis(e)
     return None
 
 
+# Quellen, die bei der letzten Suche (in diesem Thread) nicht erreichbar waren
+abfrage = threading.local()
+
+
+def fehler_merken(quelle):
+    if not hasattr(abfrage, "fehler"):
+        abfrage.fehler = []
+    abfrage.fehler.append(quelle)
+
+
+def letzte_fehler():
+    return getattr(abfrage, "fehler", [])
+
+# Was jede Quelle liefern kann – eine Quelle wird nur gefragt, wenn sie noch etwas Fehlendes ergänzen kann
+QUELLEN = (
+    ("Google Books", fetch_from_google, {"buch", "genre", "serie", "beschreibung", "cover_url"}),
+    ("Deutsche Nationalbibliothek", fetch_from_dnb, {"buch", "genre", "serie", "beschreibung"}),
+    ("Open Library", fetch_from_openlibrary, {"buch", "genre", "serie", "cover_url"}),
+)
+
+
+def fehlende_angaben(daten, genre_sicher):
+    if not daten:
+        return {"buch"}
+    fehlt = {f for f in ("serie", "beschreibung", "cover_url") if not daten[f]}
+    if not genre_sicher:
+        fehlt.add("genre")
+    return fehlt
+
+
+def buchdaten_ergaenzen(daten, treffer):
+    """Füllt leere Angaben in 'daten' aus 'treffer' auf. Liefert die Namen der ergänzten Felder."""
+    ergaenzt = []
+    for feld, _ in BUCH_FELDER:
+        if feld != "genre" and daten[feld].strip() in LEERWERTE and treffer[feld].strip() not in LEERWERTE:
+            daten[feld] = treffer[feld]
+            ergaenzt.append(feld)
+    if not daten["serie"] and treffer["serie"]:
+        daten["serie"], daten["band"] = treffer["serie"], treffer["band"]
+        ergaenzt.append("serie")
+    elif not daten["band"] and treffer["band"] and daten["serie"].lower() == treffer["serie"].lower():
+        daten["band"] = treffer["band"]
+        ergaenzt.append("band")
+    for feld in ZUSATZ_FELDER:
+        if not daten[feld] and treffer[feld]:
+            daten[feld] = treffer[feld]
+            ergaenzt.append(feld)
+    return ergaenzt
+
+
 def fetch_book_data(isbn):
-    quellen = (
-        ("Google Books", fetch_from_google),
-        ("Deutsche Nationalbibliothek", fetch_from_dnb),
-        ("Open Library", fetch_from_openlibrary),
-    )
+    abfrage.fehler = []
     daten, sichere, unsichere = None, [], []
-    for name, quelle in quellen:
-        if daten and sichere:
-            break  # Buch gefunden und Genre erkannt
+    for name, quelle, liefert in QUELLEN:
+        if not fehlende_angaben(daten, bool(sichere)) & liefert:
+            continue
         treffer = quelle(isbn)
         if not treffer:
             continue
         if not daten:
             daten = treffer
             print(f"📡 Gefunden bei {name}.")
-        elif treffer['_genre_sicher']:
-            print(f"📡 Genre ergänzt aus {name}.")
+        else:
+            ergaenzt = buchdaten_ergaenzen(daten, treffer)
+            if treffer['_genre_sicher'] and not sichere:
+                ergaenzt.append("genre")
+            if ergaenzt:
+                namen = dict(BUCH_FELDER + SERIEN_FELDER, beschreibung="Beschreibung", cover_url="Cover")
+                print(f"📡 Ergänzt aus {name}: {', '.join(namen[f] for f in ergaenzt)}.")
         (sichere if treffer['_genre_sicher'] else unsichere).append(treffer['_genres'])
 
     if not daten:
@@ -778,9 +957,20 @@ def fetch_book_data(isbn):
 
 
 # --- BUCHDATEN ANZEIGEN, PRÜFEN & BEARBEITEN ---
+def serie_text(serie, band):
+    if not serie:
+        return ""
+    return f"{serie}, Band {band}" if band else serie
+
+
 def zeige_buchdaten(daten):
     for feld, label in BUCH_FELDER:
         print(f"   {label + ':':<18} {daten[feld]}")
+    if daten.get('serie'):
+        print(f"   {'Serie:':<18} {serie_text(daten['serie'], daten['band'])}")
+    if daten.get('beschreibung'):
+        kurz = " ".join(daten['beschreibung'].split())
+        print(f"   {'Beschreibung:':<18} {kurz[:150] + ' …' if len(kurz) > 150 else kurz}")
 
 
 def fehlende_felder_abfragen(daten):
@@ -795,40 +985,119 @@ def fehlende_felder_abfragen(daten):
 
 
 def buchdaten_bearbeiten(daten):
-    print("✏️ Neue Werte eingeben ([ENTER] = beibehalten):")
-    for feld, label in BUCH_FELDER:
+    print("✏️ Neue Werte eingeben ([ENTER] = beibehalten, '-' = Serie/Band leeren):")
+    for feld, label in BUCH_FELDER + SERIEN_FELDER:
+        if feld == "band" and not daten['serie']:
+            daten['band'] = ""
+            continue
         neu = input(f"   {label} [{daten[feld]}]: ").strip()
-        if neu:
-            daten[feld] = neu
+        if neu == "-" and feld in ("serie", "band"):
+            daten[feld] = ""
+        elif neu:
+            daten[feld] = band_normalisieren(neu) if feld == "band" else neu
+    if not daten['serie']:
+        daten['band'] = ""
 
 
-def buch_speichern(isbn, daten, anzahl=1):
+def buch_speichern(isbn, daten, anzahl=1, nachgeladen=False):
+    """nachgeladen = Daten kommen aus der Online-Suche (Beschreibung, Cover, Serie wurden schon gesucht)."""
     sort_key, formatiert = get_sort_name(daten['autoren'])
     with db_connection() as conn:
         conn.execute('''
             INSERT INTO buecher
-            (isbn, titel, autoren, autor_nachname, autor_formatiert, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (isbn, titel, autoren, autor_nachname, autor_formatiert, verlag, erscheinungsjahr, genre,
+             anzahl_gesamt, anzahl_verfuegbar, serie, band, beschreibung, cover_url, nachgeladen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             isbn, daten['titel'], daten['autoren'], sort_key, formatiert,
-            daten['verlag'], daten['erscheinungsjahr'], daten['genre'], anzahl, anzahl
+            daten['verlag'], daten['erscheinungsjahr'], daten['genre'], anzahl, anzahl,
+            daten.get('serie', ''), daten.get('band', ''), daten.get('beschreibung', ''),
+            daten.get('cover_url', ''), int(nachgeladen),
         ))
     print(f"✨ NEU HINZUGEFÜGT: {daten['titel']} ({formatiert}) – {anzahl}x")
+
+
+def buch_aktualisieren(isbn, daten):
+    """Speichert die bearbeitbaren Felder, die in 'daten' vorkommen."""
+    felder = [f for f, _ in BUCH_FELDER + SERIEN_FELDER if f in daten] + [f for f in ZUSATZ_FELDER if f in daten]
+    werte = [daten[f] for f in felder]
+    if "autoren" in daten:
+        sort_key, formatiert = get_sort_name(daten['autoren'])
+        felder += ["autor_nachname", "autor_formatiert"]
+        werte += [sort_key, formatiert]
+    with db_connection() as conn:
+        conn.execute(f"UPDATE buecher SET {', '.join(f + ' = ?' for f in felder)} WHERE isbn = ?", (*werte, isbn))
 
 
 def lade_buch(isbn):
     with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar
+            SELECT titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar,
+                   serie, band, beschreibung, cover_url, nachgeladen
             FROM buecher WHERE isbn = ?
         ''', (isbn,))
         row = cursor.fetchone()
     if not row:
         return None
-    daten = dict(zip([f for f, _ in BUCH_FELDER], row[:5]))
+    daten = dict(zip([f for f, _ in BUCH_FELDER], (w or "" for w in row[:5])))
     daten['anzahl_gesamt'], daten['anzahl_verfuegbar'] = row[5], row[6]
+    daten['serie'], daten['band'], daten['beschreibung'], daten['cover_url'] = (w or "" for w in row[7:11])
+    daten['nachgeladen'] = bool(row[11])
     return daten
+
+
+def daten_nachladen(isbn):
+    """Sucht online nach fehlenden Angaben (Beschreibung, Cover, Serie, leere Felder) und ergänzt nur,
+    was noch leer ist – von Hand eingetragene Angaben bleiben unverändert.
+    Liefert die Liste der ergänzten Felder oder None, wenn das Buch online nicht gefunden wurde.
+    War eine Quelle nicht erreichbar, wird das Buch beim nächsten "Alle nachladen" noch einmal versucht."""
+    buch = lade_buch(isbn)
+    if not buch:
+        return None
+    gefunden = fetch_book_data(isbn)
+    fehler = letzte_fehler()
+    ergaenzt = []
+    if gefunden:
+        ergaenzt = buchdaten_ergaenzen(buch, gefunden)
+        if buch['genre'].strip() in LEERWERTE and gefunden['genre'].strip() not in LEERWERTE:
+            buch['genre'] = gefunden['genre']
+            ergaenzt.append("genre")
+        if ergaenzt:
+            buch_aktualisieren(isbn, {f: buch[f] for f in [f for f, _ in BUCH_FELDER + SERIEN_FELDER] + ZUSATZ_FELDER})
+    if not fehler:
+        with db_connection() as conn:
+            conn.execute("UPDATE buecher SET nachgeladen = 1 WHERE isbn = ?", (isbn,))
+    return ergaenzt if gefunden else None
+
+
+def noch_nicht_nachgeladen():
+    with db_connection() as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT isbn FROM buecher WHERE nachgeladen = 0 OR nachgeladen IS NULL ORDER BY autor_nachname, titel")]
+
+
+def alle_nachladen(fortschritt=None, pause=0.5):
+    """Lädt für alle Bücher, die noch nicht online ergänzt wurden, die fehlenden Angaben nach.
+    fortschritt(erledigt, gesamt, titel) wird nach jedem Buch aufgerufen.
+    Bricht ab, wenn bei 3 Büchern nacheinander keine Quelle erreichbar war (z. B. kein Internet)."""
+    isbns = noch_nicht_nachgeladen()
+    ergaenzt = nicht_erreichbar = 0
+    for nr, isbn in enumerate(isbns, 1):
+        felder = daten_nachladen(isbn)
+        if felder:
+            ergaenzt += 1
+        if len(set(letzte_fehler())) == len(QUELLEN):
+            nicht_erreichbar += 1
+            if nicht_erreichbar >= 3:
+                raise ConnectionError("Die Online-Quellen sind gerade nicht erreichbar. Bitte später noch einmal versuchen.")
+        else:
+            nicht_erreichbar = 0
+        if fortschritt:
+            fortschritt(nr, len(isbns), (lade_buch(isbn) or {}).get("titel", isbn))
+        if nr < len(isbns):
+            time.sleep(pause)  # Online-Quellen nicht mit Anfragen überhäufen
+    return len(isbns), ergaenzt
 
 
 # --- BUCH SCANNEN UND HINZUFÜGEN ---
@@ -879,7 +1148,7 @@ def scan_and_add():
                 continue
             if wahl in ('ä', 'a'):
                 buchdaten_bearbeiten(daten)
-            buch_speichern(isbn, daten)
+            buch_speichern(isbn, daten, nachgeladen=True)
 
         except EOFError:
             raise
@@ -909,7 +1178,10 @@ def manuelle_eingabe(isbn=None):
         input("   Verlag: ").strip(),
         input("   Erscheinungsjahr: ").strip(),
         input("   Genre: ").strip(),
+        input("   Serie (leer = keine): ").strip(),
     )
+    if daten['serie']:
+        daten['band'] = band_normalisieren(input("   Band-Nummer: ").strip())
     anzahl_input = input("   Anzahl Exemplare [1]: ").strip()
     anzahl = int(anzahl_input) if anzahl_input.isdigit() and int(anzahl_input) > 0 else 1
 
@@ -917,9 +1189,17 @@ def manuelle_eingabe(isbn=None):
 
 
 # --- KATALOG ANZEIGEN & SUCHEN ---
+def katalog_sortierung(buch):
+    """Nach Autor, Bände einer Serie direkt nacheinander in der richtigen Reihenfolge."""
+    autor, titel, serie, band = buch[0], buch[1], buch[7] or "", buch[8] or ""
+    return (autor or "").lower(), serie.lower(), band_sortierwert(band) if serie else (0, 0, ""), titel.lower()
+
+
 def zeige_buchliste(buecher):
-    for autor_formatiert, titel, jahr, genre, gesamt, verfuegbar, isbn in buecher:
+    for autor_formatiert, titel, jahr, genre, gesamt, verfuegbar, isbn, serie, band in sorted(buecher, key=katalog_sortierung):
         print(f"• {autor_formatiert:<25} | {titel} ({jahr}) [Bestand: {verfuegbar}/{gesamt} verfügbar]")
+        if serie:
+            print(f"  📚 Serie: {serie_text(serie, band)}")
         print(f"  Genre: {genre} | ISBN: {isbn}")
         print("-" * 75)
 
@@ -941,7 +1221,7 @@ def show_sorted_catalog():
 
 def search_books():
     ueberschrift("🔎 BUCH SUCHEN")
-    suchbegriff = input("Titel, Autor, Genre oder ISBN: ").strip()
+    suchbegriff = input("Titel, Autor, Serie, Genre oder ISBN: ").strip()
     if not suchbegriff:
         return
 
@@ -950,9 +1230,9 @@ def search_books():
     with db_connection() as conn:
         treffer = conn.execute(f'''
             SELECT {BUCH_SPALTEN} FROM buecher
-            WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ?
+            WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ? OR serie LIKE ?
             ORDER BY autor_nachname ASC, titel ASC
-        ''', (muster, muster, muster, muster)).fetchall()
+        ''', (muster,) * 5).fetchall()
 
     print(f"\n{len(treffer)} Treffer für '{suchbegriff}':")
     print("-" * 75)
@@ -979,19 +1259,13 @@ def manage_book():
         print("\n1. Buchdaten bearbeiten")
         print("2. Ein Exemplar entfernen (z. B. verloren oder kaputt)")
         print("3. Buch komplett löschen")
-        print("4. Zurück zum Hauptmenü")
-        wahl = input("\nWähle eine Option (1-4): ").strip()
+        print("4. Fehlende Angaben online nachladen (Beschreibung, Cover, Serie)")
+        print("5. Zurück zum Hauptmenü")
+        wahl = input("\nWähle eine Option (1-5): ").strip()
 
         if wahl == "1":
             buchdaten_bearbeiten(daten)
-            sort_key, formatiert = get_sort_name(daten['autoren'])
-            with db_connection() as conn:
-                conn.execute('''
-                    UPDATE buecher SET titel = ?, autoren = ?, autor_nachname = ?, autor_formatiert = ?,
-                        verlag = ?, erscheinungsjahr = ?, genre = ?
-                    WHERE isbn = ?
-                ''', (daten['titel'], daten['autoren'], sort_key, formatiert,
-                      daten['verlag'], daten['erscheinungsjahr'], daten['genre'], isbn))
+            buch_aktualisieren(isbn, {f: daten[f] for f, _ in BUCH_FELDER + SERIEN_FELDER})
             print("✅ Buchdaten gespeichert!")
 
         elif wahl == "2":
@@ -1022,9 +1296,49 @@ def manage_book():
                 return
 
         elif wahl == "4":
+            print(f"🔍 Suche online nach ISBN {isbn}...")
+            ergaenzt = daten_nachladen(isbn)
+            if ergaenzt is None and letzte_fehler():
+                print("❌ Die Online-Quellen waren nicht erreichbar. Bitte später noch einmal versuchen.")
+            elif ergaenzt is None:
+                print("❌ Online nicht gefunden.")
+            elif ergaenzt:
+                print("✅ Fehlende Angaben ergänzt.")
+            else:
+                print("ℹ️ Nichts Neues gefunden – alle verfügbaren Angaben sind schon da.")
+
+        elif wahl == "5":
             return
         else:
             print("Ungültige Eingabe.")
+
+
+def buchdaten_nachladen_menue():
+    ueberschrift("🌐 BUCHDATEN ONLINE NACHLADEN")
+    anzahl = len(noch_nicht_nachgeladen())
+    if not anzahl:
+        print("✅ Für alle Bücher wurde schon online gesucht.")
+        print("   Einzelne Bücher lassen sich unter 'Buch bearbeiten' erneut nachladen.")
+        warte()
+        return
+    print(f"Für {anzahl} Bücher werden Beschreibung, Cover und Serie online gesucht.")
+    print("Von Hand eingetragene Angaben bleiben unverändert. Abbrechen mit Strg+C, später geht es dort weiter.")
+    if not ja_nein("Jetzt starten?"):
+        return
+
+    def fortschritt(nr, gesamt, titel):
+        print(f"   [{nr}/{gesamt}] {titel}")
+
+    try:
+        gesamt, ergaenzt = alle_nachladen(fortschritt)
+    except ConnectionError as e:
+        print(f"\n❌ {e}")
+    else:
+        print(f"\n✅ Fertig: {gesamt} Bücher geprüft, bei {ergaenzt} wurden Angaben ergänzt.")
+        rest = len(noch_nicht_nachgeladen())
+        if rest:
+            print(f"ℹ️ Bei {rest} Büchern war eine Quelle nicht erreichbar – einfach später noch einmal starten.")
+    warte()
 
 
 # --- BUCH AUSLEIHEN ---
@@ -1290,10 +1604,10 @@ def export_daten(typ):
     with db_connection() as conn:
         if typ == "katalog":
             zeilen = conn.execute('''
-                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar
+                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, serie, band, anzahl_gesamt, anzahl_verfuegbar
                 FROM buecher ORDER BY autor_nachname, titel
             ''').fetchall()
-            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Exemplare", "Verfügbar"], zeilen
+            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Band", "Exemplare", "Verfügbar"], zeilen
 
         sql = '''
             SELECT a.ausleiher, b.titel, a.isbn, a.ausgeliehen_am, a.rueckgabe_bis
@@ -1391,6 +1705,7 @@ MENUE = [
     ("Export (CSV / Excel)", export_menu),
     ("Datenbank-Backup erstellen", backup_menu),
     ("Stammdaten", manage_stammdaten),
+    ("Buchdaten online nachladen (Beschreibung, Cover, Serie)", buchdaten_nachladen_menue),
     ("Nach Programm-Updates suchen (GitHub)", checkForUpdates),
 ]
 
