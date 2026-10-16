@@ -36,6 +36,8 @@ Der Browser öffnet sich automatisch mit der ScanBook-Oberfläche. Beenden mit S
 
 Voraussetzung: Python von python.org, beim Installieren den Haken bei „Add python.exe to PATH“ setzen.
 
+**Ohne Python-Installation:** Beim jeweiligen GitHub-Release `ScanBook-Windows.zip` herunterladen, entpacken (Rechtsklick → „Alle extrahieren“) und im Ordner `ScanBook` die Datei `ScanBook.exe` doppelklicken. Das Paket bringt ein eigenes Python mit, es muss nichts installiert werden. Beim ersten Start kann Windows warnen („Der Computer wurde durch Windows geschützt“): auf „Weitere Informationen“ → „Trotzdem ausführen“ klicken. Die ZIP wird bei jedem Release automatisch gebaut (`.github/workflows/windows-paket.yml`).
+
 Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`exporte/`) werden automatisch im selben Ordner wie das Programm angelegt – egal, von wo aus es gestartet wird.
 
 ## Funktionen
