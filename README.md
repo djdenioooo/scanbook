@@ -51,7 +51,7 @@ Die Browser-Oberfläche hat sechs Bereiche: **Ausleihe** (Startseite), **Katalog
 | 10 | Ausleiher-Übersicht | Was hat eine bestimmte Person gerade oder früher ausgeliehen? Im Browser unter „Schüler“ → „Ausleih-Verlauf“. |
 | 11 | Statistik | Bestand, Ausleihen, überfällige und meistgeliehene Bücher. |
 | 12 | Export | Katalog, Ausleihen oder Mahnliste als CSV (öffnet sich direkt in Excel). Ausleihen und Mahnliste sind nach Klasse sortiert. |
-| 13 | Backup | Sicherungskopie der Datenbank. Zusätzlich wird einmal täglich beim Start automatisch gesichert. |
+| 13 | Datensicherung (Backup) | Sicherungskopie der Datenbank und zweiten Backup-Ordner festlegen (siehe unten). |
 | 14 | Stammdaten | Schulname, Standard-Leihdauer, Löschfrist usw. |
 | 15 | Buchdaten nachladen | Sucht für Bücher, die schon im Katalog sind, online nach Beschreibung, Cover und Serie. Von Hand eingetragene Angaben bleiben unverändert. |
 | 16 | Regale & Standorte | Regale mit Fächern anlegen; ScanBook sagt für jedes Buch, wo es hingehört (siehe unten). |
@@ -65,6 +65,14 @@ Serie und Band werden beim Scannen aus Google Books und der Deutschen Nationalbi
 
 Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog den Knopf „Alle Bücher nachladen“ (Terminal: Menüpunkt 15). Er ergänzt nur leere Angaben. Die Cover werden direkt im Browser von Google Books, Open Library oder der DNB geladen.
 
+## Datensicherung
+
+ScanBook sichert die Datenbank automatisch einmal täglich in den Ordner `backups/` – beim Start und, wenn das Programm über Nacht offen bleibt, auch an den folgenden Tagen. Die automatischen Backups der letzten 14 Tage bleiben erhalten.
+
+Unter **Verwaltung → Datensicherung** (Terminal: Menüpunkt 13) kannst du einen zweiten Ordner eintragen, z. B. einen USB-Stick, OneDrive oder ein Netzlaufwerk. Jede Sicherung wird dann zusätzlich dorthin kopiert, damit die Daten auch einen PC-Defekt überstehen. Klappt das Kopieren nicht (Stick nicht eingesteckt), zeigt die Verwaltung einen Hinweis.
+
+Zum Wiederherstellen: ScanBook beenden und die gewünschte Backup-Datei als `buecherei_system.db` in den Programmordner kopieren.
+
 ## Regale und Standorte
 
 Im Tab „Regale“ (Terminal: Menüpunkt 16) legst du einmal deine Regale an: Name, Anzahl Fächer, ungefähr wie viele Bücher in ein Fach passen, und welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf.
@@ -75,7 +83,7 @@ ScanBook verteilt die Bücher dann selbst:
 - Innerhalb eines Regals wird nach Genre (in der eingetragenen Reihenfolge) und dann nach Autor sortiert. Bände einer Serie stehen zusammen in der richtigen Reihenfolge.
 - Ist ein Regal voll, kommen die übrigen Bücher ins nächste Regal, das ihr Genre (oder alle übrigen Bücher) aufnimmt. Was nirgends hinpasst, steht unter „Ohne Platz“.
 
-Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau.
+Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau und in der Katalogliste (Spalte „Standort“, grau = geplant, noch nicht eingeräumt). Im Katalog lässt sich nach Regal filtern, die Suche findet auch Regalnamen, und der Katalog-Export enthält den Standort.
 
 ## Schülerausweise
 

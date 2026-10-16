@@ -8,6 +8,7 @@ import csv
 import json
 import ssl
 import bisect
+import shutil
 import sqlite3
 import subprocess
 import urllib.request
@@ -18,7 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -32,6 +33,7 @@ BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 EXPORT_DIR = os.path.join(BASE_DIR, "exporte")
 
 MAX_AUTO_BACKUPS = 14
+BACKUP_ORDNER_EINSTELLUNG = "backup_ordner"  # optionaler zweiter Ordner, z. B. USB-Stick oder OneDrive
 MAX_UPDATE_BACKUPS = 3
 
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
@@ -1416,6 +1418,19 @@ def standort_von(isbn, plan=None):
     return ist, (soll if soll != ist else "")
 
 
+def standorte(plan=None):
+    """Für den Katalog: {isbn: (Standort-Text, Regal-ID, geplant)}.
+    Steht ein Buch schon fest im Regal, zählt dieser Platz, sonst der geplante. Ohne Regale: leer."""
+    plan = plan or regal_plan()
+    if not plan["regale"]:
+        return {}
+    ergebnis = {}
+    for isbn, b in plan["buecher"].items():
+        platz = b["ist"] or b["soll"]
+        ergebnis[isbn] = (standort_text(plan["regale"], platz), platz[0], not b["ist"]) if platz else ("", None, False)
+    return ergebnis
+
+
 def zahl_eingabe(prompt, standard):
     while True:
         eingabe = input(f"{prompt} [{standard}]: ").strip()
@@ -2393,7 +2408,14 @@ def export_daten(typ):
                 SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, serie, band, anzahl_gesamt, anzahl_verfuegbar
                 FROM buecher ORDER BY autor_nachname, titel
             ''').fetchall()
-            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Band", "Exemplare", "Verfügbar"], zeilen
+            orte = standorte()
+
+            def ort(isbn):
+                text, _, geplant = orte.get(isbn, ("", None, False))
+                return f"{text} (geplant)" if text and geplant else text
+            zeilen = [(*z, ort(z[0])) for z in zeilen]
+            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Band", "Exemplare", "Verfügbar",
+                    "Standort"], zeilen
 
         sql = '''
             SELECT a.ausleiher, COALESCE(s.klasse, ''), b.titel, a.isbn, COALESCE(a.exemplar, ''),
@@ -2432,20 +2454,65 @@ def export_menu():
 
 
 # --- DATENBANK-BACKUP ---
+# Sicherungen liegen im Ordner "backups" neben dem Programm. Ist ein zweiter Ordner eingestellt
+# (USB-Stick, OneDrive, Netzlaufwerk), kommt jede Sicherung zusätzlich dorthin – falls der PC ausfällt.
+backup_sperre = threading.Lock()
+backup_status = {"kopie_fehler": ""}
+
+
+def zweiter_backup_ordner():
+    try:
+        return get_einstellung(BACKUP_ORDNER_EINSTELLUNG).strip()
+    except sqlite3.Error:  # ganz alte Datenbank ohne Einstellungen
+        return ""
+
+
+def backup_ordner_pruefen(ordner):
+    """Liefert eine Fehlermeldung oder "" wenn der Ordner benutzbar ist."""
+    if not os.path.isdir(ordner):
+        return "Diesen Ordner gibt es nicht (ist der USB-Stick eingesteckt?)."
+    test = os.path.join(ordner, ".scanbook_test")
+    try:
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+    except OSError:
+        return "In diesen Ordner kann nicht geschrieben werden."
+    return ""
+
+
 def erstelle_backup(praefix="backup"):
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    pfad = os.path.join(BACKUP_DIR, f"{praefix}_{datetime.now():%Y%m%d_%H%M%S}.db")
-    src = sqlite3.connect(DB_NAME)
-    dst = sqlite3.connect(pfad)
-    with dst:
-        src.backup(dst)
-    src.close()
-    dst.close()
-    return pfad
+    with backup_sperre:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        pfad = os.path.join(BACKUP_DIR, f"{praefix}_{datetime.now():%Y%m%d_%H%M%S}.db")
+        src = sqlite3.connect(DB_NAME)
+        dst = sqlite3.connect(pfad)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+        backup_kopieren(pfad, praefix)
+        return pfad
+
+
+def backup_kopieren(pfad, praefix):
+    ordner = zweiter_backup_ordner()
+    backup_status["kopie_fehler"] = ""
+    if not ordner:
+        return
+    fehler = backup_ordner_pruefen(ordner)
+    if not fehler:
+        try:
+            shutil.copy2(pfad, os.path.join(ordner, os.path.basename(pfad)))
+            if praefix == "auto":
+                alte_dateien_aufraeumen(ordner, "auto_", MAX_AUTO_BACKUPS)
+        except OSError as e:
+            fehler = f"Kopieren fehlgeschlagen: {e}"
+    backup_status["kopie_fehler"] = fehler
 
 
 def auto_backup():
-    """Einmal pro Tag beim Start automatisch sichern."""
+    """Einmal pro Tag automatisch sichern – beim Start und, solange ScanBook läuft, auch an den Folgetagen."""
     if not os.path.exists(DB_NAME):
         return
     tages_praefix = f"auto_{datetime.now():%Y%m%d}"
@@ -2455,12 +2522,44 @@ def auto_backup():
     alte_dateien_aufraeumen(BACKUP_DIR, "auto_", MAX_AUTO_BACKUPS)
 
 
+def backups_liste():
+    """Vorhandene Sicherungen, neueste zuerst: [(Dateiname, Zeitpunkt, Größe in Bytes)]."""
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    liste = []
+    for name in os.listdir(BACKUP_DIR):
+        if name.endswith(".db"):
+            pfad = os.path.join(BACKUP_DIR, name)
+            liste.append((name, datetime.fromtimestamp(os.path.getmtime(pfad)), os.path.getsize(pfad)))
+    return sorted(liste, key=lambda x: x[1], reverse=True)
+
+
 def backup_menu():
     ueberschrift("💾 DATENBANK-BACKUP")
     pfad = erstelle_backup()
     print(f"✅ Backup gespeichert unter: {pfad}")
+    ordner = zweiter_backup_ordner()
+    if ordner and backup_status["kopie_fehler"]:
+        print(f"⚠️ Kopie nach {ordner} fehlgeschlagen: {backup_status['kopie_fehler']}")
+    elif ordner:
+        print(f"✅ Kopie liegt auch in: {ordner}")
+    print(f"Automatisch wird einmal täglich gesichert (die letzten {MAX_AUTO_BACKUPS} Tage bleiben erhalten).")
     print("Zum Wiederherstellen: Programm beenden und die Backup-Datei als")
     print(f"'{DB_FILENAME}' in den Programmordner kopieren.")
+
+    print(f"\nZweiter Backup-Ordner (z. B. USB-Stick oder OneDrive): {ordner or '– keiner –'}")
+    neu = input("Neuen Ordner eingeben ('-' = keiner, Enter = so lassen): ").strip().strip('"')
+    if neu == "-":
+        set_einstellung(BACKUP_ORDNER_EINSTELLUNG, "")
+        print("✅ Es wird nur noch im Ordner 'backups' gesichert.")
+    elif neu:
+        fehler = backup_ordner_pruefen(neu)
+        if fehler:
+            print(f"❌ {fehler}")
+        else:
+            set_einstellung(BACKUP_ORDNER_EINSTELLUNG, neu)
+            erstelle_backup()
+            print(f"✅ Gespeichert. Backups werden ab jetzt auch nach {neu} kopiert.")
 
 
 # --- DATENSCHUTZ: ALTE AUSLEIHEN LÖSCHEN ---
@@ -2492,7 +2591,7 @@ MENUE = [
     ("Ausleiher-Übersicht", show_borrower),
     ("Statistik", show_statistics),
     ("Export (CSV / Excel)", export_menu),
-    ("Datenbank-Backup erstellen", backup_menu),
+    ("Datensicherung (Backup)", backup_menu),
     ("Stammdaten", manage_stammdaten),
     ("Buchdaten online nachladen (Beschreibung, Cover, Serie)", buchdaten_nachladen_menue),
     ("Regale & Standorte", regale_menue),
@@ -2507,6 +2606,7 @@ def main():
     alte_ausleihen_loeschen()
 
     while True:
+        auto_backup()  # falls das Programm über Nacht offen bleibt
         bib_name = get_einstellung("bib_name", "Schulbibliothek")
         print(f"\n=== 📚 ScanBook {VERSION} - {bib_name} ===")
         for idx, (text, _) in enumerate(MENUE, 1):
