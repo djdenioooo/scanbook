@@ -68,4 +68,10 @@ Die Datenbank enthält Namen von Ausleihern und wird deshalb über `.gitignore` 
 2. Auf GitHub hochladen.
 3. Empfohlen: auf GitHub ein **Release** mit einem Tag erstellen (z. B. `v2.1.0`). Das Programm holt bevorzugt das neueste Release. Gibt es noch keins, wird der `main`-Branch verwendet.
 
-Ein Update wird nur installiert, wenn die Versionsnummer höher ist und der Code fehlerfrei geladen werden kann. Die letzten 3 alten Versionen werden in `backups/` aufbewahrt.
+Ein Update ersetzt `ScanBook.py` und `ScanBook_Web.py`. Es wird nur installiert, wenn die Versionsnummer in `ScanBook.py` höher ist und beide Dateien fehlerfrei geladen werden können. Die letzten 3 alten Versionen werden in `backups/` aufbewahrt.
+
+Die Updates werden ohne Anmeldung von GitHub geladen. Das Repository muss deshalb **öffentlich** sein.
+
+## Google Books API-Schlüssel (optional)
+
+Ohne Schlüssel funktioniert die Suche auch, nur mit weniger Abfragen pro Tag. Einen eigenen Schlüssel als Umgebungsvariable `GOOGLE_API_KEY` setzen, niemals in den Code schreiben.
