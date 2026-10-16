@@ -32,6 +32,13 @@ jobs:
           $pth = Get-ChildItem paket\ScanBook\python\python*._pth | Select-Object -First 1
           Add-Content $pth.FullName ".."
 
+      - name: ScanBook.exe bauen
+        shell: pwsh
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /target:exe /out:paket\ScanBook\ScanBook.exe /reference:System.Windows.Forms.dll windows\ScanBookStarter.cs
+          if ($LASTEXITCODE -ne 0) { throw "ScanBook.exe konnte nicht gebaut werden." }
+
       - name: ScanBook-Dateien kopieren
         shell: pwsh
         run: |
@@ -41,8 +48,10 @@ jobs:
         shell: pwsh
         run: |
           # In einer Kopie testen, damit keine Datenbank im Paket landet.
+          # Gestartet wird ueber ScanBook.exe, genau wie per Doppelklick.
           Copy-Item paket\ScanBook test -Recurse
-          $p = Start-Process test\python\python.exe -ArgumentList "ScanBook_Web.py", "--no-browser" -WorkingDirectory test -PassThru
+          $env:BROWSER = "none"
+          $p = Start-Process test\ScanBook.exe -WorkingDirectory $env:TEMP -PassThru
           $ok = $false
           foreach ($i in 1..20) {
             Start-Sleep -Seconds 1
@@ -52,6 +61,7 @@ jobs:
             } catch {}
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
           if (-not $ok) { throw "ScanBook-Oberflaeche hat nicht geantwortet." }
           Write-Host "ScanBook laeuft mit dem portablen Python."
 
