@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.1.2"
+VERSION = "2.2.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -480,6 +480,117 @@ def zertifikat_hinweis(fehler):
         print("      und ScanBook neu starten.")
 
 
+# --- GENRE ERKENNEN ---
+MAX_GENRES = 3
+
+# Begriffe aus Google Books, Open Library und DNB -> deutsches Genre (spezielle Muster zuerst)
+GENRE_MUSTER = [
+    (r"juvenile|young adult|children|kinder|jugend", "Kinder- und Jugendbuch"),
+    (r"science.fiction", "Science-Fiction"),
+    (r"fantasy", "Fantasy"),
+    (r"historical fiction|historische[rn]? roman", "Historischer Roman"),
+    (r"crime|mystery|detective|krimi|detektiv", "Krimi"),
+    (r"thriller|suspense", "Thriller"),
+    (r"horror|gruselgeschichte", "Horror"),
+    (r"romance|liebesroman|liebesgeschichte", "Liebesroman"),
+    (r"comic|graphic novel|manga", "Comic"),
+    (r"poetry|lyrik|gedicht", "Lyrik"),
+    (r"^drama|theater|schauspiel", "Drama"),
+    (r"humou?r|satire", "Humor"),
+    (r"biograph|biograf|memoir|autobiogra", "Biografie"),
+    (r"cook|kochbuch|kochen|rezept", "Kochbuch"),
+    (r"travel|reiseführer|reisebericht", "Reisen"),
+    (r"self-help|ratgeber|lebenshilfe", "Ratgeber"),
+    (r"psycholog", "Psychologie"),
+    (r"philosoph", "Philosophie"),
+    (r"religio|theolog|bible|bibel", "Religion"),
+    (r"political science|politik", "Politik"),
+    (r"business|economics|wirtschaft", "Wirtschaft"),
+    (r"computer|informatik|programmier", "Informatik"),
+    (r"health|medic|gesundheit|medizin", "Gesundheit"),
+    (r"\bsports?\b", "Sport"),
+    (r"music|musik", "Musik"),
+    (r"^art\b|\bkunst", "Kunst"),
+    (r"^history|^geschichte", "Geschichte"),
+    (r"^science$|^nature$|naturwissenschaft", "Naturwissenschaften"),
+    (r"fiction|roman$|belletristik|erzählung|novelle|fiktionale darstellung", "Roman"),
+]
+
+# Genaue Romangenres – daneben ist "Roman" überflüssig
+ROMAN_GENRES = {"Science-Fiction", "Fantasy", "Historischer Roman", "Krimi", "Thriller", "Horror", "Liebesroman"}
+
+# DNB-Sachgruppen (Buchstaben) und DDC-Nummern -> Genre
+DNB_SACHGRUPPEN = {"B": "Roman", "K": "Kinder- und Jugendbuch", "S": "Schulbuch"}
+DDC_GENRES = [  # (Anfang der DDC-Nummer, Genre) – längster Treffer gewinnt
+    ("0", "Sachbuch"), ("004", "Informatik"), ("005", "Informatik"),
+    ("1", "Philosophie"), ("13", "Ratgeber"), ("15", "Psychologie"),
+    ("2", "Religion"),
+    ("3", "Gesellschaft"), ("32", "Politik"), ("33", "Wirtschaft"), ("34", "Recht"),
+    ("37", "Pädagogik"), ("39", "Bräuche & Folklore"),
+    ("4", "Sprache"),
+    ("5", "Naturwissenschaften"), ("51", "Mathematik"),
+    ("6", "Technik"), ("61", "Gesundheit"), ("63", "Garten & Landwirtschaft"), ("64", "Haushalt"),
+    ("641", "Kochbuch"), ("65", "Wirtschaft"),
+    ("7", "Kunst"), ("741.5", "Comic"), ("78", "Musik"), ("79", "Sport & Freizeit"),
+    ("8", "Literatur"), ("8x1", "Lyrik"), ("8x2", "Drama"), ("8x3", "Roman"), ("8x7", "Humor"),
+    ("9", "Geschichte"), ("91", "Reisen"), ("92", "Biografie"),
+]
+
+# Open-Library-Subjects, die nichts über das Genre sagen
+GENRE_RAUSCHEN = re.compile(r"accessible book|protected daisy|in library|lending library|"
+                            r"^nyt:|award|large type|^open library|^long now|reading level|"
+                            r"^\d|translations into", re.I)
+
+
+def genre_aus_text(begriff):
+    begriff = (begriff or "").strip().lower()
+    return [genre for muster, genre in GENRE_MUSTER if re.search(muster, begriff)]
+
+
+def genre_aus_ddc(nummer):
+    nummer = (nummer or "").strip().upper()
+    if nummer in DNB_SACHGRUPPEN:
+        return DNB_SACHGRUPPEN[nummer]
+    if not re.match(r"\d", nummer):
+        return None
+    beste, laenge = None, 0
+    for anfang, genre in DDC_GENRES:
+        if "x" in anfang:  # Literatur einer beliebigen Sprache, z. B. 833 = deutscher Roman
+            passt = len(nummer) >= 3 and nummer[0] == "8" and nummer[1] != "0" and nummer[2] == anfang[2]
+        else:
+            passt = nummer.startswith(anfang)
+        if passt and len(anfang) > laenge:
+            beste, laenge = genre, len(anfang)
+    return beste
+
+
+def genres_zusammenfuehren(*listen):
+    ergebnis = []
+    for liste in listen:
+        for genre in liste:
+            if genre and genre not in ergebnis:
+                ergebnis.append(genre)
+    # Allgemeine Angaben weglassen, wenn schon ein genaueres Genre da ist
+    if len(ergebnis) > 1:
+        ergebnis = [g for g in ergebnis if g not in ("Literatur", "Sachbuch")] or ergebnis
+    if any(g in ROMAN_GENRES for g in ergebnis):
+        ergebnis = [g for g in ergebnis if g != "Roman"]
+    return ergebnis[:MAX_GENRES]
+
+
+def genre_ermitteln(begriffe, klassen=(), schlagwoerter=()):
+    """Liefert (Genres, sicher). 'sicher' = aus einer Einordnung erkannt statt nur Schlagwörter übernommen."""
+    erkannt = genres_zusammenfuehren(
+        [genre_aus_ddc(k) for k in klassen],
+        [g for b in begriffe for g in genre_aus_text(b)],
+    )
+    if erkannt:
+        return erkannt, erkannt != ["Roman"]  # nur "Roman" -> andere Quellen nach Genaurem fragen
+    roh = [b.strip() for b in list(begriffe) + list(schlagwoerter)
+           if b and b.strip() and not GENRE_RAUSCHEN.search(b)]
+    return genres_zusammenfuehren(roh), False
+
+
 def neue_buchdaten(titel, autoren, verlag, jahr, genre):
     return {
         'titel': titel or 'Unbekannter Titel',
@@ -499,13 +610,18 @@ def fetch_from_google(isbn):
         data = json.loads(http_get(f"https://www.googleapis.com/books/v1/volumes?{params}"))
         if data.get("items"):
             info = data["items"][0]["volumeInfo"]
-            return neue_buchdaten(
+            # Kategorien wie "Fiction / Fantasy / Epic" in Einzelteile zerlegen
+            begriffe = [t for k in info.get('categories', []) for t in k.split("/")]
+            genres, sicher = genre_ermitteln(begriffe)
+            daten = neue_buchdaten(
                 info.get('title'),
                 ', '.join(info.get('authors', [])),
                 info.get('publisher'),
                 info.get('publishedDate', '')[:4],
-                ', '.join(info.get('categories', [])),
+                ', '.join(genres),
             )
+            daten['_genres'], daten['_genre_sicher'] = genres, sicher
+            return daten
     except Exception as e:
         print(f"⚠️ Google-Books-Abfrage fehlgeschlagen: {e}")
         zertifikat_hinweis(e)
@@ -518,13 +634,16 @@ def fetch_from_openlibrary(isbn):
         eintrag = json.loads(http_get(url)).get(f"ISBN:{isbn}")
         if eintrag:
             jahr = re.search(r"\d{4}", eintrag.get("publish_date", ""))
-            return neue_buchdaten(
+            genres, sicher = genre_ermitteln([s["name"] for s in eintrag.get("subjects", [])])
+            daten = neue_buchdaten(
                 eintrag.get("title"),
                 ', '.join(a["name"] for a in eintrag.get("authors", [])),
                 ', '.join(p["name"] for p in eintrag.get("publishers", [])),
                 jahr.group(0) if jahr else None,
-                ', '.join(s["name"] for s in eintrag.get("subjects", [])[:3]),
+                ', '.join(genres),
             )
+            daten['_genres'], daten['_genre_sicher'] = genres, sicher
+            return daten
     except Exception as e:
         print(f"⚠️ Open-Library-Abfrage fehlgeschlagen: {e}")
         zertifikat_hinweis(e)
@@ -598,9 +717,16 @@ def parse_dnb_marc(record):
             if wort and wort not in schlagwoerter:
                 schlagwoerter.append(wort)
 
+    # Sachgruppe/DDC (z. B. "B" = Belletristik, "833" = deutscher Roman) und Gattung (z. B. "Roman", "Fantasy")
+    klassen = [k for tag in ("082", "083", "084") for f in felder(tag) for k in marc_unterfelder(f, "a")]
+    gattungen = [marc_text(g) for f in felder("655") for g in marc_unterfelder(f, "a")]
+
     if not titel:
         return None
-    return neue_buchdaten(titel, ', '.join(autoren), verlag, jahr, ', '.join(schlagwoerter[:3]))
+    genres, sicher = genre_ermitteln(gattungen, klassen, schlagwoerter)
+    daten = neue_buchdaten(titel, ', '.join(autoren), verlag, jahr, ', '.join(genres))
+    daten['_genres'], daten['_genre_sicher'] = genres, sicher
+    return daten
 
 
 def fetch_from_dnb(isbn):
@@ -628,12 +754,27 @@ def fetch_book_data(isbn):
         ("Deutsche Nationalbibliothek", fetch_from_dnb),
         ("Open Library", fetch_from_openlibrary),
     )
+    daten, sichere, unsichere = None, [], []
     for name, quelle in quellen:
-        daten = quelle(isbn)
-        if daten:
+        if daten and sichere:
+            break  # Buch gefunden und Genre erkannt
+        treffer = quelle(isbn)
+        if not treffer:
+            continue
+        if not daten:
+            daten = treffer
             print(f"📡 Gefunden bei {name}.")
-            return daten
-    return None
+        elif treffer['_genre_sicher']:
+            print(f"📡 Genre ergänzt aus {name}.")
+        (sichere if treffer['_genre_sicher'] else unsichere).append(treffer['_genres'])
+
+    if not daten:
+        return None
+    genres = genres_zusammenfuehren(*(sichere or [g for g in unsichere if g][:1]))
+    daten['genre'] = ', '.join(genres) or 'Keine Angabe'
+    daten.pop('_genres', None)
+    daten.pop('_genre_sicher', None)
+    return daten
 
 
 # --- BUCHDATEN ANZEIGEN, PRÜFEN & BEARBEITEN ---
