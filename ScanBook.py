@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -70,6 +70,8 @@ STAMMDATEN = [
     ("kontakt_email", "E-Mail", None),
     ("standard_leihdauer", "Standard-Leihdauer (Tage)", "positiv"),
     ("loeschfrist_monate", "Löschfrist alter Ausleihen (Monate, 0 = nie)", "zahl"),
+    ("ausweis_praefix", "Vorsilbe für Ausweisnummern", None),
+    ("mediencode_praefix", "Vorsilbe für Mediencodes", None),
 ]
 
 DEFAULT_EINSTELLUNGEN = {
@@ -79,6 +81,8 @@ DEFAULT_EINSTELLUNGEN = {
     "kontakt_email": "bibliothek@schule.de",
     "standard_leihdauer": "14",
     "loeschfrist_monate": "12",
+    "ausweis_praefix": "S",
+    "mediencode_praefix": "M",
 }
 
 BUCH_SPALTEN = "autor_formatiert, titel, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar, isbn, serie, band"
@@ -419,6 +423,29 @@ def init_db():
             )
         ''')
 
+        # Schüler mit Ausweisnummer (steht als Barcode auf dem Schülerausweis)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS schueler (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ausweis TEXT UNIQUE COLLATE NOCASE,
+                vorname TEXT,
+                nachname TEXT,
+                klasse TEXT DEFAULT ''
+            )
+        ''')
+
+        # Mediencodes: eigene Nummer pro Exemplar, als Etikett im Buch (eigener = schon vorhandenes Etikett)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS exemplare (
+                code TEXT PRIMARY KEY COLLATE NOCASE,
+                isbn TEXT,
+                eigener INTEGER DEFAULT 0,
+                gedruckt INTEGER DEFAULT 0,
+                FOREIGN KEY(isbn) REFERENCES buecher(isbn)
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS exemplare_isbn ON exemplare(isbn)")
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS einstellungen (
                 schluessel TEXT PRIMARY KEY,
@@ -444,6 +471,11 @@ def init_db():
             cursor.execute("ALTER TABLE ausleihen ADD COLUMN zurueckgegeben_am DATE")
         if "verlaengerungen" not in vorhandene_spalten:
             cursor.execute("ALTER TABLE ausleihen ADD COLUMN verlaengerungen INTEGER DEFAULT 0")
+        # Wer (Schüler) und welches Exemplar (Mediencode) – leer bei Ausleihen per Name bzw. ISBN
+        if "schueler_id" not in vorhandene_spalten:
+            cursor.execute("ALTER TABLE ausleihen ADD COLUMN schueler_id INTEGER")
+        if "exemplar" not in vorhandene_spalten:
+            cursor.execute("ALTER TABLE ausleihen ADD COLUMN exemplar TEXT")
 
         for key, val in DEFAULT_EINSTELLUNGEN.items():
             cursor.execute("INSERT OR IGNORE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (key, val))
@@ -1693,29 +1725,25 @@ def manage_book():
             print("✅ Buchdaten gespeichert!")
 
         elif wahl == "2":
-            if daten['anzahl_gesamt'] <= 1:
-                print("ℹ️ Das ist das letzte Exemplar – nutze 'Buch komplett löschen'.")
-            elif daten['anzahl_verfuegbar'] <= 0:
-                print("❌ Alle Exemplare sind ausgeliehen. Erst nach einer Rückgabe kann eins entfernt werden.")
-            else:
-                with db_connection() as conn:
-                    conn.execute('''
-                        UPDATE buecher SET anzahl_gesamt = anzahl_gesamt - 1, anzahl_verfuegbar = anzahl_verfuegbar - 1
-                        WHERE isbn = ?
-                    ''', (isbn,))
+            codes = exemplare_von(isbn)
+            code = None
+            if codes:
+                print("Mediencodes: " + ", ".join(e["code"] + (f" (bei {e['ausgeliehen_an']})" if e["ausgeliehen_an"] else "")
+                                                  for e in codes))
+                code = input("Mediencode des Exemplars ([ENTER] = Exemplar ohne Code): ").strip() or None
+            try:
+                exemplar_entfernen(isbn, code)
                 print("✅ Ein Exemplar entfernt.")
+            except ValueError as e:
+                print(f"❌ {e}")
 
         elif wahl == "3":
-            with db_connection() as conn:
-                aktiv = conn.execute(
-                    "SELECT COUNT(*) FROM ausleihen WHERE isbn = ? AND status = 'aktiv'", (isbn,)
-                ).fetchone()[0]
-            if aktiv:
-                print(f"❌ Das Buch ist noch {aktiv}x ausgeliehen und kann nicht gelöscht werden.")
-            elif ja_nein(f"⚠️ '{daten['titel']}' samt Ausleih-Historie wirklich löschen?"):
-                with db_connection() as conn:
-                    conn.execute("DELETE FROM ausleihen WHERE isbn = ?", (isbn,))
-                    conn.execute("DELETE FROM buecher WHERE isbn = ?", (isbn,))
+            if ja_nein(f"⚠️ '{daten['titel']}' samt Ausleih-Historie wirklich löschen?"):
+                try:
+                    buch_loeschen(isbn)
+                except ValueError as e:
+                    print(f"❌ {e}")
+                    continue
                 print("🗑️ Buch gelöscht.")
                 return
 
@@ -1765,11 +1793,326 @@ def buchdaten_nachladen_menue():
     warte()
 
 
+# --- SCHÜLER & MEDIENCODES ---
+AUSWEIS_STELLEN = 4
+MEDIENCODE_STELLEN = 5
+
+
+def code_gueltig(code):
+    """Codes stehen als Barcode (Code 128) auf Etiketten und Ausweisen: nur einfache Zeichen, nicht zu lang."""
+    return 0 < len(code) <= 30 and all(32 < ord(z) < 127 for z in code)
+
+
+def code_vergeben(conn, code, ausser_schueler=None):
+    return bool(
+        conn.execute("SELECT 1 FROM exemplare WHERE code = ?", (code,)).fetchone()
+        or conn.execute("SELECT 1 FROM schueler WHERE ausweis = ? AND id IS NOT ?", (code, ausser_schueler)).fetchone()
+    )
+
+
+def naechster_code(conn, einstellung, stellen):
+    """Nächste freie Nummer mit Vorsilbe, z. B. M00013 – zählt ab der höchsten schon vergebenen weiter."""
+    row = conn.execute("SELECT wert FROM einstellungen WHERE schluessel = ?", (einstellung,)).fetchone()
+    praefix = (row[0] if row else DEFAULT_EINSTELLUNGEN[einstellung]).strip()
+    hoechste = 0
+    for (code,) in conn.execute("SELECT code FROM exemplare UNION ALL SELECT ausweis FROM schueler"):
+        rest = (code or "")[len(praefix):]
+        if code and code.upper().startswith(praefix.upper()) and rest.isdigit():
+            hoechste = max(hoechste, int(rest))
+    while True:
+        hoechste += 1
+        code = f"{praefix}{hoechste:0{stellen}d}"
+        if not normalize_isbn(code) and not code_vergeben(conn, code):
+            return code
+
+
+def neuer_code_pruefen(conn, code, ausser_schueler=None):
+    if not code_gueltig(code):
+        raise ValueError("Ein Code darf höchstens 30 Zeichen lang sein und keine Leerzeichen oder Umlaute enthalten.")
+    if normalize_isbn(code):
+        raise ValueError(f"'{code}' ist eine ISBN und kann nicht als Code verwendet werden.")
+    if code_vergeben(conn, code, ausser_schueler):
+        raise ValueError(f"Der Code '{code}' ist schon vergeben.")
+
+
+def schueler_name(vorname, nachname):
+    return f"{vorname} {nachname}".strip()
+
+
+def schueler_speichern(schueler_id, vorname, nachname, klasse, ausweis=""):
+    """Legt einen Schüler an (schueler_id leer) oder ändert ihn. Leere Ausweisnummer = automatisch vergeben."""
+    vorname, nachname, klasse, ausweis = (str(w or "").strip() for w in (vorname, nachname, klasse, ausweis))
+    if not vorname or not nachname:
+        raise ValueError("Bitte Vor- und Nachname eingeben.")
+    with db_connection() as conn:
+        if ausweis:
+            neuer_code_pruefen(conn, ausweis, schueler_id)
+        elif schueler_id:
+            row = conn.execute("SELECT ausweis FROM schueler WHERE id = ?", (schueler_id,)).fetchone()
+            ausweis = row[0] if row else ""
+        if not ausweis:
+            ausweis = naechster_code(conn, "ausweis_praefix", AUSWEIS_STELLEN)
+        if schueler_id:
+            if not conn.execute("UPDATE schueler SET vorname = ?, nachname = ?, klasse = ?, ausweis = ? WHERE id = ?",
+                                (vorname, nachname, klasse, ausweis, schueler_id)).rowcount:
+                raise ValueError("Diesen Schüler gibt es nicht (mehr).")
+            # Name auch bei den Ausleihen anpassen, damit Listen und Mahnliste stimmen
+            conn.execute("UPDATE ausleihen SET ausleiher = ? WHERE schueler_id = ?",
+                         (schueler_name(vorname, nachname), schueler_id))
+            return schueler_id
+        return conn.execute("INSERT INTO schueler (ausweis, vorname, nachname, klasse) VALUES (?, ?, ?, ?)",
+                            (ausweis, vorname, nachname, klasse)).lastrowid
+
+
+def schueler_loeschen(schueler_id):
+    with db_connection() as conn:
+        offen = conn.execute("SELECT COUNT(*) FROM ausleihen WHERE schueler_id = ? AND status = 'aktiv'",
+                             (schueler_id,)).fetchone()[0]
+        if offen:
+            raise ValueError(f"Der Schüler hat noch {offen} Buch/Bücher ausgeliehen.")
+        # Frühere Ausleihen bleiben mit Namen erhalten (bis zur Löschfrist)
+        conn.execute("UPDATE ausleihen SET schueler_id = NULL WHERE schueler_id = ?", (schueler_id,))
+        conn.execute("DELETE FROM schueler WHERE id = ?", (schueler_id,))
+
+
+def lade_schueler(schueler_id):
+    with db_connection() as conn:
+        row = conn.execute("SELECT id, ausweis, vorname, nachname, klasse FROM schueler WHERE id = ?",
+                           (schueler_id,)).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "ausweis": row[1], "vorname": row[2], "nachname": row[3], "klasse": row[4] or "",
+            "name": schueler_name(row[2], row[3])}
+
+
+def klassen_sortierwert(klasse):
+    """'5a' vor '10b': erst nach Zahl, dann nach dem Rest."""
+    zahl = re.match(r"\d+", klasse or "")
+    return (int(zahl.group()) if zahl else 999, (klasse or "").lower())
+
+
+SCHUELER_KOPF = {"vorname": "vorname", "nachname": "nachname", "name": "nachname", "familienname": "nachname",
+                 "klasse": "klasse", "ausweis": "ausweis", "ausweisnummer": "ausweis", "nummer": "ausweis"}
+
+
+def schueler_importieren(text):
+    """Liest eine Klassenliste ein (aus Excel kopiert oder als CSV-Datei).
+    Spalten: Nachname, Vorname, Klasse und optional Ausweisnummer – oder in der Reihenfolge der Kopfzeile."""
+    zeilen = [z for z in (text or "").lstrip("﻿").splitlines() if z.strip()]
+    if not zeilen:
+        return {"neu": 0, "vorhanden": 0, "fehler": []}
+    trenner = max("\t;,", key=zeilen[0].count)
+    zeilen = list(csv.reader(zeilen, delimiter=trenner))
+    reihenfolge = ["nachname", "vorname", "klasse", "ausweis"]
+    kopf = [SCHUELER_KOPF.get(z.strip().lower().replace("-", "")) for z in zeilen[0]]
+    if "vorname" in kopf and "nachname" in kopf:
+        reihenfolge, zeilen = kopf, zeilen[1:]
+
+    neu, vorhanden, fehler = 0, 0, []
+    with db_connection() as conn:
+        bekannt = {(v.lower(), n.lower(), (k or "").lower())
+                   for v, n, k in conn.execute("SELECT vorname, nachname, klasse FROM schueler")}
+    for nr, zeile in enumerate(zeilen, 1):
+        werte = {feld: zeile[i].strip() for i, feld in enumerate(reihenfolge) if feld and i < len(zeile)}
+        schluessel = tuple(werte.get(f, "").lower() for f in ("vorname", "nachname", "klasse"))
+        if schluessel in bekannt:
+            vorhanden += 1
+            continue
+        try:
+            schueler_speichern(None, werte.get("vorname"), werte.get("nachname"), werte.get("klasse"), werte.get("ausweis"))
+            bekannt.add(schluessel)
+            neu += 1
+        except ValueError as e:
+            fehler.append(f"Zeile {nr} ({' '.join(zeile).strip()}): {e}")
+    return {"neu": neu, "vorhanden": vorhanden, "fehler": fehler}
+
+
+def exemplare_von(isbn):
+    """Mediencodes eines Buchs, mit der Person, die das Exemplar gerade hat."""
+    with db_connection() as conn:
+        rows = conn.execute('''
+            SELECT e.code, e.eigener, e.gedruckt,
+                   (SELECT a.ausleiher FROM ausleihen a WHERE a.exemplar = e.code AND a.status = 'aktiv')
+            FROM exemplare e WHERE e.isbn = ? ORDER BY e.code
+        ''', (isbn,)).fetchall()
+    return [{"code": c, "eigener": bool(e), "gedruckt": bool(g), "ausgeliehen_an": a or ""} for c, e, g, a in rows]
+
+
+def exemplar_anlegen(isbn, code=""):
+    """Gibt einem Exemplar einen Mediencode: einen eigenen (z. B. ein schon aufgeklebtes Etikett) oder,
+    wenn code leer ist, die nächste freie Nummer. Haben schon alle Exemplare einen Code, ist es ein
+    weiteres Exemplar und der Bestand steigt um eins. Liefert (code, aufgestockt)."""
+    code = str(code or "").strip()
+    eigener = bool(code)
+    with db_connection() as conn:
+        row = conn.execute("SELECT anzahl_gesamt FROM buecher WHERE isbn = ?", (isbn,)).fetchone()
+        if not row:
+            raise ValueError("Dieses Buch ist nicht im Katalog.")
+        if eigener:
+            neuer_code_pruefen(conn, code)
+        else:
+            code = naechster_code(conn, "mediencode_praefix", MEDIENCODE_STELLEN)
+        mit_code = conn.execute("SELECT COUNT(*) FROM exemplare WHERE isbn = ?", (isbn,)).fetchone()[0]
+        aufgestockt = mit_code >= row[0]
+        if aufgestockt:
+            conn.execute("UPDATE buecher SET anzahl_gesamt = anzahl_gesamt + 1, anzahl_verfuegbar = anzahl_verfuegbar + 1 "
+                         "WHERE isbn = ?", (isbn,))
+        conn.execute("INSERT INTO exemplare (code, isbn, eigener) VALUES (?, ?, ?)", (code, isbn, int(eigener)))
+    return code, aufgestockt
+
+
+def fehlende_codes_erzeugen(isbn=None):
+    """Erzeugt Mediencodes für alle Exemplare ohne Code – für ein Buch oder den ganzen Katalog."""
+    with db_connection() as conn:
+        sql = "SELECT isbn, anzahl_gesamt - (SELECT COUNT(*) FROM exemplare e WHERE e.isbn = b.isbn) FROM buecher b"
+        offen = conn.execute(sql + (" WHERE isbn = ?" if isbn else "") + " ORDER BY autor_nachname, titel",
+                             (isbn,) if isbn else ()).fetchall()
+        neu = []
+        for buch_isbn, anzahl in offen:
+            for _ in range(max(0, anzahl)):
+                code = naechster_code(conn, "mediencode_praefix", MEDIENCODE_STELLEN)
+                conn.execute("INSERT INTO exemplare (code, isbn) VALUES (?, ?)", (code, buch_isbn))
+                neu.append(code)
+    return neu
+
+
+def exemplare_ohne_code():
+    with db_connection() as conn:
+        return conn.execute('''
+            SELECT COALESCE(SUM(MAX(0, anzahl_gesamt - (SELECT COUNT(*) FROM exemplare e WHERE e.isbn = b.isbn))), 0)
+            FROM buecher b
+        ''').fetchone()[0]
+
+
+def exemplar_loeschen(code):
+    """Entfernt nur den Mediencode – das Exemplar selbst bleibt im Bestand."""
+    with db_connection() as conn:
+        if conn.execute("SELECT 1 FROM ausleihen WHERE exemplar = ? AND status = 'aktiv'", (code,)).fetchone():
+            raise ValueError("Dieses Exemplar ist gerade ausgeliehen.")
+        if not conn.execute("DELETE FROM exemplare WHERE code = ?", (code,)).rowcount:
+            raise ValueError("Diesen Mediencode gibt es nicht (mehr).")
+
+
+def exemplar_entfernen(isbn, code=None):
+    """Nimmt ein Exemplar aus dem Bestand (verloren, kaputt). Mit Mediencode genau dieses, sonst eins ohne Code."""
+    with db_connection() as conn:
+        row = conn.execute("SELECT anzahl_gesamt, anzahl_verfuegbar FROM buecher WHERE isbn = ?", (isbn,)).fetchone()
+        if not row:
+            raise ValueError("Dieses Buch ist nicht im Katalog.")
+        gesamt, verfuegbar = row
+        if gesamt <= 1:
+            raise ValueError("Das ist das letzte Exemplar – bitte stattdessen das Buch löschen.")
+        if code:
+            if conn.execute("SELECT 1 FROM ausleihen WHERE exemplar = ? AND status = 'aktiv'", (code,)).fetchone():
+                raise ValueError("Dieses Exemplar ist gerade ausgeliehen.")
+            if not conn.execute("DELETE FROM exemplare WHERE code = ? AND isbn = ?", (code, isbn)).rowcount:
+                raise ValueError("Dieser Mediencode gehört nicht zu diesem Buch.")
+        elif conn.execute("SELECT COUNT(*) FROM exemplare WHERE isbn = ?", (isbn,)).fetchone()[0] >= gesamt:
+            raise ValueError("Alle Exemplare haben einen Mediencode – bitte den Code des Exemplars angeben, das entfernt wird.")
+        if verfuegbar <= 0:
+            raise ValueError("Alle Exemplare sind ausgeliehen. Erst nach einer Rückgabe kann eins entfernt werden.")
+        conn.execute("UPDATE buecher SET anzahl_gesamt = anzahl_gesamt - 1, anzahl_verfuegbar = anzahl_verfuegbar - 1 "
+                     "WHERE isbn = ?", (isbn,))
+
+
+def buch_loeschen(isbn):
+    with db_connection() as conn:
+        aktiv = conn.execute("SELECT COUNT(*) FROM ausleihen WHERE isbn = ? AND status = 'aktiv'", (isbn,)).fetchone()[0]
+        if aktiv:
+            raise ValueError(f"Das Buch ist noch {aktiv}x ausgeliehen und kann nicht gelöscht werden.")
+        conn.execute("DELETE FROM ausleihen WHERE isbn = ?", (isbn,))
+        conn.execute("DELETE FROM exemplare WHERE isbn = ?", (isbn,))
+        conn.execute("DELETE FROM buecher WHERE isbn = ?", (isbn,))
+
+
+def code_aufloesen(eingabe):
+    """Was wurde gescannt? ("exemplar", isbn, code), ("schueler", id, ausweis), ("isbn", isbn, None) oder None."""
+    eingabe = str(eingabe or "").strip()
+    if not eingabe:
+        return None
+    with db_connection() as conn:
+        row = conn.execute("SELECT isbn, code FROM exemplare WHERE code = ?", (eingabe,)).fetchone()
+        if row:
+            return ("exemplar", row[0], row[1])
+        row = conn.execute("SELECT id, ausweis FROM schueler WHERE ausweis = ?", (eingabe,)).fetchone()
+        if row:
+            return ("schueler", row[0], row[1])
+    isbn = normalize_isbn(eingabe)
+    return ("isbn", isbn, None) if isbn else None
+
+
+def person_aufloesen(eingabe):
+    """Ausweis gescannt oder Name eingetippt? Liefert (Name, schueler_id oder None)."""
+    eingabe = str(eingabe or "").strip()
+    treffer = code_aufloesen(eingabe)
+    if treffer and treffer[0] == "schueler":
+        s = lade_schueler(treffer[1])
+        return s["name"], s["id"]
+    # "Max Muster (5a)" aus der Vorschlagsliste oder genau ein Schüler mit diesem Namen
+    name = re.sub(r"\s*\([^()]*\)$", "", eingabe)
+    klasse = eingabe[len(name):].strip(" ()")
+    with db_connection() as conn:
+        rows = conn.execute('''
+            SELECT id FROM schueler
+            WHERE LOWER(vorname || ' ' || nachname) = LOWER(?) AND (? = '' OR LOWER(klasse) = LOWER(?))
+        ''', (name, klasse, klasse)).fetchall()
+    if len(rows) == 1:
+        s = lade_schueler(rows[0][0])
+        return s["name"], s["id"]
+    return name, None
+
+
+def buch_ausleihen(isbn, ausleiher, tage, schueler_id=None, exemplar=None):
+    """Trägt eine Ausleihe ein. Liefert (Name des Ausleihers, Rückgabedatum)."""
+    ausgeliehen_am = heute()
+    rueckgabe_bis = ausgeliehen_am + timedelta(days=tage)
+    with db_connection() as conn:
+        if exemplar:
+            besitzer = conn.execute("SELECT ausleiher FROM ausleihen WHERE exemplar = ? AND status = 'aktiv'",
+                                    (exemplar,)).fetchone()
+            if besitzer:
+                raise ValueError(f"Das Exemplar {exemplar} ist noch an {besitzer[0]} ausgeliehen. Bitte erst zurückgeben.")
+        if not conn.execute(
+            "UPDATE buecher SET anzahl_verfuegbar = anzahl_verfuegbar - 1 WHERE isbn = ? AND anzahl_verfuegbar > 0",
+            (isbn,),
+        ).rowcount:
+            titel = conn.execute("SELECT titel FROM buecher WHERE isbn = ?", (isbn,)).fetchone()
+            raise ValueError(f"'{titel[0] if titel else isbn}' ist aktuell vollständig ausgeliehen!")
+
+        if not schueler_id:
+            # Gleiche Schreibweise wie bei früheren Ausleihen verwenden ("max mustermann" → "Max Mustermann")
+            bekannt = conn.execute(
+                "SELECT ausleiher FROM ausleihen WHERE LOWER(ausleiher) = LOWER(?) LIMIT 1", (ausleiher,)
+            ).fetchone()
+            if bekannt:
+                ausleiher = bekannt[0]
+
+        conn.execute('''
+            INSERT INTO ausleihen (isbn, ausleiher, ausgeliehen_am, rueckgabe_bis, status, schueler_id, exemplar)
+            VALUES (?, ?, ?, ?, 'aktiv', ?, ?)
+        ''', (isbn, ausleiher, ausgeliehen_am.isoformat(), rueckgabe_bis.isoformat(), schueler_id, exemplar))
+    return ausleiher, rueckgabe_bis
+
+
+def lies_buchcode(prompt):
+    """Für Ausleihe und Rückgabe im Terminal: Mediencode oder ISBN. Liefert (isbn, mediencode)."""
+    eingabe = input(prompt).strip()
+    if not eingabe:
+        return None, None
+    treffer = code_aufloesen(eingabe)
+    if treffer and treffer[0] == "exemplar":
+        return treffer[1], treffer[2]
+    if treffer and treffer[0] == "isbn":
+        return treffer[1], None
+    print("❌ Unbekannter Code bzw. ungültige ISBN – die Prüfziffer stimmt nicht. Bitte erneut scannen.")
+    return None, None
+
+
 # --- BUCH AUSLEIHEN ---
 def book_checkout():
     ueberschrift("📤 BUCH AUSLEIHEN")
 
-    isbn = lies_isbn("👉 Scanne/Gib die ISBN des Buches ein: ")
+    isbn, exemplar = lies_buchcode("👉 Scanne das Buch (Mediencode oder ISBN): ")
     if not isbn:
         return
 
@@ -1783,32 +2126,24 @@ def book_checkout():
         print(f"❌ '{titel}' ist aktuell vollständig ausgeliehen!")
         return
 
-    print(f"📖 Ausleihe für: '{titel}' (Verfügbar: {verfuegbar} Exemplar(e))")
-    ausleiher = input("👤 Name des Ausleihers: ").strip()
+    print(f"📖 Ausleihe für: '{titel}'{f' – Exemplar {exemplar}' if exemplar else ''} (Verfügbar: {verfuegbar} Exemplar(e))")
+    ausleiher, schueler_id = person_aufloesen(input("👤 Schülerausweis scannen oder Name eingeben: "))
     if not ausleiher:
         print("❌ Ausleihe abgebrochen. Name erforderlich.")
         return
+    if schueler_id:
+        s = lade_schueler(schueler_id)
+        print(f"🎓 Schüler: {s['name']}" + (f", Klasse {s['klasse']}" if s["klasse"] else ""))
 
     standard = get_einstellung_int("standard_leihdauer", 14)
     tage_input = input(f"📅 Ausleihdauer in Tagen [Standard: {standard}]: ").strip()
     tage = int(tage_input) if tage_input.isdigit() and int(tage_input) > 0 else standard
 
-    ausgeliehen_am = heute()
-    rueckgabe_datum = ausgeliehen_am + timedelta(days=tage)
-
-    with db_connection() as conn:
-        # Gleiche Schreibweise wie bei früheren Ausleihen verwenden ("max mustermann" → "Max Mustermann")
-        bekannt = conn.execute(
-            "SELECT ausleiher FROM ausleihen WHERE LOWER(ausleiher) = LOWER(?) LIMIT 1", (ausleiher,)
-        ).fetchone()
-        if bekannt:
-            ausleiher = bekannt[0]
-
-        conn.execute('''
-            INSERT INTO ausleihen (isbn, ausleiher, ausgeliehen_am, rueckgabe_bis, status)
-            VALUES (?, ?, ?, ?, 'aktiv')
-        ''', (isbn, ausleiher, ausgeliehen_am.isoformat(), rueckgabe_datum.isoformat()))
-        conn.execute("UPDATE buecher SET anzahl_verfuegbar = anzahl_verfuegbar - 1 WHERE isbn = ?", (isbn,))
+    try:
+        ausleiher, rueckgabe_datum = buch_ausleihen(isbn, ausleiher, tage, schueler_id, exemplar)
+    except ValueError as e:
+        print(f"❌ {e}")
+        return
 
     print("\n✅ AUSLEIHE ERFOLGREICH GESPEICHERT!")
     print(f"👤 Ausleiher:    {ausleiher}")
@@ -1817,8 +2152,26 @@ def book_checkout():
 
 
 # --- AKTIVE AUSLEIHE AUSWÄHLEN (PER SCAN ODER LISTE) ---
+def ausleihen_zum_code(eingabe):
+    """IDs der aktiven Ausleihen zu einem gescannten Mediencode oder einer ISBN.
+    Beim Mediencode genau dieses Exemplar; wurde es per ISBN ausgeliehen, die Ausleihen dieses Buchs ohne Code."""
+    treffer = code_aufloesen(eingabe)
+    if not treffer or treffer[0] == "schueler":
+        raise ValueError("Unbekannter Code bzw. ungültige ISBN – die Prüfziffer stimmt nicht.")
+    typ, isbn, code = treffer
+    with db_connection() as conn:
+        if typ == "exemplar":
+            ids = conn.execute("SELECT id FROM ausleihen WHERE exemplar = ? AND status = 'aktiv'", (code,)).fetchall()
+            if ids:
+                return [i for (i,) in ids]
+            sql = "SELECT id FROM ausleihen WHERE isbn = ? AND exemplar IS NULL AND status = 'aktiv' ORDER BY rueckgabe_bis"
+        else:
+            sql = "SELECT id FROM ausleihen WHERE isbn = ? AND status = 'aktiv' ORDER BY rueckgabe_bis"
+        return [i for (i,) in conn.execute(sql, (isbn,))]
+
+
 def finde_aktive_ausleihe():
-    eingabe = input("👉 Scanne die ISBN des Buches (oder [ENTER] für die Liste): ").strip()
+    eingabe = input("👉 Scanne das Buch – Mediencode oder ISBN (oder [ENTER] für die Liste): ").strip()
     sql = '''
         SELECT a.id, a.isbn, b.titel, a.ausleiher, a.rueckgabe_bis
         FROM ausleihen a
@@ -1826,16 +2179,19 @@ def finde_aktive_ausleihe():
         WHERE a.status = 'aktiv'
     '''
 
+    if eingabe:
+        try:
+            ids = ausleihen_zum_code(eingabe)
+        except ValueError as e:
+            print(f"❌ {e}")
+            return None
+        if not ids:
+            print("❌ Für dieses Buch gibt es keine aktive Ausleihe.")
+            return None
     with db_connection() as conn:
         if eingabe:
-            isbn = normalize_isbn(eingabe)
-            if not isbn:
-                print("❌ Ungültige ISBN – die Prüfziffer stimmt nicht.")
-                return None
-            ausleihen = conn.execute(sql + " AND a.isbn = ? ORDER BY a.rueckgabe_bis", (isbn,)).fetchall()
-            if not ausleihen:
-                print("❌ Für dieses Buch gibt es keine aktive Ausleihe.")
-                return None
+            ausleihen = conn.execute(sql + f" AND a.id IN ({','.join('?' * len(ids))}) ORDER BY a.rueckgabe_bis",
+                                     ids).fetchall()
         else:
             ausleihen = conn.execute(sql + " ORDER BY a.rueckgabe_bis").fetchall()
             if not ausleihen:
@@ -2034,21 +2390,24 @@ def export_daten(typ):
             return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Band", "Exemplare", "Verfügbar"], zeilen
 
         sql = '''
-            SELECT a.ausleiher, b.titel, a.isbn, a.ausgeliehen_am, a.rueckgabe_bis
-            FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn
+            SELECT a.ausleiher, COALESCE(s.klasse, ''), b.titel, a.isbn, COALESCE(a.exemplar, ''),
+                   a.ausgeliehen_am, a.rueckgabe_bis
+            FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn LEFT JOIN schueler s ON s.id = a.schueler_id
             WHERE a.status = 'aktiv'
         '''
         params = ()
         if typ == "mahnliste":
             sql += " AND a.rueckgabe_bis < ?"
             params = (heute().isoformat(),)
-        rohdaten = conn.execute(sql + " ORDER BY a.ausleiher, a.rueckgabe_bis", params).fetchall()
+        rohdaten = conn.execute(sql, params).fetchall()
 
+    # Nach Klasse (5a vor 10b), dann Name – so lässt sich die Mahnliste pro Klasse an die Lehrkräfte geben
+    rohdaten.sort(key=lambda r: (klassen_sortierwert(r[1]) if r[1] else (1000, ""), r[0].lower(), r[6]))
     zeilen = [
-        (name, titel, isbn, de_datum(von), de_datum(bis), max(0, (heute() - date.fromisoformat(bis)).days))
-        for name, titel, isbn, von, bis in rohdaten
+        (name, klasse, titel, isbn, code, de_datum(von), de_datum(bis), max(0, (heute() - date.fromisoformat(bis)).days))
+        for name, klasse, titel, isbn, code, von, bis in rohdaten
     ]
-    return ["Ausleiher", "Titel", "ISBN", "Geliehen am", "Rückgabe bis", "Tage überfällig"], zeilen
+    return ["Ausleiher", "Klasse", "Titel", "ISBN", "Mediencode", "Geliehen am", "Rückgabe bis", "Tage überfällig"], zeilen
 
 
 def export_menu():

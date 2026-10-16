@@ -42,13 +42,13 @@ Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`export
 | 3 | Katalog | Alle Bücher, sortiert nach Nachname des Autors, Bände einer Serie in der richtigen Reihenfolge. |
 | 4 | Suchen | Nach Titel, Autor, Serie, Genre oder ISBN. |
 | 5 | Bearbeiten / Löschen | Buchdaten ändern, einzelne Exemplare entfernen oder ein Buch löschen. |
-| 6 | Ausleihen | Buch scannen, Name eingeben, fertig. |
-| 7 | Zurückgeben | Buch scannen (oder aus der Liste wählen). |
+| 6 | Ausleihen | Buch scannen (Mediencode oder ISBN), dann Schülerausweis scannen oder Namen eingeben. |
+| 7 | Zurückgeben | Buch scannen, Mediencode oder ISBN (oder aus der Liste wählen). |
 | 8 | Verlängern | Rückgabedatum einer Ausleihe nach hinten schieben. |
 | 9 | Ausleih-Übersicht | Alle aktuellen Ausleihen, überfällige werden markiert. |
 | 10 | Ausleiher-Übersicht | Was hat eine bestimmte Person gerade oder früher ausgeliehen? |
 | 11 | Statistik | Bestand, Ausleihen, überfällige und meistgeliehene Bücher. |
-| 12 | Export | Katalog, Ausleihen oder Mahnliste als CSV (öffnet sich direkt in Excel). |
+| 12 | Export | Katalog, Ausleihen oder Mahnliste als CSV (öffnet sich direkt in Excel). Ausleihen und Mahnliste sind nach Klasse sortiert. |
 | 13 | Backup | Sicherungskopie der Datenbank. Zusätzlich wird einmal täglich beim Start automatisch gesichert. |
 | 14 | Stammdaten | Schulname, Standard-Leihdauer, Löschfrist usw. |
 | 15 | Buchdaten nachladen | Sucht für Bücher, die schon im Katalog sind, online nach Beschreibung, Cover und Serie. Von Hand eingetragene Angaben bleiben unverändert. |
@@ -74,6 +74,24 @@ ScanBook verteilt die Bücher dann selbst:
 - Ist ein Regal voll, kommen die übrigen Bücher ins nächste Regal, das ihr Genre (oder alle übrigen Bücher) aufnimmt. Was nirgends hinpasst, steht unter „Ohne Platz“.
 
 Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau.
+
+## Schülerausweise
+
+Im Tab „Schüler“ der Browser-Oberfläche legst du Schüler mit Vorname, Nachname und Klasse an, einzeln oder als ganze Klassenliste („Klassenliste importieren“: Spalten aus Excel kopieren und einfügen oder eine CSV-Datei wählen, Reihenfolge Nachname, Vorname, Klasse). Jeder Schüler bekommt eine Ausweisnummer (z. B. `S0001`). Haben die Schüler schon einen Ausweis mit Barcode, trägst du dessen Nummer einfach als Ausweisnummer ein.
+
+„Ausweise drucken“ erzeugt pro Klasse eine Druckseite mit Ausweisen im Scheckkartenformat (10 pro A4-Seite) mit Name, Klasse und Barcode. Beim Drucken „Tatsächliche Größe“ bzw. 100 % wählen, dann ausschneiden und am besten laminieren.
+
+Ausleihen im Tab „Ausleihe“: Ausweis scannen, dann nacheinander die Bücher scannen. Jedes Buch wird sofort ausgeliehen, man sieht dabei, was der Schüler schon hat und ob etwas überfällig ist. Mit dem nächsten Ausweis geht es mit dem nächsten Schüler weiter. Lehrkräfte und andere ohne Ausweis lassen sich weiterhin per Name eintragen.
+
+## Mediencodes (Etiketten pro Exemplar)
+
+Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. Beim Ausleihen und Zurückgeben scannst du dann den Mediencode statt der ISBN. So weiß ScanBook genau, welches Exemplar wer hat, und die Rückgabe geht ohne Rückfrage. Bücher ohne Mediencode funktionieren weiter wie bisher mit der ISBN.
+
+- **Eigene Etiketten:** Den Code des vorhandenen Etiketts im Tab „Scannen“ scannen, danach die ISBN des Buchs. ScanBook ordnet den Code diesem Exemplar zu. Haben schon alle Exemplare einen Code, zählt es als neues Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.
+- **Von ScanBook erzeugte Codes:** „Codes für alle Exemplare ohne Code erzeugen“ vergibt fortlaufende Nummern (z. B. `M00001`), „Neue Etiketten drucken“ druckt sie auf Etikettenbögen 70 × 37 mm (24 pro A4-Seite, z. B. Zweckform 3474). Angebrochene Bögen lassen sich weiter verwenden.
+- In der Buchvorschau stehen alle Codes eines Buchs, wer welches Exemplar gerade hat, und Knöpfe zum Ausmustern einzelner Exemplare.
+
+Die Vorsilben für Ausweisnummern (`S`) und Mediencodes (`M`) lassen sich unter „Einstellungen“ ändern. Barcodes werden als Code 128 erzeugt, den jeder übliche Barcode-Scanner liest.
 
 ## ISBN-Prüfung
 
