@@ -3,6 +3,7 @@ import re
 import sys
 import csv
 import json
+import ssl
 import sqlite3
 import subprocess
 import urllib.request
@@ -13,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -136,9 +137,40 @@ def alte_dateien_aufraeumen(ordner, praefix, behalten):
         os.remove(os.path.join(ordner, name))
 
 
+# Zertifikatsdateien, die es je nach System gibt (macOS, Linux)
+ZERTIFIKAT_DATEIEN = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
+_ssl_kontext = None
+
+
+def ssl_kontext():
+    """Prüft Zertifikate immer, ergänzt aber fehlende Stammzertifikate.
+
+    Python von python.org bringt auf dem Mac keine Zertifikate mit, und unter Windows
+    fehlen manchmal Stammzertifikate. Dann scheitert z. B. die DNB-Abfrage mit
+    CERTIFICATE_VERIFY_FAILED. Zusätzlich geladen werden das Paket certifi (falls
+    installiert) und die Zertifikatsdatei des Betriebssystems."""
+    global _ssl_kontext
+    if _ssl_kontext is None:
+        kontext = ssl.create_default_context()
+        dateien = list(ZERTIFIKAT_DATEIEN)
+        try:
+            import certifi
+            dateien.insert(0, certifi.where())
+        except ImportError:
+            pass
+        for datei in dateien:
+            if os.path.isfile(datei):
+                try:
+                    kontext.load_verify_locations(cafile=datei)
+                except (ssl.SSLError, OSError):
+                    pass
+        _ssl_kontext = kontext
+    return _ssl_kontext
+
+
 def http_get(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_kontext()) as response:
         return response.read().decode("utf-8")
 
 
@@ -441,6 +473,13 @@ def manage_stammdaten():
 
 
 # --- BUCHDATEN AUS DEM INTERNET LADEN ---
+def zertifikat_hinweis(fehler):
+    if "CERTIFICATE_VERIFY_FAILED" in str(fehler):
+        print("   💡 Deinem Python fehlen Sicherheitszertifikate. Abhilfe: im Terminal")
+        print("      'python3 -m pip install certifi' (Windows: 'py -m pip install certifi') ausführen")
+        print("      und ScanBook neu starten.")
+
+
 def neue_buchdaten(titel, autoren, verlag, jahr, genre):
     return {
         'titel': titel or 'Unbekannter Titel',
@@ -469,6 +508,7 @@ def fetch_from_google(isbn):
             )
     except Exception as e:
         print(f"⚠️ Google-Books-Abfrage fehlgeschlagen: {e}")
+        zertifikat_hinweis(e)
     return None
 
 
@@ -487,6 +527,7 @@ def fetch_from_openlibrary(isbn):
             )
     except Exception as e:
         print(f"⚠️ Open-Library-Abfrage fehlgeschlagen: {e}")
+        zertifikat_hinweis(e)
     return None
 
 
@@ -577,6 +618,7 @@ def fetch_from_dnb(isbn):
             return parse_dnb_marc(record)
     except Exception as e:
         print(f"⚠️ DNB-Abfrage fehlgeschlagen: {e}")
+        zertifikat_hinweis(e)
     return None
 
 
