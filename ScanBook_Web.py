@@ -6,6 +6,8 @@ Die Oberfläche benutzt dieselbe Datenbank wie das Terminal-Programm ScanBook.py
 """
 import io
 import os
+import re
+import html
 import csv
 import sys
 import time
@@ -105,9 +107,9 @@ def api_book(params):
     buch = buch_oder_fehler(isbn)
     with sb.db_connection() as conn:
         buch["ausleihen"] = [
-            {"name": name, "bis": bis, "tage": tage_bis(bis)}
-            for name, bis in conn.execute(
-                "SELECT ausleiher, rueckgabe_bis FROM ausleihen WHERE isbn = ? AND status = 'aktiv' ORDER BY rueckgabe_bis",
+            {"name": name, "bis": bis, "tage": tage_bis(bis), "exemplar": exemplar or ""}
+            for name, bis, exemplar in conn.execute(
+                "SELECT ausleiher, rueckgabe_bis, exemplar FROM ausleihen WHERE isbn = ? AND status = 'aktiv' ORDER BY rueckgabe_bis",
                 (isbn,))
         ]
         baende = []
@@ -119,25 +121,31 @@ def api_book(params):
                     (buch["serie"],))
             ]
     buch["serie_baende"] = sorted(baende, key=lambda b: (sb.band_sortierwert(b["band"]), b["titel"]))
+    buch["exemplare"] = sb.exemplare_von(isbn)
     return buch
 
 
 def api_loans(params):
     sql = '''
         SELECT a.id, a.isbn, b.titel, b.autor_formatiert, a.ausleiher, a.ausgeliehen_am, a.rueckgabe_bis,
-               COALESCE(a.verlaengerungen, 0)
-        FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn
+               COALESCE(a.verlaengerungen, 0), COALESCE(s.klasse, ''), COALESCE(a.exemplar, '')
+        FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn LEFT JOIN schueler s ON s.id = a.schueler_id
         WHERE a.status = 'aktiv'
     '''
     werte = ()
-    if params.get("isbn"):
-        sql += " AND a.isbn = ?"
-        werte = (isbn_pruefen(params["isbn"]),)
+    code = params.get("code") or params.get("isbn")
+    if code:
+        try:
+            werte = tuple(sb.ausleihen_zum_code(code))
+        except ValueError as e:
+            raise ApiFehler(str(e))
+        sql += f" AND a.id IN ({','.join('?' * len(werte)) or 'NULL'})"
     with sb.db_connection() as conn:
         rows = conn.execute(sql + " ORDER BY a.rueckgabe_bis", werte).fetchall()
     return [
         {"id": r[0], "isbn": r[1], "titel": r[2], "autor": r[3], "ausleiher": r[4],
-         "ausgeliehen_am": r[5], "rueckgabe_bis": r[6], "verlaengerungen": r[7], "tage": tage_bis(r[6])}
+         "ausgeliehen_am": r[5], "rueckgabe_bis": r[6], "verlaengerungen": r[7], "tage": tage_bis(r[6]),
+         "klasse": r[8], "exemplar": r[9]}
         for r in rows
     ]
 
@@ -202,20 +210,46 @@ def api_settings(_):
 
 
 # --- SCHREIBENDE AKTIONEN (POST) ---
+def sieht_aus_wie_isbn(eingabe):
+    return bool(re.fullmatch(r"[\d\s-]{9,}[\dXx]", eingabe))
+
+
 def api_scan(body):
-    isbn = isbn_pruefen(body.get("isbn"))
-    with sb.db_connection() as conn:
-        aufgestockt = conn.execute('''
-            UPDATE buecher SET anzahl_gesamt = anzahl_gesamt + 1, anzahl_verfuegbar = anzahl_verfuegbar + 1
-            WHERE isbn = ?
-        ''', (isbn,)).rowcount
-    if aufgestockt:
-        return {"status": "aufgestockt", "buch": buch_oder_fehler(isbn)}
+    eingabe = text(body, "isbn")
+    neuer_code = text(body, "code")  # vorher gescanntes, noch unbekanntes Etikett, das zugeordnet werden soll
+    treffer = sb.code_aufloesen(eingabe)
+    if treffer and treffer[0] == "exemplar":
+        return {"status": "exemplar", "code": treffer[2], "buch": buch_oder_fehler(treffer[1])}
+    if treffer and treffer[0] == "schueler":
+        raise ApiFehler("Das ist ein Schülerausweis. Ausleihen geht im Tab „Ausleihe“.")
+    if not treffer:
+        if neuer_code or sieht_aus_wie_isbn(eingabe) or not sb.code_gueltig(eingabe):
+            raise ApiFehler("Ungültige ISBN – die Prüfziffer stimmt nicht.")
+        # Unbekanntes Etikett: als eigener Mediencode merken, das nächste gescannte Buch bekommt ihn
+        return {"status": "neuer_code", "code": eingabe}
+    isbn = treffer[1]
+
+    if neuer_code and sb.lade_buch(isbn):
+        try:
+            code, aufgestockt = sb.exemplar_anlegen(isbn, neuer_code)
+        except ValueError as e:
+            raise ApiFehler(str(e))
+        return {"status": "zugeordnet", "code": code, "aufgestockt": aufgestockt, "buch": buch_oder_fehler(isbn)}
+
+    if not neuer_code:
+        with sb.db_connection() as conn:
+            aufgestockt = conn.execute('''
+                UPDATE buecher SET anzahl_gesamt = anzahl_gesamt + 1, anzahl_verfuegbar = anzahl_verfuegbar + 1
+                WHERE isbn = ?
+            ''', (isbn,)).rowcount
+        if aufgestockt:
+            return {"status": "aufgestockt", "buch": buch_oder_fehler(isbn)}
 
     daten = sb.fetch_book_data(isbn)
     return {
         "status": "neu",
         "isbn": isbn,
+        "code": neuer_code,
         "daten": daten,
         "fehlend": fehlende_felder(daten) if daten else [feld for feld, _ in sb.BUCH_FELDER],
     }
@@ -227,8 +261,17 @@ def api_book_create(body):
         raise ApiFehler("Bitte einen Titel eingeben.")
     if sb.lade_buch(isbn):
         raise ApiFehler("Dieses Buch ist schon im Katalog. Zum Aufstocken einfach scannen.")
+    code = text(body, "code")
+    if code:
+        with sb.db_connection() as conn:
+            try:
+                sb.neuer_code_pruefen(conn, code)
+            except ValueError as e:
+                raise ApiFehler(str(e))
     sb.buch_speichern(isbn, buchdaten_aus(body), positive_zahl(body.get("anzahl"), 1),
                       nachgeladen=body.get("nachgeladen") in (True, "1"))
+    if code:
+        sb.exemplar_anlegen(isbn, code)
     _, umstellen, grund = sb.buch_einraeumen(isbn)
     buch = buch_oder_fehler(isbn)
     buch["umstellen"], buch["kein_platz"] = umstellen, grund
@@ -287,65 +330,41 @@ def api_refresh_status(_):
 
 def api_book_remove_copy(body):
     isbn = isbn_pruefen(body.get("isbn"))
-    buch = buch_oder_fehler(isbn)
-    if buch["anzahl_gesamt"] <= 1:
-        raise ApiFehler("Das ist das letzte Exemplar – bitte stattdessen das Buch löschen.")
-    with sb.db_connection() as conn:
-        geaendert = conn.execute('''
-            UPDATE buecher SET anzahl_gesamt = anzahl_gesamt - 1, anzahl_verfuegbar = anzahl_verfuegbar - 1
-            WHERE isbn = ? AND anzahl_verfuegbar > 0
-        ''', (isbn,)).rowcount
-    if not geaendert:
-        raise ApiFehler("Alle Exemplare sind ausgeliehen. Erst nach einer Rückgabe kann eins entfernt werden.")
+    buch_oder_fehler(isbn)
+    try:
+        sb.exemplar_entfernen(isbn)
+    except ValueError as e:
+        raise ApiFehler(str(e))
     return buch_oder_fehler(isbn)
 
 
 def api_book_delete(body):
     isbn = isbn_pruefen(body.get("isbn"))
     buch_oder_fehler(isbn)
-    with sb.db_connection() as conn:
-        aktiv = conn.execute(
-            "SELECT COUNT(*) FROM ausleihen WHERE isbn = ? AND status = 'aktiv'", (isbn,)
-        ).fetchone()[0]
-        if aktiv:
-            raise ApiFehler(f"Das Buch ist noch {aktiv}x ausgeliehen und kann nicht gelöscht werden.")
-        conn.execute("DELETE FROM ausleihen WHERE isbn = ?", (isbn,))
-        conn.execute("DELETE FROM buecher WHERE isbn = ?", (isbn,))
+    try:
+        sb.buch_loeschen(isbn)
+    except ValueError as e:
+        raise ApiFehler(str(e))
     return {"ok": True}
 
 
 def api_checkout(body):
-    isbn = isbn_pruefen(body.get("isbn"))
+    """Buch (Mediencode oder ISBN) an eine Person (Schülerausweis oder Name) ausleihen."""
+    treffer = sb.code_aufloesen(text(body, "code") or text(body, "isbn"))
+    if not treffer or treffer[0] == "schueler":
+        raise ApiFehler("Bitte ein Buch scannen (Mediencode oder ISBN).")
+    _, isbn, exemplar = treffer
     buch = buch_oder_fehler(isbn)
-    ausleiher = text(body, "ausleiher")
+    ausleiher, schueler_id = sb.person_aufloesen(text(body, "ausleiher"))
     if not ausleiher:
-        raise ApiFehler("Bitte den Namen des Ausleihers eingeben.")
+        raise ApiFehler("Bitte den Schülerausweis scannen oder einen Namen eingeben.")
     tage = positive_zahl(body.get("tage"), sb.get_einstellung_int("standard_leihdauer", 14))
-
-    ausgeliehen_am = sb.heute()
-    rueckgabe_bis = ausgeliehen_am + timedelta(days=tage)
-
-    with sb.db_connection() as conn:
-        verfuegbar = conn.execute(
-            "UPDATE buecher SET anzahl_verfuegbar = anzahl_verfuegbar - 1 WHERE isbn = ? AND anzahl_verfuegbar > 0",
-            (isbn,),
-        ).rowcount
-        if not verfuegbar:
-            raise ApiFehler(f"'{buch['titel']}' ist aktuell vollständig ausgeliehen!")
-
-        # Gleiche Schreibweise wie bei früheren Ausleihen verwenden
-        bekannt = conn.execute(
-            "SELECT ausleiher FROM ausleihen WHERE LOWER(ausleiher) = LOWER(?) LIMIT 1", (ausleiher,)
-        ).fetchone()
-        if bekannt:
-            ausleiher = bekannt[0]
-
-        conn.execute('''
-            INSERT INTO ausleihen (isbn, ausleiher, ausgeliehen_am, rueckgabe_bis, status)
-            VALUES (?, ?, ?, ?, 'aktiv')
-        ''', (isbn, ausleiher, ausgeliehen_am.isoformat(), rueckgabe_bis.isoformat()))
-
-    return {"titel": buch["titel"], "ausleiher": ausleiher, "rueckgabe_bis": rueckgabe_bis.isoformat()}
+    try:
+        ausleiher, rueckgabe_bis = sb.buch_ausleihen(isbn, ausleiher, tage, schueler_id, exemplar)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return {"titel": buch["titel"], "ausleiher": ausleiher, "rueckgabe_bis": rueckgabe_bis.isoformat(),
+            "exemplar": exemplar or ""}
 
 
 def aktive_ausleihe(conn, ausleihe_id):
@@ -488,6 +507,283 @@ def api_update_install(_):
     return {"version": version, "backups": backups}
 
 
+# --- BARCODES (Code 128, ohne Zusatzpakete) ---
+# Breiten von Strich/Lücke/Strich/Lücke/Strich/Lücke für die Werte 0–106 (104 = Start B, 106 = Stopp)
+CODE128 = (
+    "212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 "
+    "221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 "
+    "221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 "
+    "212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 "
+    "231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 "
+    "231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 "
+    "314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 "
+    "112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 "
+    "111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 "
+    "214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 "
+    "114131 311141 411131 211412 211214 211232 2331112"
+).split()
+
+
+def code128_module(text):
+    """Strich- und Lückenbreiten (in Modulen) für Code 128 B, mit Prüfzeichen."""
+    werte = [104] + [ord(z) - 32 for z in text]
+    pruefsumme = sum(w * max(i, 1) for i, w in enumerate(werte)) % 103
+    return "".join(CODE128[w] for w in werte + [pruefsumme, 106])
+
+
+def barcode_svg(text, hoehe=40):
+    """Barcode als SVG, das sich im Browser in jeder Größe scharf drucken lässt."""
+    ruhezone = 10
+    x, striche = ruhezone, []
+    for i, breite in enumerate(code128_module(text)):
+        if i % 2 == 0:
+            striche.append(f'<rect x="{x}" width="{breite}" height="{hoehe}"/>')
+        x += int(breite)
+    return (f'<svg class="barcode" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {x + ruhezone} {hoehe}" '
+            f'preserveAspectRatio="none" shape-rendering="crispEdges">{"".join(striche)}</svg>')
+
+
+# --- SCHÜLER ---
+def schueler_daten(row):
+    sid, ausweis, vorname, nachname, klasse, aktiv, ueberfaellig = row
+    return {"id": sid, "ausweis": ausweis, "vorname": vorname, "nachname": nachname, "klasse": klasse or "",
+            "name": sb.schueler_name(vorname, nachname), "aktiv": aktiv, "ueberfaellig": ueberfaellig}
+
+
+SCHUELER_SQL = '''
+    SELECT s.id, s.ausweis, s.vorname, s.nachname, s.klasse,
+           (SELECT COUNT(*) FROM ausleihen a WHERE a.schueler_id = s.id AND a.status = 'aktiv'),
+           (SELECT COUNT(*) FROM ausleihen a WHERE a.schueler_id = s.id AND a.status = 'aktiv' AND a.rueckgabe_bis < ?)
+    FROM schueler s
+'''
+
+
+def lade_schuelerliste(klasse=None, suche="", ids=None):
+    sql, werte = SCHUELER_SQL + " WHERE 1", [sb.heute().isoformat()]
+    if klasse is not None:
+        sql += " AND s.klasse = ?"
+        werte.append(klasse)
+    if suche:
+        sql += " AND (s.vorname || ' ' || s.nachname LIKE ? OR s.nachname || ' ' || s.vorname LIKE ? OR s.ausweis LIKE ?)"
+        werte += [f"%{suche}%"] * 3
+    if ids is not None:
+        sql += f" AND s.id IN ({','.join('?' * len(ids)) or 'NULL'})"
+        werte += ids
+    with sb.db_connection() as conn:
+        rows = conn.execute(sql, werte).fetchall()
+    liste = [schueler_daten(r) for r in rows]
+    liste.sort(key=lambda s: (sb.klassen_sortierwert(s["klasse"]), s["nachname"].lower(), s["vorname"].lower()))
+    return liste
+
+
+def api_schueler(params):
+    klasse = params.get("klasse")
+    with sb.db_connection() as conn:
+        klassen = [k for (k,) in conn.execute("SELECT DISTINCT klasse FROM schueler")]
+    return {
+        "schueler": lade_schuelerliste(klasse, params.get("q", "").strip()),
+        "klassen": sorted(klassen, key=sb.klassen_sortierwert),
+    }
+
+
+def schueler_mit_ausleihen(schueler_id):
+    s = sb.lade_schueler(schueler_id)
+    if not s:
+        raise ApiFehler("Diesen Schüler gibt es nicht (mehr).", 404)
+    with sb.db_connection() as conn:
+        s["ausleihen"] = [
+            {"titel": t, "bis": bis, "tage": tage_bis(bis), "exemplar": ex or ""}
+            for t, bis, ex in conn.execute('''
+                SELECT b.titel, a.rueckgabe_bis, a.exemplar FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn
+                WHERE a.schueler_id = ? AND a.status = 'aktiv' ORDER BY a.rueckgabe_bis
+            ''', (schueler_id,))
+        ]
+    return s
+
+
+def api_code(params):
+    """Was steckt hinter einem gescannten Code? Schülerausweis, Mediencode oder ISBN."""
+    eingabe = text(params, "c")
+    treffer = sb.code_aufloesen(eingabe)
+    if not treffer:
+        raise ApiFehler(f"Der Code „{eingabe}“ ist weder ein Schülerausweis noch ein Mediencode oder eine gültige ISBN.", 404)
+    typ, schluessel, code = treffer
+    if typ == "schueler":
+        return {"typ": "schueler", "schueler": schueler_mit_ausleihen(schluessel)}
+    buch = buch_oder_fehler(schluessel)
+    besitzer = ""
+    if code:
+        with sb.db_connection() as conn:
+            row = conn.execute("SELECT ausleiher FROM ausleihen WHERE exemplar = ? AND status = 'aktiv'", (code,)).fetchone()
+        besitzer = row[0] if row else ""
+    return {"typ": "buch", "buch": buch, "exemplar": code or "", "ausgeliehen_an": besitzer}
+
+
+def api_schueler_save(body):
+    try:
+        sid = sb.schueler_speichern(body.get("id") or None, text(body, "vorname"), text(body, "nachname"),
+                                    text(body, "klasse"), text(body, "ausweis"))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return sb.lade_schueler(sid)
+
+
+def api_schueler_delete(body):
+    try:
+        sb.schueler_loeschen(body.get("id"))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return {"ok": True}
+
+
+def api_schueler_import(body):
+    return sb.schueler_importieren(body.get("text"))
+
+
+# --- MEDIENCODES ---
+def api_exemplar_neu(body):
+    isbn = isbn_pruefen(body.get("isbn"))
+    try:
+        code, aufgestockt = sb.exemplar_anlegen(isbn, text(body, "code"))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return {"code": code, "aufgestockt": aufgestockt, "buch": buch_oder_fehler(isbn)}
+
+
+def api_codes_erzeugen(body):
+    isbn = isbn_pruefen(body.get("isbn")) if body.get("isbn") else None
+    return {"codes": sb.fehlende_codes_erzeugen(isbn)}
+
+
+def api_exemplar_loeschen(body):
+    try:
+        sb.exemplar_loeschen(text(body, "code"))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return {"ok": True}
+
+
+def api_exemplar_entfernen(body):
+    isbn = isbn_pruefen(body.get("isbn"))
+    try:
+        sb.exemplar_entfernen(isbn, text(body, "code") or None)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return buch_oder_fehler(isbn)
+
+
+def api_etiketten_gedruckt(body):
+    codes = [str(c) for c in body.get("codes") or []]
+    with sb.db_connection() as conn:
+        conn.executemany("UPDATE exemplare SET gedruckt = 1 WHERE code = ?", [(c,) for c in codes])
+    return {"ok": True}
+
+
+def api_codes_status(_):
+    with sb.db_connection() as conn:
+        mit_code, ungedruckt = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(eigener = 0 AND gedruckt = 0), 0) FROM exemplare").fetchone()
+    return {"mit_code": mit_code, "ohne_code": sb.exemplare_ohne_code(), "ungedruckt": ungedruckt}
+
+
+# --- DRUCKSEITEN (Ausweise und Etiketten, gedruckt über den Browser) ---
+DRUCK_CSS = """
+* { box-sizing: border-box; }
+body { margin: 0; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif; color: #000; background: #f2f2f7; }
+.leiste { position: sticky; top: 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 20px; background: rgba(255,255,255,.92); border-bottom: .5px solid rgba(60,60,67,.2); }
+.leiste .grow { flex: 1; min-width: 200px; color: rgba(60,60,67,.7); }
+.leiste button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 8px 16px; background: #007aff; color: #fff; cursor: pointer; }
+.leiste button.zweit { background: rgba(118,118,128,.12); color: #007aff; }
+.blatt { width: 210mm; height: 297mm; margin: 16px auto; background: #fff; display: grid; align-content: start; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,.1); break-after: page; }
+.barcode { display: block; width: 100%; fill: #000; }
+.leer { padding: 40px; text-align: center; color: rgba(60,60,67,.7); }
+/* Schülerausweise im Scheckkartenformat, 10 pro A4-Seite */
+.ausweise { grid-template-columns: repeat(2, 85.6mm); grid-auto-rows: 54mm; gap: 3mm 8mm; padding: 7mm 15.4mm; }
+.ausweis { border: .3mm dashed #bbb; border-radius: 3.2mm; padding: 4mm 5mm 3mm; display: flex; flex-direction: column; overflow: hidden; break-inside: avoid; }
+.ausweis .kopf { display: flex; justify-content: space-between; gap: 4mm; font-size: 8pt; color: #555; border-bottom: .3mm solid #007aff; padding-bottom: 1.5mm; }
+.ausweis .kopf b { color: #007aff; }
+.ausweis .name { font-size: 14pt; font-weight: 700; margin-top: 2.5mm; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ausweis .klasse { font-size: 10pt; color: #333; }
+.ausweis .barcode { height: 12mm; margin-top: auto; }
+.ausweis .nummer { text-align: center; font: 9pt ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; margin-top: .8mm; }
+/* Buchetiketten 70 × 37 mm, 24 pro A4-Seite (3 × 8) */
+.etiketten { grid-template-columns: repeat(3, 70mm); grid-auto-rows: 37mm; }
+.etikett { padding: 3mm 5mm 2mm; display: flex; flex-direction: column; overflow: hidden; break-inside: avoid; outline: .2mm dashed #ddd; outline-offset: -.1mm; }
+.etikett .bib { font-size: 7pt; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.etikett .titel { font-size: 8.5pt; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.etikett .barcode { height: 13mm; margin-top: auto; }
+.etikett .nummer { text-align: center; font: 9pt ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; }
+@page { size: A4; margin: 0; }
+@media print {
+  body { background: #fff; }
+  .leiste { display: none; }
+  .blatt { margin: 0; box-shadow: none; }
+  .ausweis, .etikett { outline: none; }
+}
+"""
+
+
+def druckseite(titel, hinweis, felder, pro_seite, klasse, skript=""):
+    knopf = '<button onclick="window.print()">Drucken</button>' if felder else ""
+    blaetter = "".join(f'<div class="blatt {klasse}">{"".join(felder[i:i + pro_seite])}</div>'
+                       for i in range(0, len(felder), pro_seite))
+    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8"><title>{html.escape(titel)}</title>
+<style>{DRUCK_CSS}</style></head><body>
+<div class="leiste"><span class="grow"><b>{html.escape(titel)}</b> · {html.escape(hinweis)}</span>{knopf}
+<button class="zweit" onclick="window.close()">Schließen</button></div>
+{blaetter or '<p class="leer">Nichts zu drucken.</p>'}
+<script>{skript}</script></body></html>"""
+
+
+def druck_ausweise(params):
+    ids = [int(i) for i in params.get("ids", "").split(",") if i.isdigit()] if params.get("ids") else None
+    liste = lade_schuelerliste(params.get("klasse"), ids=ids)
+    bib = sb.get_einstellung("bib_name", "Schulbibliothek")
+    schule = sb.get_einstellung("schulname")
+    karten = [f"""<div class="ausweis">
+  <div class="kopf"><b>{html.escape(bib)}</b><span>{html.escape(schule)}</span></div>
+  <div class="name">{html.escape(s["name"])}</div>
+  <div class="klasse">{f"Klasse {html.escape(s['klasse'])}" if s["klasse"] else "Leseausweis"}</div>
+  {barcode_svg(s["ausweis"])}
+  <div class="nummer">{html.escape(s["ausweis"])}</div>
+</div>""" for s in liste]
+    titel = f"Ausweise Klasse {params['klasse']}" if params.get("klasse") else "Schülerausweise"
+    return druckseite(titel, f"{len(liste)} Ausweis(e), 10 pro Seite. Beim Drucken „Tatsächliche Größe“ bzw. 100 % wählen.",
+                      karten, 10, "ausweise")
+
+
+def druck_etiketten(params):
+    sql = '''
+        SELECT e.code, b.titel FROM exemplare e JOIN buecher b ON b.isbn = e.isbn
+    '''
+    if params.get("isbn"):
+        sql, werte = sql + " WHERE e.isbn = ? AND e.eigener = 0", (isbn_pruefen(params["isbn"]),)
+    elif params.get("codes"):
+        codes = params["codes"].split(",")
+        sql, werte = sql + f" WHERE e.code IN ({','.join('?' * len(codes))})", codes
+    else:  # alle selbst erzeugten Codes, die noch nicht gedruckt wurden
+        sql, werte = sql + " WHERE e.eigener = 0 AND e.gedruckt = 0", ()
+    with sb.db_connection() as conn:
+        rows = conn.execute(sql + " ORDER BY b.autor_nachname, b.titel, e.code", werte).fetchall()
+    bib = sb.get_einstellung("bib_name", "Schulbibliothek")
+    # Leere Felder am Anfang, damit ein angebrochener Etikettenbogen weiter benutzt werden kann
+    leer = min(positive_zahl(params.get("frei"), 0), 23)
+    etiketten = ['<div class="etikett"></div>'] * leer + [f"""<div class="etikett">
+  <div class="bib">{html.escape(bib)}</div><div class="titel">{html.escape(titel)}</div>
+  {barcode_svg(code)}<div class="nummer">{html.escape(code)}</div>
+</div>""" for code, titel in rows]
+    codes = json.dumps([c for c, _ in rows])
+    # Nach dem Drucken als gedruckt merken, damit sie beim nächsten Mal nicht wieder erscheinen
+    skript = f"""window.addEventListener("afterprint", () => fetch("/api/etiketten_gedruckt", {{
+  method: "POST", headers: {{"Content-Type": "application/json", "X-ScanBook": "1"}}, body: JSON.stringify({{codes: {codes}}})
+}}));"""
+    return druckseite("Buchetiketten", f"{len(rows)} Etikett(en) im Format 70 × 37 mm, 24 pro Seite (z. B. Zweckform 3474). "
+                      "Beim Drucken 100 % wählen.", etiketten if rows else [], 24, "etiketten", skript)
+
+
+DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten}
+
+
 GET_ROUTEN = {
     "info": api_info,
     "books": api_books,
@@ -500,6 +796,9 @@ GET_ROUTEN = {
     "settings": api_settings,
     "regale": api_regale,
     "update_check": api_update_check,
+    "schueler": api_schueler,
+    "code": api_code,
+    "codes_status": api_codes_status,
 }
 
 POST_ROUTEN = {
@@ -520,6 +819,14 @@ POST_ROUTEN = {
     "regal_move": api_regal_move,
     "regale_uebernehmen": api_regale_uebernehmen,
     "update_install": api_update_install,
+    "schueler_save": api_schueler_save,
+    "schueler_delete": api_schueler_delete,
+    "schueler_import": api_schueler_import,
+    "exemplar_neu": api_exemplar_neu,
+    "exemplar_loeschen": api_exemplar_loeschen,
+    "exemplar_entfernen": api_exemplar_entfernen,
+    "codes_erzeugen": api_codes_erzeugen,
+    "etiketten_gedruckt": api_etiketten_gedruckt,
 }
 
 EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste")
@@ -573,6 +880,11 @@ class Handler(BaseHTTPRequestHandler):
             self._senden(200, HTML, "text/html; charset=utf-8")
         elif url.path.startswith("/api/") and url.path[5:] in GET_ROUTEN:
             self._api_ausfuehren(GET_ROUTEN[url.path[5:]], params)
+        elif url.path.startswith("/druck/") and url.path[7:] in DRUCK_ROUTEN:
+            try:
+                self._senden(200, DRUCK_ROUTEN[url.path[7:]](params), "text/html; charset=utf-8")
+            except ApiFehler as e:
+                self._senden(e.status, html.escape(str(e)), "text/plain; charset=utf-8")
         elif url.path.startswith("/export/") and url.path[8:-4] in EXPORT_TYPEN and url.path.endswith(".csv"):
             typ = url.path[8:-4]
             kopf, zeilen = sb.export_daten(typ)
@@ -897,6 +1209,17 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .aufgaben .pfad { color: var(--muted); font-size: 13px; }
 #update-hinweis { margin-top: 8px; align-self: flex-start; }
 @media (max-width: 860px) { #update-hinweis { margin: 0 0 0 auto; } }
+/* Schüler & Mediencodes */
+.code { font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: .03em; padding: 1px 7px; border-radius: 6px; background: var(--fill); white-space: nowrap; }
+.codes li { align-items: center; flex-wrap: wrap; }
+.codes li .grow { flex: 1; min-width: 140px; }
+.code-zeile { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.code-zeile input { flex: 1; min-width: 180px; }
+.person-box { display: flex; gap: 12px; align-items: center; }
+.person-box .avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; flex: none; }
+.person-box .sub { color: var(--muted); font-size: 13px; }
+#co-log { margin-top: 10px; }
+#co-log:empty { display: none; }
 @keyframes rein { from { opacity: 0; transform: translateY(6px); } }
 @keyframes toast { from { opacity: 0; transform: translateY(-12px) scale(.96); } }
 @keyframes sheet { from { opacity: 0; transform: translateY(24px) scale(.98); } }
@@ -914,6 +1237,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <button data-tab="katalog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14.5M9 19.5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v12.5"/><path d="m14.5 7.8 2.9-.8a1 1 0 0 1 1.2.7l2.9 10.9a1 1 0 0 1-.7 1.2l-2.9.8a1 1 0 0 1-1.2-.7L14 8.9"/><path d="M3 20h12"/></svg><span>Katalog</span></button>
       <button data-tab="regale"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M7 5.5v2M10 5.5v2M7 11.5v2M14 17.5v2M17 17.5v2"/></svg><span>Regale</span></button>
       <button data-tab="ausleihe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4 3 8l4 4M3 8h13M17 20l4-4-4-4M21 16H8"/></svg><span>Ausleihe</span></button>
+      <button data-tab="schueler"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><circle cx="8.5" cy="11" r="2.2"/><path d="M5 16.2c.5-1.7 1.8-2.6 3.5-2.6s3 .9 3.5 2.6M14.5 10h4M14.5 13.5h3"/></svg><span>Schüler</span></button>
       <button data-tab="personen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 19.5c.6-3.2 3-5 6-5s5.4 1.8 6 5"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14c2.2 0 3.7 1.3 4.2 3.6"/></svg><span>Ausleiher</span></button>
       <button data-tab="statistik"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V11M10 20V5M16 20v-6M3 20h18"/></svg><span>Statistik &amp; Export</span></button>
       <button data-tab="einstellungen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg><span>Einstellungen</span></button>
@@ -929,9 +1253,10 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <h2>Bücher scannen</h2>
       <p class="hint">Neue Bücher werden online nachgeschlagen, bekannte Bücher werden automatisch um ein Exemplar aufgestockt.</p>
       <form id="scan-form" class="row">
-        <input id="scan-isbn" class="big grow" placeholder="ISBN scannen oder eingeben …" autocomplete="off" inputmode="numeric">
+        <input id="scan-isbn" class="big grow" placeholder="ISBN oder eigenes Etikett scannen …" autocomplete="off">
         <button class="btn" type="submit">Hinzufügen</button>
       </form>
+      <div class="platz-box hidden" id="code-box"></div>
       <div class="platz-box hidden" id="platz-box"></div>
       <button class="link" id="manual-btn" type="button">Buch ohne Scan von Hand eintragen</button>
     </div>
@@ -944,7 +1269,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
           <div class="cover-box"><img alt="" referrerpolicy="no-referrer"><span class="cover-leer hidden">📖</span></div>
           <div class="sub" id="nb-beschreibung"></div>
         </div>
-        <input type="hidden" name="beschreibung"><input type="hidden" name="cover_url"><input type="hidden" name="nachgeladen">
+        <input type="hidden" name="beschreibung"><input type="hidden" name="cover_url"><input type="hidden" name="nachgeladen"><input type="hidden" name="code">
         <div class="form-grid">
           <div><label for="nb-isbn">ISBN</label><input id="nb-isbn" name="isbn" autocomplete="off"></div>
           <div><label for="nb-anzahl">Anzahl Exemplare</label><input id="nb-anzahl" name="anzahl" type="number" min="1" value="1"></div>
@@ -966,6 +1291,17 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
     <div class="card">
       <h3>Zuletzt erfasst</h3>
       <ul class="log" id="scan-log"><li class="sub" style="color:var(--muted)">Noch nichts gescannt.</li></ul>
+    </div>
+
+    <div class="card">
+      <h2>Mediencodes &amp; Etiketten</h2>
+      <p class="hint">Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. Beim Ausleihen und Zurückgeben lässt sich dann der Mediencode statt der ISBN scannen, und du siehst genau, welches Exemplar wer hat.</p>
+      <p class="hint"><b>Eigene Etiketten verwenden:</b> den Code des Etiketts oben ins Scan-Feld scannen, danach die ISBN des Buchs. ScanBook merkt sich den Code für dieses Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.</p>
+      <p class="hint" id="codes-status"></p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn secondary" type="button" id="codes-erzeugen">Codes für alle Exemplare ohne Code erzeugen</button>
+        <button class="btn secondary" type="button" id="etiketten-drucken">Neue Etiketten drucken</button>
+      </div>
     </div>
   </section>
 
@@ -1022,25 +1358,28 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
     <div class="grid-2" style="margin-bottom:18px">
       <div class="card">
         <h2>Buch ausleihen</h2>
-        <p class="hint">Buch scannen, Namen eingeben, fertig.</p>
+        <p class="hint">Schülerausweis scannen, dann die Bücher scannen. Jedes Buch wird sofort ausgeliehen.</p>
+        <form id="person-form">
+          <label for="co-name">Schülerausweis oder Name</label>
+          <input id="co-name" list="namen-liste" autocomplete="off" placeholder="Ausweis scannen oder Namen eingeben …">
+        </form>
+        <div class="book-info" id="co-person">Noch niemand ausgewählt.</div>
         <form id="checkout-form">
-          <label for="co-isbn">ISBN</label>
-          <input id="co-isbn" autocomplete="off" placeholder="ISBN scannen …">
-          <div class="book-info" id="co-info">Noch kein Buch gescannt.</div>
           <div class="row" style="margin-top:12px">
-            <div class="grow"><label for="co-name">Name des Ausleihers</label><input id="co-name" list="namen-liste" autocomplete="off"></div>
+            <div class="grow"><label for="co-isbn">Buch (Mediencode oder ISBN)</label><input id="co-isbn" autocomplete="off" placeholder="Buch scannen …" disabled></div>
             <div style="width:110px"><label for="co-tage">Tage</label><input id="co-tage" type="number" min="1"></div>
           </div>
-          <div class="actions"><button class="btn" type="submit" id="co-btn" disabled>Ausleihen</button></div>
+          <ul class="log" id="co-log"></ul>
+          <div class="actions"><button class="btn secondary" type="button" id="co-fertig" disabled>Fertig – nächste Person</button></div>
         </form>
         <datalist id="namen-liste"></datalist>
       </div>
       <div class="card">
         <h2>Zurückgeben oder verlängern</h2>
-        <p class="hint">Buch scannen – ist es nur einmal ausgeliehen, fragt ScanBook direkt, ob es zurückgegeben werden soll. Sonst wird es unten hervorgehoben.</p>
+        <p class="hint">Mediencode scannen – das Exemplar wird sofort zurückgebucht. Bei einer ISBN fragt ScanBook nach, ist das Buch mehrfach ausgeliehen, wird es unten hervorgehoben.</p>
         <form id="return-form">
-          <label for="re-isbn">ISBN</label>
-          <input id="re-isbn" autocomplete="off" placeholder="ISBN scannen …">
+          <label for="re-isbn">Buch (Mediencode oder ISBN)</label>
+          <input id="re-isbn" autocomplete="off" placeholder="Buch scannen …">
         </form>
         <div class="book-info" id="re-info">Oder unten in der Liste auswählen.</div>
       </div>
@@ -1049,12 +1388,34 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
     <div class="card">
       <div class="row" style="margin-bottom:14px">
         <h2 class="grow" style="margin:0">Aktuelle Ausleihen <span class="sub" id="loans-summary" style="color:var(--muted);font-weight:400;font-size:14px"></span></h2>
-        <input id="loans-filter" style="max-width:260px" placeholder="Filtern nach Name oder Titel …" autocomplete="off">
+        <input id="loans-filter" style="max-width:260px" placeholder="Filtern nach Name, Klasse oder Titel …" autocomplete="off">
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Buch</th><th>Ausleiher</th><th>Geliehen am</th><th>Rückgabe bis</th><th>Status</th><th></th></tr></thead>
           <tbody id="loans-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- SCHÜLER -->
+  <section id="tab-schueler">
+    <div class="card">
+      <div class="row">
+        <input id="schueler-suche" class="grow" placeholder="Suchen nach Name oder Ausweisnummer …" autocomplete="off">
+        <button class="btn" type="button" id="schueler-neu">Schüler hinzufügen</button>
+        <button class="btn secondary" type="button" id="schueler-import-btn">Klassenliste importieren</button>
+      </div>
+      <div class="chips" id="klassen-chips"></div>
+      <div class="toolbar">
+        <p class="hint" id="schueler-anzahl"></p>
+        <button class="btn small secondary" type="button" id="ausweise-drucken" style="margin-left:auto">Ausweise drucken</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Klasse</th><th>Ausweis</th><th>Ausgeliehen</th><th></th></tr></thead>
+          <tbody id="schueler-body"></tbody>
         </table>
       </div>
     </div>
@@ -1153,6 +1514,16 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
     <div class="beschreibung" id="pv-beschreibung"></div>
     <div class="vorschau-block hidden" id="pv-baende-block"><h3 id="pv-baende-titel"></h3><ul class="baende" id="pv-baende"></ul></div>
     <div class="vorschau-block hidden" id="pv-ausleihen-block"><h3>Gerade ausgeliehen</h3><ul class="log" id="pv-ausleihen"></ul></div>
+    <div class="vorschau-block" id="pv-codes-block">
+      <h3 id="pv-codes-titel">Mediencodes</h3>
+      <ul class="log codes" id="pv-codes"></ul>
+      <form class="code-zeile" id="pv-code-form">
+        <input id="pv-code-neu" placeholder="Eigenen Code scannen oder eingeben …" autocomplete="off">
+        <button class="btn small" type="submit">Zuordnen</button>
+        <button class="btn small secondary" type="button" id="pv-codes-erzeugen">Fehlende Codes erzeugen</button>
+        <button class="btn small secondary" type="button" id="pv-etiketten">Etiketten drucken</button>
+      </form>
+    </div>
     <div class="actions">
       <button class="btn" type="button" id="pv-edit">Bearbeiten</button>
       <button class="btn secondary" type="button" id="pv-refresh">Daten online nachladen</button>
@@ -1181,6 +1552,43 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
   </form>
 </dialog>
 
+<!-- SCHÜLER-DIALOG -->
+<dialog id="schueler-dialog">
+  <form id="schueler-form" class="dlg-body">
+    <h2 id="schueler-dlg-titel">Schüler</h2>
+    <p class="hint">Die Ausweisnummer steht als Barcode auf dem Ausweis. Leer lassen, dann vergibt ScanBook die nächste freie Nummer. Vorhandene Ausweise (z. B. vom Schülerausweis der Schule) einfach einscannen.</p>
+    <input type="hidden" name="id">
+    <div class="form-grid">
+      <div><label for="sc-vorname">Vorname</label><input id="sc-vorname" name="vorname" autocomplete="off"></div>
+      <div><label for="sc-nachname">Nachname</label><input id="sc-nachname" name="nachname" autocomplete="off"></div>
+      <div><label for="sc-klasse">Klasse</label><input id="sc-klasse" name="klasse" list="klassen-liste" autocomplete="off" placeholder="z. B. 5a"></div>
+      <div><label for="sc-ausweis">Ausweisnummer</label><input id="sc-ausweis" name="ausweis" autocomplete="off" placeholder="leer = automatisch"></div>
+    </div>
+    <div class="vorschau-block hidden" id="sc-ausleihen-block"><h3>Gerade ausgeliehen</h3><ul class="log" id="sc-ausleihen"></ul></div>
+    <div class="actions">
+      <button class="btn" type="submit">Speichern</button>
+      <button class="btn secondary" type="button" id="sc-drucken">Ausweis drucken</button>
+      <button class="btn danger" type="button" id="sc-loeschen">Löschen</button>
+      <button class="btn secondary" type="button" id="sc-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- KLASSENLISTE-IMPORT -->
+<dialog id="import-dialog">
+  <form id="import-form" class="dlg-body">
+    <h2>Klassenliste importieren</h2>
+    <p class="hint">Eine Zeile pro Schüler: <b>Nachname; Vorname; Klasse</b>, optional als vierte Spalte eine vorhandene Ausweisnummer. Am einfachsten die Spalten aus Excel kopieren und hier einfügen, oder eine CSV-Datei wählen. Eine Kopfzeile mit „Vorname“, „Nachname“, „Klasse“ darf dabei sein, dann ist die Reihenfolge egal. Schüler, die es schon gibt, werden übersprungen.</p>
+    <textarea name="text" id="import-text" rows="9" placeholder="Muster;Max;5a&#10;Beispiel;Lea;5a"></textarea>
+    <div class="row" style="margin-top:10px"><input type="file" id="import-datei" accept=".csv,.txt,text/csv,text/plain" style="background:none;padding:0"></div>
+    <div class="actions">
+      <button class="btn" type="submit">Importieren</button>
+      <button class="btn secondary" type="button" id="import-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
+<datalist id="klassen-liste"></datalist>
 <datalist id="serien-liste"></datalist>
 <div id="toasts"></div>
 
@@ -1267,16 +1675,23 @@ function nachBand(a, b) {
 function serieText(serie, band) {
   return serie ? (band ? `${serie} · Band ${band}` : serie) : "";
 }
+function codeHtml(code) {
+  return `<span class="code">${esc(code)}</span>`;
+}
+function drucken(pfad, params = {}) {
+  window.open(`/druck/${pfad}?` + new URLSearchParams(params), "_blank");
+}
 async function versuche(fn) {
   try { return await fn(); } catch (e) { toast(e.message, true); }
 }
 
 // --- Navigation ---
 const LADER = {
-  scan: () => $("#scan-isbn").focus(),
+  scan: () => { $("#scan-isbn").focus(); ladeCodesStatus(); },
   katalog: () => ladeKatalog(),
   regale: () => ladeRegale(),
-  ausleihe: () => { ladeAusleihen(); ladeNamen(); $("#co-isbn").focus(); },
+  ausleihe: () => { ladeAusleihen(); ladeNamen(); (ausleihPerson ? $("#co-isbn") : $("#co-name")).focus(); },
+  schueler: () => ladeSchueler(),
   personen: () => ladePersonen(),
   statistik: () => ladeStatistik(),
   einstellungen: () => ladeEinstellungen(),
@@ -1311,6 +1726,7 @@ function logEintrag(html) {
 function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
   const form = $("#new-book-form");
   form.reset();
+  form.code.value = wartenderCode || "";
   form.isbn.value = isbn || "";
   form.isbn.readOnly = Boolean(isbn);
   for (const f of FELDER) {
@@ -1354,8 +1770,22 @@ function zeigePlatz(b) {
 
 function schliesseNeuesBuch() {
   $("#new-book-card").classList.add("hidden");
+  setzeWartendenCode(null);
   $("#scan-isbn").focus();
 }
+
+// Eigenes Etikett gescannt, das ScanBook noch nicht kennt: das nächste gescannte Buch bekommt diesen Code
+let wartenderCode = null;
+function setzeWartendenCode(code) {
+  wartenderCode = code;
+  const box = $("#code-box");
+  box.classList.toggle("hidden", !code);
+  if (code) box.innerHTML = `🏷️ Neuer Mediencode ${codeHtml(code)} – jetzt die <b>ISBN des Buchs</b> scannen, um ihn zuzuordnen.
+    <button class="btn small secondary" type="button" id="code-abbrechen" style="margin-left:8px">Abbrechen</button>`;
+}
+$("#code-box").addEventListener("click", (e) => {
+  if (e.target.id === "code-abbrechen") { setzeWartendenCode(null); $("#scan-isbn").focus(); }
+});
 
 $("#scan-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -1366,15 +1796,30 @@ $("#scan-form").addEventListener("submit", (e) => {
   versuche(async () => {
     feld.disabled = true;
     try {
-      const r = await post("scan", { isbn });
-      if (r.status === "aufgestockt") {
+      const r = await post("scan", { isbn, code: wartenderCode || "" });
+      if (r.status === "neuer_code") {
+        setzeWartendenCode(r.code);
+      } else if (r.status === "exemplar") {
+        const b = r.buch;
+        toast(`${r.code} gehört zu „${b.titel}“`);
+        logEintrag(`🏷️ ${codeHtml(r.code)} ist ein Exemplar von <b>${esc(b.titel)}</b>${b.standort ? ` · 📍 ${esc(b.standort)}` : ""}`);
+        zeigePlatz(b);
+      } else if (r.status === "zugeordnet") {
+        const b = r.buch;
+        setzeWartendenCode(null);
+        toast(`${r.code} → „${b.titel}“` + (r.aufgestockt ? ` – neues Exemplar, jetzt ${b.anzahl_gesamt}×` : ""));
+        logEintrag(`🏷️ ${codeHtml(r.code)} → <b>${esc(b.titel)}</b>` + (r.aufgestockt ? ` (neues Exemplar, ${b.anzahl_gesamt}×)` : " (vorhandenes Exemplar)"));
+        zeigePlatz(b);
+        ladeCodesStatus();
+      } else if (r.status === "aufgestockt") {
         const b = r.buch;
         toast(`„${b.titel}“ aufgestockt – jetzt ${b.anzahl_gesamt}×`);
         logEintrag(`➕ <b>${esc(b.titel)}</b> aufgestockt (${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar)${b.standort ? ` · 📍 ${esc(b.standort)}` : ""}`);
         zeigePlatz(b);
       } else if (r.daten) {
         zeigeNeuesBuch(r.isbn, r.daten, r.fehlend,
-          r.fehlend.length ? "Gefunden! Gelb markierte Angaben fehlen – du kannst sie ergänzen. [Enter] speichert." : "Gefunden! Bitte kurz prüfen. [Enter] speichert.");
+          (r.fehlend.length ? "Gefunden! Gelb markierte Angaben fehlen – du kannst sie ergänzen. [Enter] speichert." : "Gefunden! Bitte kurz prüfen. [Enter] speichert.")
+          + (r.code ? ` Das Exemplar bekommt den Mediencode ${r.code}.` : ""));
       } else {
         zeigeNeuesBuch(r.isbn, null, ["titel"], "Dieses Buch wurde online nicht gefunden. Bitte die Daten von Hand eintragen.");
       }
@@ -1392,6 +1837,7 @@ $("#new-book-form").addEventListener("submit", (e) => {
   versuche(async () => {
     const b = await post("book_create", formDaten(e.target));
     toast(`„${b.titel}“ gespeichert`);
+    if (wartenderCode) ladeCodesStatus();
     const platz = b.standort_soll || b.standort;
     logEintrag(`✨ <b>${esc(b.titel)}</b> neu hinzugefügt (${b.anzahl_gesamt}×)${platz ? ` · 📍 ${esc(platz)}` : ""}`
       + (b.umstellen ? ` · ↪️ ${b.umstellen} Buch${b.umstellen === 1 ? "" : "er"} umstellen (Tab „Regale“)` : ""));
@@ -1399,6 +1845,32 @@ $("#new-book-form").addEventListener("submit", (e) => {
     schliesseNeuesBuch();
     if (b.serie) get("books").then(setzeSerienListe).catch(() => {});
   });
+});
+
+// --- Mediencodes & Etiketten ---
+async function ladeCodesStatus() {
+  const st = await get("codes_status").catch(() => null);
+  if (!st) return;
+  const teile = [`${st.mit_code} Exemplar${st.mit_code === 1 ? " hat" : "e haben"} einen Mediencode`];
+  if (st.ohne_code) teile.push(`${st.ohne_code} noch keinen`);
+  if (st.ungedruckt) teile.push(`${st.ungedruckt} Etikett${st.ungedruckt === 1 ? "" : "en"} noch nicht gedruckt`);
+  $("#codes-status").textContent = teile.join(", ") + ".";
+  $("#codes-erzeugen").disabled = !st.ohne_code;
+  $("#etiketten-drucken").disabled = !st.ungedruckt;
+}
+$("#codes-erzeugen").addEventListener("click", () => {
+  if (!confirm("Für alle Exemplare ohne Mediencode eine neue Nummer erzeugen? Die Etiketten druckst du danach mit „Neue Etiketten drucken“.")) return;
+  versuche(async () => {
+    const r = await post("codes_erzeugen");
+    toast(`${r.codes.length} Mediencode${r.codes.length === 1 ? "" : "s"} erzeugt`);
+    ladeCodesStatus();
+  });
+});
+$("#etiketten-drucken").addEventListener("click", () => {
+  const frei = prompt("Wie viele Etiketten auf dem ersten Bogen sind schon verbraucht? (0 = neuer Bogen)", "0");
+  if (frei === null) return;
+  drucken("etiketten", { frei });
+  setTimeout(ladeCodesStatus, 4000);
 });
 
 // --- Katalog ---
@@ -1569,7 +2041,8 @@ async function oeffneVorschau(isbn) {
 
     $("#pv-ausleihen-block").classList.toggle("hidden", !b.ausleihen.length);
     $("#pv-ausleihen").innerHTML = b.ausleihen.map((a) =>
-      `<li><span>${esc(a.name)}</span><span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
+      `<li><span>${esc(a.name)}</span>${a.exemplar ? codeHtml(a.exemplar) : ""}<span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
+    zeigeCodes(b);
 
     const dlg = $("#preview-dialog");
     if (!dlg.open) dlg.showModal();
@@ -1577,6 +2050,58 @@ async function oeffneVorschau(isbn) {
   });
 }
 $("#pv-close").addEventListener("click", () => $("#preview-dialog").close());
+
+function zeigeCodes(b) {
+  const codes = b.exemplare;
+  const ohne = Math.max(0, b.anzahl_gesamt - codes.length);
+  const perIsbn = b.ausleihen.filter((a) => !a.exemplar).length;
+  $("#pv-codes-titel").textContent = codes.length
+    ? `Mediencodes – ${codes.length} von ${b.anzahl_gesamt} Exemplar${b.anzahl_gesamt === 1 ? "" : "en"}`
+    : "Mediencodes";
+  $("#pv-codes").innerHTML = codes.map((e) => `
+    <li><span class="grow">${codeHtml(e.code)} <span class="time">${e.eigener ? "eigenes Etikett" : e.gedruckt ? "Etikett gedruckt" : "Etikett noch nicht gedruckt"}</span></span>
+      ${e.ausgeliehen_an ? `<span class="badge warn">bei ${esc(e.ausgeliehen_an)}</span>` : `<span class="badge ok">da</span>`}
+      <button class="btn small secondary" type="button" data-code-loeschen="${esc(e.code)}" title="Nur den Code entfernen, das Exemplar bleibt im Bestand">Code löschen</button>
+      <button class="btn small danger" type="button" data-ausmustern="${esc(e.code)}" title="Exemplar ist verloren oder kaputt">Ausmustern</button>
+    </li>`).join("") + (ohne ? `<li class="sub" style="color:var(--muted)">${ohne} Exemplar${ohne === 1 ? "" : "e"} noch ohne Code.</li>` : "")
+    + (perIsbn && codes.length ? `<li class="sub" style="color:var(--muted)">${perIsbn} Ausleihe${perIsbn === 1 ? " wurde" : "n wurden"} per ISBN gebucht, darum ist nicht bekannt, welches Exemplar.</li>` : "");
+  $("#pv-codes-erzeugen").disabled = !ohne;
+  $("#pv-etiketten").disabled = !codes.some((e) => !e.eigener);
+}
+$("#pv-code-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const feld = $("#pv-code-neu");
+  const code = feld.value.trim();
+  if (!code) return;
+  versuche(async () => {
+    const r = await post("exemplar_neu", { isbn: aktuelleIsbn, code });
+    feld.value = "";
+    toast(`${r.code} zugeordnet` + (r.aufgestockt ? ` – neues Exemplar, jetzt ${r.buch.anzahl_gesamt}×` : ""));
+    await oeffneVorschau(aktuelleIsbn);
+    feld.focus();
+    if (r.aufgestockt) ladeKatalog();
+  });
+});
+$("#pv-codes-erzeugen").addEventListener("click", () => versuche(async () => {
+  const r = await post("codes_erzeugen", { isbn: aktuelleIsbn });
+  toast(`${r.codes.length} Mediencode${r.codes.length === 1 ? "" : "s"} erzeugt`);
+  await oeffneVorschau(aktuelleIsbn);
+}));
+$("#pv-etiketten").addEventListener("click", () => drucken("etiketten", { isbn: aktuelleIsbn }));
+$("#pv-codes").addEventListener("click", (e) => {
+  const d = e.target.dataset;
+  if (d.codeLoeschen && confirm(`Mediencode ${d.codeLoeschen} löschen? Das Exemplar bleibt im Bestand, nur ohne Code.`)) {
+    versuche(async () => { await post("exemplar_loeschen", { code: d.codeLoeschen }); toast("Code gelöscht"); await oeffneVorschau(aktuelleIsbn); });
+  }
+  if (d.ausmustern && confirm(`Exemplar ${d.ausmustern} ausmustern (verloren oder kaputt)? Der Bestand sinkt um eins.`)) {
+    versuche(async () => {
+      await post("exemplar_entfernen", { isbn: aktuelleIsbn, code: d.ausmustern });
+      toast("Exemplar ausgemustert");
+      await oeffneVorschau(aktuelleIsbn);
+      ladeKatalog();
+    });
+  }
+});
 $("#pv-baende").addEventListener("click", (e) => {
   const li = e.target.closest("li[data-isbn]");
   if (li && li.dataset.isbn !== aktuelleIsbn) oeffneVorschau(li.dataset.isbn);
@@ -1798,8 +2323,12 @@ let ausleihen = [];
 let markierteIsbn = null;
 
 async function ladeNamen() {
-  const namen = await get("borrowers").catch(() => []);
-  $("#namen-liste").innerHTML = namen.map((n) => `<option value="${esc(n)}">`).join("");
+  const [namen, sc] = await Promise.all([get("borrowers").catch(() => []), get("schueler").catch(() => ({ schueler: [] }))]);
+  // Schüler mit Klasse, dazu frühere Namen (z. B. Lehrkräfte), die kein Schüler sind
+  const schuelerNamen = new Set(sc.schueler.map((x) => x.name.toLowerCase()));
+  const vorschlaege = [...sc.schueler.map((x) => x.klasse ? `${x.name} (${x.klasse})` : x.name),
+    ...namen.filter((n) => !schuelerNamen.has(n.toLowerCase()))];
+  $("#namen-liste").innerHTML = vorschlaege.map((n) => `<option value="${esc(n)}">`).join("");
 }
 
 async function ladeAusleihen() {
@@ -1815,11 +2344,11 @@ function zeichneAusleihen() {
   const filter = $("#loans-filter").value.trim().toLowerCase();
   const liste = ausleihen.filter((a) =>
     (!markierteIsbn || a.isbn === markierteIsbn) &&
-    (!filter || a.ausleiher.toLowerCase().includes(filter) || a.titel.toLowerCase().includes(filter)));
+    (!filter || [a.ausleiher, a.titel, a.klasse, a.exemplar].some((x) => x.toLowerCase().includes(filter))));
   $("#loans-body").innerHTML = liste.length ? liste.map((a) => `
     <tr class="${markierteIsbn ? "highlight" : ""}">
-      <td><b>${esc(a.titel)}</b><div class="sub">${esc(a.autor)}</div></td>
-      <td>${esc(a.ausleiher)}</td>
+      <td><b>${esc(a.titel)}</b><div class="sub">${esc(a.autor)}${a.exemplar ? ` · ${esc(a.exemplar)}` : ""}</div></td>
+      <td>${esc(a.ausleiher)}${a.klasse ? `<div class="sub">Klasse ${esc(a.klasse)}</div>` : ""}</td>
       <td class="num">${deDatum(a.ausgeliehen_am)}</td>
       <td class="num">${deDatum(a.rueckgabe_bis)}${a.verlaengerungen ? `<div class="sub">${a.verlaengerungen}× verlängert</div>` : ""}</td>
       <td>${statusBadge(a.tage)}</td>
@@ -1856,50 +2385,88 @@ $("#loans-body").addEventListener("click", (e) => {
   if (e.target.dataset.extend) verlaengern(Number(e.target.dataset.extend));
 });
 
-// Ausleihen-Formular
-let ausleihBuch = null;
-async function pruefeAusleihBuch() {
-  const isbn = $("#co-isbn").value.trim();
-  const infoBox = $("#co-info");
-  ausleihBuch = null;
-  $("#co-btn").disabled = true;
-  infoBox.classList.remove("error");
-  if (!isbn) { infoBox.textContent = "Noch kein Buch gescannt."; return; }
-  try {
-    const b = await get("book", { isbn });
-    if (b.anzahl_verfuegbar <= 0) {
-      infoBox.classList.add("error");
-      infoBox.textContent = `„${b.titel}“ ist aktuell vollständig ausgeliehen.`;
-      return;
-    }
-    ausleihBuch = b;
-    infoBox.innerHTML = `📖 <b>${esc(b.titel)}</b> – ${b.anzahl_verfuegbar} von ${b.anzahl_gesamt} verfügbar`;
-    $("#co-btn").disabled = false;
-  } catch (e) {
-    infoBox.classList.add("error");
-    infoBox.textContent = e.message;
-  }
+// Ausleihen: erst die Person (Ausweis oder Name), dann beliebig viele Bücher
+let ausleihPerson = null;
+function zeigeAusleihPerson(p) {
+  ausleihPerson = p;
+  const box = $("#co-person");
+  box.classList.remove("error");
+  $("#co-isbn").disabled = !p;
+  $("#co-fertig").disabled = !p;
+  if (!p) { box.textContent = "Noch niemand ausgewählt."; return; }
+  const ueber = (p.ausleihen || []).filter((a) => a.tage < 0).length;
+  const anzahl = (p.ausleihen || []).length;
+  const kuerzel = p.name.split(/\s+/).map((t) => t[0] || "").slice(0, 2).join("").toUpperCase();
+  box.innerHTML = `<div class="person-box"><div class="avatar">${esc(kuerzel)}</div><div>
+    <b>${esc(p.name)}</b>${p.klasse ? ` · Klasse ${esc(p.klasse)}` : ""}${p.ausweis ? ` · ${codeHtml(p.ausweis)}` : ""}
+    <div class="sub">${p.id ? (anzahl ? `Hat ${anzahl} ${anzahl === 1 ? "Buch" : "Bücher"} ausgeliehen` : "Hat gerade nichts ausgeliehen") : "Kein Schüler aus der Liste – wird als Name eingetragen"}</div>
+    ${ueber ? `<span class="badge danger">${ueber} überfällig</span>` : ""}</div></div>`;
 }
-$("#co-isbn").addEventListener("keydown", async (e) => {
-  if (e.key !== "Enter") return;
+async function waehlePerson(eingabe) {
+  eingabe = eingabe.trim();
+  $("#co-log").innerHTML = "";
+  if (!eingabe) { zeigeAusleihPerson(null); return; }
+  try {
+    const r = await get("code", { c: eingabe });
+    if (r.typ === "schueler") { zeigeAusleihPerson(r.schueler); return true; }
+    throw new Error("Das ist ein Buch, kein Ausweis. Bitte zuerst den Schülerausweis scannen.");
+  } catch (e) {
+    if (!/weder ein Schülerausweis/.test(e.message)) {
+      zeigeAusleihPerson(null);
+      $("#co-person").classList.add("error");
+      $("#co-person").textContent = e.message;
+      return false;
+    }
+  }
+  // Kein Ausweis: Schüler aus der Vorschlagsliste ("Name (Klasse)") oder ein frei eingegebener Name
+  const sc = await get("schueler", { q: eingabe.replace(/\s*\([^()]*\)$/, "") }).catch(() => ({ schueler: [] }));
+  const treffer = sc.schueler.filter((x) => [x.name, `${x.name} (${x.klasse})`].some((n) => n.toLowerCase() === eingabe.toLowerCase()));
+  if (treffer.length === 1) {
+    const r = await get("code", { c: treffer[0].ausweis });
+    zeigeAusleihPerson(r.schueler);
+  } else {
+    zeigeAusleihPerson({ name: eingabe });
+  }
+  return true;
+}
+$("#person-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  await pruefeAusleihBuch();
-  if (ausleihBuch) $("#co-name").focus();
+  if (await waehlePerson($("#co-name").value)) $("#co-isbn").focus();
 });
-$("#co-isbn").addEventListener("change", pruefeAusleihBuch);
+$("#co-name").addEventListener("change", () => waehlePerson($("#co-name").value));
+// Das Formular hat zwei Felder und keinen Absenden-Knopf, darum [Enter] im Buchfeld selbst abfangen
+$("#co-isbn").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("#checkout-form").requestSubmit(); }
+});
+$("#co-fertig").addEventListener("click", () => {
+  $("#co-name").value = "";
+  zeigeAusleihPerson(null);
+  $("#co-log").innerHTML = "";
+  $("#co-name").focus();
+});
 $("#checkout-form").addEventListener("submit", (e) => {
   e.preventDefault();
-  if (!ausleihBuch) return;
+  const feld = $("#co-isbn");
+  const code = feld.value.trim();
+  if (!code || !ausleihPerson) return;
+  feld.value = "";
   versuche(async () => {
-    const r = await post("checkout", { isbn: ausleihBuch.isbn, ausleiher: $("#co-name").value, tage: $("#co-tage").value });
-    toast(`„${r.titel}“ an ${r.ausleiher} ausgeliehen – Rückgabe bis ${deDatum(r.rueckgabe_bis)}`);
-    e.target.reset();
-    ausleihBuch = null;
-    $("#co-btn").disabled = true;
-    $("#co-info").textContent = "Noch kein Buch gescannt.";
-    await Promise.all([ladeAusleihen(), ladeNamen()]);
-    $("#co-isbn").focus();
-  });
+    // Nächsten Ausweis gescannt? Dann einfach die Person wechseln
+    const was = await get("code", { c: code });
+    if (was.typ === "schueler") {
+      $("#co-name").value = was.schueler.ausweis;
+      zeigeAusleihPerson(was.schueler);
+      $("#co-log").innerHTML = "";
+      return;
+    }
+    if (was.ausgeliehen_an) throw new Error(`Das Exemplar ${was.exemplar} ist noch an ${was.ausgeliehen_an} ausgeliehen. Bitte erst zurückgeben.`);
+    const r = await post("checkout", { code, ausleiher: ausleihPerson.ausweis || ausleihPerson.name, tage: $("#co-tage").value });
+    toast(`„${r.titel}“ an ${r.ausleiher} ausgeliehen – bis ${deDatum(r.rueckgabe_bis)}`);
+    $("#co-log").insertAdjacentHTML("afterbegin",
+      `<li>✅ <span><b>${esc(r.titel)}</b>${r.exemplar ? " " + codeHtml(r.exemplar) : ""}</span><span class="time">bis ${deDatum(r.rueckgabe_bis)}</span></li>`);
+    if (ausleihPerson.ausweis) zeigeAusleihPerson((await get("code", { c: ausleihPerson.ausweis })).schueler);
+    await ladeAusleihen();
+  }).finally(() => feld.focus());
 });
 
 // Rückgabe per Scan
@@ -1913,7 +2480,10 @@ $("#return-form").addEventListener("submit", (e) => {
   if (!isbn) { markierteIsbn = null; zeichneAusleihen(); return; }
   versuche(async () => {
     try {
-      const treffer = await get("loans", { isbn });
+      const treffer = await get("loans", { code: isbn });
+      if (treffer.length === 1 && treffer[0].exemplar.toLowerCase() === isbn.toLowerCase()) {
+        return zurueckgeben(treffer[0].id);  // Mediencode: eindeutig, ohne Rückfrage
+      }
       if (!treffer.length) {
         markierteIsbn = null;
         infoBox.classList.add("error");
@@ -1932,6 +2502,128 @@ $("#return-form").addEventListener("submit", (e) => {
       infoBox.classList.add("error");
       infoBox.textContent = err.message;
     }
+  });
+});
+
+// --- Schüler ---
+let schuelerDaten = { schueler: [], klassen: [] };
+let aktiveKlasse = null;
+async function ladeSchueler() {
+  await versuche(async () => {
+    const params = { q: $("#schueler-suche").value };
+    if (aktiveKlasse !== null) params.klasse = aktiveKlasse;
+    schuelerDaten = await get("schueler", params);
+    if (aktiveKlasse !== null && !schuelerDaten.klassen.includes(aktiveKlasse)) { aktiveKlasse = null; return ladeSchueler(); }
+    const liste = schuelerDaten.schueler;
+    $("#klassen-chips").innerHTML = schuelerDaten.klassen.length
+      ? [`<button class="chip ${aktiveKlasse === null ? "active" : ""}" data-alle="1">Alle</button>`,
+        ...schuelerDaten.klassen.map((k) => `<button class="chip ${k === aktiveKlasse ? "active" : ""}" data-klasse="${esc(k)}">${k ? esc(k) : "ohne Klasse"}</button>`)].join("")
+      : "";
+    $("#klassen-liste").innerHTML = schuelerDaten.klassen.filter(Boolean).map((k) => `<option value="${esc(k)}">`).join("");
+    $("#schueler-anzahl").textContent = liste.length
+      ? `${liste.length} Schüler${aktiveKlasse ? ` in Klasse ${aktiveKlasse}` : ""}. Klicke auf einen Namen zum Bearbeiten.`
+      : "";
+    $("#ausweise-drucken").disabled = !liste.length;
+    $("#ausweise-drucken").textContent = aktiveKlasse ? `Ausweise Klasse ${aktiveKlasse} drucken` : "Alle Ausweise drucken";
+    $("#schueler-body").innerHTML = liste.length ? liste.map((x) => `
+      <tr class="clickable" data-id="${x.id}">
+        <td><b>${esc(x.nachname)}</b>, ${esc(x.vorname)}</td>
+        <td>${esc(x.klasse)}</td>
+        <td>${codeHtml(x.ausweis)}</td>
+        <td>${x.aktiv ? `${x.aktiv} ${x.aktiv === 1 ? "Buch" : "Bücher"}` : `<span class="sub">–</span>`}${x.ueberfaellig ? ` <span class="badge danger">${x.ueberfaellig} überfällig</span>` : ""}</td>
+        <td style="text-align:right"><button class="btn small secondary" type="button" data-ausweis="${x.id}">Ausweis</button></td>
+      </tr>`).join("") : `<tr><td colspan="5" class="empty">${$("#schueler-suche").value.trim() ? "Niemand gefunden." : "Noch keine Schüler. Lege sie einzeln an oder importiere eine Klassenliste."}</td></tr>`;
+  });
+}
+$("#schueler-suche").addEventListener("input", debounce(ladeSchueler));
+$("#klassen-chips").addEventListener("click", (e) => {
+  const d = e.target.dataset;
+  if (d.alle) aktiveKlasse = null;
+  else if (d.klasse !== undefined) aktiveKlasse = d.klasse;
+  else return;
+  ladeSchueler();
+});
+$("#ausweise-drucken").addEventListener("click", () =>
+  drucken("ausweise", aktiveKlasse !== null ? { klasse: aktiveKlasse } : {}));
+$("#schueler-body").addEventListener("click", (e) => {
+  if (e.target.dataset.ausweis) return drucken("ausweise", { ids: e.target.dataset.ausweis });
+  const zeile = e.target.closest("tr[data-id]");
+  if (zeile) oeffneSchueler(schuelerDaten.schueler.find((x) => x.id === Number(zeile.dataset.id)));
+});
+async function oeffneSchueler(x) {
+  const form = $("#schueler-form");
+  form.reset();
+  form.id.value = x?.id ?? "";
+  for (const f of ["vorname", "nachname", "klasse", "ausweis"]) form[f].value = x?.[f] ?? "";
+  if (!x && aktiveKlasse) form.klasse.value = aktiveKlasse;
+  $("#schueler-dlg-titel").textContent = x ? x.name : "Neuer Schüler";
+  $("#sc-drucken").classList.toggle("hidden", !x);
+  $("#sc-loeschen").classList.toggle("hidden", !x);
+  $("#sc-ausleihen-block").classList.add("hidden");
+  $("#schueler-dialog").showModal();
+  form.vorname.focus();
+  if (x?.aktiv) {
+    const r = await get("code", { c: x.ausweis }).catch(() => null);
+    if (!r) return;
+    $("#sc-ausleihen").innerHTML = r.schueler.ausleihen.map((a) =>
+      `<li><span>${esc(a.titel)}</span>${a.exemplar ? codeHtml(a.exemplar) : ""}<span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
+    $("#sc-ausleihen-block").classList.remove("hidden");
+  }
+}
+$("#schueler-neu").addEventListener("click", () => oeffneSchueler(null));
+$("#sc-close").addEventListener("click", () => $("#schueler-dialog").close());
+$("#sc-drucken").addEventListener("click", () => drucken("ausweise", { ids: $("#schueler-form").id.value }));
+$("#schueler-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    const daten = formDaten(e.target);
+    const neu = !daten.id;
+    const x = await post("schueler_save", { ...daten, id: Number(daten.id) || null });
+    toast(`${x.name} gespeichert – Ausweis ${x.ausweis}`);
+    if (neu) {
+      // Gleich den nächsten Schüler derselben Klasse erfassen
+      const form = $("#schueler-form");
+      for (const f of ["vorname", "nachname", "ausweis"]) form[f].value = "";
+      form.vorname.focus();
+    } else {
+      $("#schueler-dialog").close();
+    }
+    ladeSchueler();
+  });
+});
+$("#sc-loeschen").addEventListener("click", () => {
+  const form = $("#schueler-form");
+  if (!confirm(`${form.vorname.value} ${form.nachname.value} löschen? Frühere Ausleihen bleiben mit Namen in der Historie.`)) return;
+  versuche(async () => {
+    await post("schueler_delete", { id: Number(form.id.value) });
+    toast("Schüler gelöscht");
+    $("#schueler-dialog").close();
+    ladeSchueler();
+  });
+});
+$("#schueler-import-btn").addEventListener("click", () => {
+  $("#import-form").reset();
+  $("#import-dialog").showModal();
+  $("#import-text").focus();
+});
+$("#import-close").addEventListener("click", () => $("#import-dialog").close());
+$("#import-datei").addEventListener("change", async (e) => {
+  const datei = e.target.files[0];
+  if (!datei) return;
+  const bytes = new Uint8Array(await datei.arrayBuffer());
+  // Excel speichert CSV oft als Windows-1252 statt UTF-8
+  let inhalt;
+  try { inhalt = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { inhalt = new TextDecoder("windows-1252").decode(bytes); }
+  $("#import-text").value = inhalt;
+});
+$("#import-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    const r = await post("schueler_import", { text: $("#import-text").value });
+    toast(`${r.neu} Schüler importiert` + (r.vorhanden ? `, ${r.vorhanden} gab es schon` : ""), false);
+    if (r.fehler.length) alert("Diese Zeilen wurden nicht übernommen:\n\n" + r.fehler.slice(0, 20).join("\n") + (r.fehler.length > 20 ? `\n… und ${r.fehler.length - 20} weitere` : ""));
+    else $("#import-dialog").close();
+    ladeSchueler();
   });
 });
 
