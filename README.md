@@ -30,14 +30,6 @@ python3 ScanBook_Web.py
 
 Der Browser öffnet sich automatisch mit der ScanBook-Oberfläche. Beenden mit Strg+C im Terminal. Die Oberfläche läuft nur auf dem eigenen Rechner (`localhost`) und ist von anderen Geräten im Netzwerk nicht erreichbar. Beide Varianten – Terminal und Browser – benutzen dieselbe Datenbank und können abwechselnd verwendet werden.
 
-### Windows: Start per Doppelklick
-
-`ScanBook starten.bat` in denselben Ordner wie `ScanBook.py` und `ScanBook_Web.py` legen und doppelklicken. Für ein Desktop-Symbol: Rechtsklick auf die Datei → „Senden an“ → „Desktop (Verknüpfung erstellen)“. Das schwarze Fenster muss offen bleiben, solange ScanBook benutzt wird.
-
-Voraussetzung: Python von python.org, beim Installieren den Haken bei „Add python.exe to PATH“ setzen.
-
-**Ohne Python-Installation:** Beim jeweiligen GitHub-Release `ScanBook-Windows.zip` herunterladen, entpacken (Rechtsklick → „Alle extrahieren“) und im Ordner `ScanBook` die Datei `ScanBook.exe` doppelklicken. Das Paket bringt ein eigenes Python mit, es muss nichts installiert werden. Beim ersten Start kann Windows warnen („Der Computer wurde durch Windows geschützt“): auf „Weitere Informationen“ → „Trotzdem ausführen“ klicken. Die ZIP wird bei jedem Release automatisch gebaut (`.github/workflows/windows-paket.yml`).
-
 Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`exporte/`) werden automatisch im selben Ordner wie das Programm angelegt – egal, von wo aus es gestartet wird.
 
 ## Funktionen
