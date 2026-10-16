@@ -7,6 +7,7 @@ import sys
 import csv
 import json
 import ssl
+import bisect
 import sqlite3
 import subprocess
 import urllib.request
@@ -17,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -259,68 +260,76 @@ def neu_starten(skript):
     os.execv(sys.executable, [sys.executable, skript] + sys.argv[1:])
 
 
+def update_suchen():
+    """Liefert (Version auf GitHub, Quelle, Dateien). Dateien ist None, wenn kein neueres Update da ist.
+    Alle Dateien werden geladen und geprüft, bevor irgendetwas ersetzt wird."""
+    quelle, ref = update_quelle()
+    remote_code = hole_update_datei(ref, "ScanBook.py")
+    remote_version = lies_version(remote_code)
+    if not remote_version:
+        raise ValueError("Die Datei auf GitHub enthält keine Versionsnummer – Update wird nicht installiert.")
+    if version_tupel(remote_version) <= version_tupel(VERSION):
+        return remote_version, quelle, None
+
+    neue_dateien = []
+    for datei, backup_praefix in UPDATE_DATEIEN:
+        code = remote_code if datei == "ScanBook.py" else hole_update_datei(ref, datei)
+        try:
+            compile(code, datei, "exec")
+        except SyntaxError as e:
+            raise ValueError(f"Die neue Version ist fehlerhaft ({e}) – Update wird nicht installiert.")
+        neue_dateien.append((os.path.join(BASE_DIR, datei), backup_praefix, code))
+    return remote_version, quelle, neue_dateien
+
+
+def update_installieren(neue_dateien):
+    """Sichert die alten Programmdateien (nur die letzten paar bleiben) und schreibt die neuen.
+    Liefert die Namen der Backup-Dateien."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backups = []
+    for pfad, backup_praefix, _ in neue_dateien:
+        if not os.path.exists(pfad):
+            continue
+        backup_file = os.path.join(BACKUP_DIR, f"{backup_praefix}{timestamp}_v{VERSION}.py")
+        with open(pfad, "r", encoding="utf-8") as f:
+            local_code = f.read()
+        with open(backup_file, "w", encoding="utf-8") as f:
+            f.write(local_code)
+        alte_dateien_aufraeumen(BACKUP_DIR, backup_praefix, MAX_UPDATE_BACKUPS)
+        backups.append(os.path.basename(backup_file))
+
+    for pfad, _, code in neue_dateien:
+        with open(pfad, "w", encoding="utf-8") as f:
+            f.write(code)
+    return backups
+
+
 def checkForUpdates():
     ueberschrift("🔄 SUCHE NACH UPDATES AUF GITHUB...")
     print(f"Installierte Version: {VERSION}")
 
-    current_script = os.path.realpath(__file__)
-
     try:
-        quelle, ref = update_quelle()
-        remote_code = hole_update_datei(ref, "ScanBook.py")
-        remote_version = lies_version(remote_code)
-
-        if not remote_version:
-            print("⚠️ Die Datei auf GitHub enthält keine Versionsnummer – Update wird nicht installiert.")
-            warte()
-            return
-
-        if version_tupel(remote_version) <= version_tupel(VERSION):
+        remote_version, quelle, neue_dateien = update_suchen()
+        if not neue_dateien:
             print("✅ Das Programm ist bereits auf dem neuesten Stand!")
             warte()
             return
-
-        # Alle Programmdateien laden und prüfen, bevor irgendetwas ersetzt wird
-        neue_dateien = []
-        for datei, backup_praefix in UPDATE_DATEIEN:
-            code = remote_code if datei == "ScanBook.py" else hole_update_datei(ref, datei)
-            try:
-                compile(code, datei, "exec")
-            except SyntaxError as e:
-                print(f"⚠️ Die neue Version ist fehlerhaft ({e}) – Update wird nicht installiert.")
-                warte()
-                return
-            neue_dateien.append((os.path.join(BASE_DIR, datei), backup_praefix, code))
 
         print(f"✨ Neue Version {remote_version} gefunden ({quelle})!")
         if not ja_nein("Möchtest du das Update jetzt installieren?"):
             print("Update abgebrochen.")
             return
 
-        # 1. Backups erstellen (nur die letzten paar werden behalten)
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for pfad, backup_praefix, _ in neue_dateien:
-            if not os.path.exists(pfad):
-                continue
-            backup_file = os.path.join(BACKUP_DIR, f"{backup_praefix}{timestamp}_v{VERSION}.py")
-            with open(pfad, "r", encoding="utf-8") as f:
-                local_code = f.read()
-            with open(backup_file, "w", encoding="utf-8") as f:
-                f.write(local_code)
-            alte_dateien_aufraeumen(BACKUP_DIR, backup_praefix, MAX_UPDATE_BACKUPS)
-            print(f"📦 Backup gespeichert unter: backups/{os.path.basename(backup_file)}")
-
-        # 2. Dateien überschreiben
-        for pfad, _, code in neue_dateien:
-            with open(pfad, "w", encoding="utf-8") as f:
-                f.write(code)
+        for name in update_installieren(neue_dateien):
+            print(f"📦 Backup gespeichert unter: backups/{name}")
         print("🚀 Update erfolgreich installiert!")
         print("🔄 Das Programm wird jetzt neu gestartet...\n")
+        neu_starten(os.path.realpath(__file__))
 
-        # 3. Programm automatisch neu starten
-        neu_starten(current_script)
-
+    except ValueError as e:
+        print(f"⚠️ {e}")
+        warte()
     except Exception as e:
         print(f"⚠️ Fehler beim Suchen nach Updates: {e}")
         print("Stelle sicher, dass die Internetverbindung steht und der GitHub-Pfad korrekt ist.")
@@ -378,7 +387,21 @@ def init_db():
                 band TEXT DEFAULT '',
                 beschreibung TEXT DEFAULT '',
                 cover_url TEXT DEFAULT '',
-                nachgeladen INTEGER DEFAULT 0
+                nachgeladen INTEGER DEFAULT 0,
+                regal_id INTEGER,
+                fach INTEGER
+            )
+        ''')
+
+        # Regale: genres = mit Komma getrennt, leer = Regal für alle übrigen Bücher
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS regale (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                faecher INTEGER DEFAULT 1,
+                kapazitaet INTEGER DEFAULT 30,
+                genres TEXT DEFAULT '',
+                reihenfolge INTEGER DEFAULT 0
             )
         ''')
 
@@ -411,6 +434,10 @@ def init_db():
         if "nachgeladen" not in buch_spalten:
             # 0 = Beschreibung, Cover und Serie wurden noch nicht online gesucht
             cursor.execute("ALTER TABLE buecher ADD COLUMN nachgeladen INTEGER DEFAULT 0")
+        # Standort, an dem das Buch tatsächlich steht (leer = noch nicht eingeräumt)
+        for spalte in ("regal_id", "fach"):
+            if spalte not in buch_spalten:
+                cursor.execute(f"ALTER TABLE buecher ADD COLUMN {spalte} INTEGER")
 
         vorhandene_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(ausleihen)")}
         if "zurueckgegeben_am" not in vorhandene_spalten:
@@ -1100,6 +1127,397 @@ def alle_nachladen(fortschritt=None, pause=0.5):
     return len(isbns), ergaenzt
 
 
+# --- REGALE & STANDORTE ---
+# Jedes Regal hat Fächer mit gleich viel Platz und eine Liste von Genres (leer = alle übrigen Bücher).
+# Ein Buch kommt in das erste Regal, das eines seiner Genres hat. Innerhalb des Regals wird sortiert:
+# nach Genre (Reihenfolge wie beim Regal eingetragen), dann nach Autor; Bände einer Serie stehen
+# zusammen in Band-Reihenfolge. Ist ein Regal voll, rutschen die letzten Bücher ins nächste Regal,
+# das ihr Genre (oder alle übrigen Bücher) aufnimmt.
+# Gespeichert wird, wo ein Buch tatsächlich steht (regal_id, fach). Der Plan lässt diese Bücher
+# möglichst stehen und schlägt nur dann Umstellungen vor, wenn ein Fach zu voll wird.
+
+def genre_liste(text):
+    return [g.strip() for g in (text or "").split(",") if g.strip() and g.strip() not in LEERWERTE]
+
+
+def lade_regale():
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name, faecher, kapazitaet, genres FROM regale ORDER BY reihenfolge, id").fetchall()
+    return [{"id": r[0], "name": r[1], "faecher": max(1, r[2] or 1), "kapazitaet": max(1, r[3] or 1),
+             "genres": genre_liste(r[4])} for r in rows]
+
+
+def regal_speichern(regal_id, name, faecher, kapazitaet, genres):
+    """Legt ein Regal an (regal_id None) oder ändert es. genres = Liste. Liefert die ID."""
+    werte = (name.strip(), int(faecher), int(kapazitaet), ", ".join(genres))
+    with db_connection() as conn:
+        if regal_id:
+            conn.execute("UPDATE regale SET name = ?, faecher = ?, kapazitaet = ?, genres = ? WHERE id = ?",
+                         (*werte, regal_id))
+            return regal_id
+        naechste = conn.execute("SELECT COALESCE(MAX(reihenfolge), 0) + 1 FROM regale").fetchone()[0]
+        return conn.execute("INSERT INTO regale (name, faecher, kapazitaet, genres, reihenfolge) VALUES (?, ?, ?, ?, ?)",
+                            (*werte, naechste)).lastrowid
+
+
+def regal_loeschen(regal_id):
+    with db_connection() as conn:
+        conn.execute("UPDATE buecher SET regal_id = NULL, fach = NULL WHERE regal_id = ?", (regal_id,))
+        conn.execute("DELETE FROM regale WHERE id = ?", (regal_id,))
+
+
+def regal_verschieben(regal_id, richtung):
+    """richtung -1 = nach vorne (wird bei gleichen Genres zuerst gefüllt), +1 = nach hinten."""
+    ids = [r["id"] for r in lade_regale()]
+    if regal_id not in ids:
+        return
+    i = ids.index(regal_id)
+    j = i + richtung
+    if 0 <= j < len(ids):
+        ids[i], ids[j] = ids[j], ids[i]
+    with db_connection() as conn:
+        for nr, rid in enumerate(ids, 1):
+            conn.execute("UPDATE regale SET reihenfolge = ? WHERE id = ?", (nr, rid))
+
+
+def alle_genres():
+    with db_connection() as conn:
+        genres = {g for (text,) in conn.execute("SELECT genre FROM buecher") for g in genre_liste(text)}
+    return sorted(genres, key=str.lower)
+
+
+def natuerlich(text):
+    """Sortierschlüssel, bei dem "Teil 2" vor "Teil 10" kommt."""
+    return re.sub(r"\d+", lambda m: m.group(0).zfill(8), (text or "").lower())
+
+
+def laengste_folge(werte):
+    """Positionen der längsten nicht fallenden Teilfolge – diese Bücher können stehen bleiben."""
+    enden, enden_pos, vorgaenger = [], [], [-1] * len(werte)
+    for i, wert in enumerate(werte):
+        k = bisect.bisect_right(enden, wert)
+        if k == len(enden):
+            enden.append(wert)
+            enden_pos.append(i)
+        else:
+            enden[k], enden_pos[k] = wert, i
+        vorgaenger[i] = enden_pos[k - 1] if k else -1
+    folge, i = [], enden_pos[-1] if enden_pos else -1
+    while i != -1:
+        folge.append(i)
+        i = vorgaenger[i]
+    return folge[::-1]
+
+
+def faecher_belegen(buecher, regal):
+    """Verteilt die sortierten Bücher auf die Fächer. Liefert (Liste je Fach, Bücher ohne Platz)."""
+    anzahl_faecher, kap = regal["faecher"], regal["kapazitaet"]
+    platz = [max(1, b["anzahl"]) for b in buecher]
+    gespeichert = [b["fach"] if b["regal_id"] == regal["id"] and b["fach"] and 1 <= b["fach"] <= anzahl_faecher
+                   else None for b in buecher]
+    mit_fach = [i for i, f in enumerate(gespeichert) if f]
+    bleiben = {mit_fach[k] for k in laengste_folge([gespeichert[i] for i in mit_fach])}
+
+    fach = [None] * len(buecher)
+    if not bleiben:
+        # Regal wird neu eingeräumt: gleichmäßig verteilen, damit überall Platz für Neues bleibt
+        ziel = min(kap, -(-sum(platz) // anzahl_faecher))
+        aktuell, belegt = 1, 0
+        for i in range(len(buecher)):
+            if belegt and belegt + platz[i] > ziel and aktuell < anzahl_faecher:
+                aktuell, belegt = aktuell + 1, 0
+            fach[i] = aktuell
+            belegt += platz[i]
+    else:
+        # Neue Bücher kommen zu ihrem Vorgänger in der Sortierung (am Anfang: zum Nachfolger)
+        for i in bleiben:
+            fach[i] = gespeichert[i]
+        erstes = fach[min(bleiben)]
+        vorher = None
+        for i in range(len(buecher)):
+            if fach[i] is None:
+                fach[i] = vorher or erstes
+            vorher = fach[i]
+
+    inhalt = [[] for _ in range(anzahl_faecher + 2)]  # Index 1..n = Fächer, n+1 = passt nicht mehr
+    for i, f in enumerate(fach):
+        inhalt[f].append(i)
+
+    def belegt(f):
+        return sum(platz[i] for i in inhalt[f])
+
+    # Zu volle Fächer: erstes Buch ins vorige Fach (wenn dort Platz ist), sonst letztes ins nächste
+    for f in range(1, anzahl_faecher + 1):
+        while belegt(f) > kap and len(inhalt[f]) > 1:
+            if f > 1 and belegt(f - 1) + platz[inhalt[f][0]] <= kap:
+                inhalt[f - 1].append(inhalt[f].pop(0))
+            else:
+                inhalt[f + 1].insert(0, inhalt[f].pop())
+    return ([[buecher[i] for i in inhalt[f]] for f in range(1, anzahl_faecher + 1)],
+            [buecher[i] for i in inhalt[anzahl_faecher + 1]])
+
+
+def regal_plan():
+    """Berechnet, wo jedes Buch stehen sollte.
+    Liefert {"regale": [... mit "inhalt" je Fach], "buecher": {isbn: buch}, "ohne_platz": [(buch, grund)]}.
+    Jedes Buch hat "soll" = (regal_id, fach) oder None und "ist" = gespeicherter Standort oder None."""
+    regale = lade_regale()
+    with db_connection() as conn:
+        rows = conn.execute('''
+            SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach
+            FROM buecher
+        ''').fetchall()
+    regal_ids = {r["id"] for r in regale}
+    buecher = []
+    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach in rows:
+        buecher.append({
+            "isbn": isbn, "titel": titel or "", "autor": autor or "", "nachname": (nachname or "").lower(),
+            "genres": genre_liste(genre), "serie": (serie or "").strip(), "band": band or "", "anzahl": anzahl or 1,
+            "regal_id": regal_id if regal_id in regal_ids else None, "fach": fach, "soll": None,
+        })
+        b = buecher[-1]
+        b["ist"] = (b["regal_id"], fach) if b["regal_id"] and fach else None
+
+    # Eine Serie wird unter dem Autor ihres ersten Bandes einsortiert
+    serien_autor = {}
+    for b in sorted((b for b in buecher if b["serie"]), key=lambda b: band_sortierwert(b["band"])):
+        serien_autor.setdefault(b["serie"].lower(), b["nachname"])
+
+    def sortierung(regal, b):
+        kleine = [g.lower() for g in b["genres"]]
+        if regal["genres"]:
+            eigene = [g.lower() for g in regal["genres"]]
+            genre = (min((eigene.index(g) for g in kleine if g in eigene), default=len(eigene)), "")
+        else:
+            genre = (0, kleine[0] if kleine else "￿")  # Bücher ohne Genre ans Ende
+        if b["serie"]:
+            return genre, serien_autor[b["serie"].lower()], natuerlich(b["serie"]), band_sortierwert(b["band"]), natuerlich(b["titel"])
+        return genre, b["nachname"], natuerlich(b["titel"]), (0, 0, ""), ""
+
+    def nimmt_auf(regal, b):
+        eigene = {g.lower() for g in regal["genres"]}
+        return not eigene or any(g.lower() in eigene for g in b["genres"])
+
+    def erstes_regal(b):
+        for nr, regal in enumerate(regale):
+            if regal["genres"] and nimmt_auf(regal, b):
+                return nr
+        return next((nr for nr, regal in enumerate(regale) if not regal["genres"]), None)
+
+    zuordnung = {b["isbn"]: erstes_regal(b) for b in buecher}
+    uebrig = []
+    for nr, regal in enumerate(regale):
+        hierher = [b for b in buecher if zuordnung[b["isbn"]] == nr] + [b for b in uebrig if nimmt_auf(regal, b)]
+        uebrig = [b for b in uebrig if not nimmt_auf(regal, b)]
+        hierher.sort(key=lambda b: sortierung(regal, b))
+        regal["inhalt"], zu_viel = faecher_belegen(hierher, regal)
+        for fach_nr, inhalt in enumerate(regal["inhalt"], 1):
+            for b in inhalt:
+                b["soll"] = (regal["id"], fach_nr)
+        uebrig += zu_viel
+
+    ohne_platz = [(b, "voll") for b in uebrig]
+    ohne_platz += [(b, "kein_regal") for b in buecher if zuordnung[b["isbn"]] is None]
+    return {"regale": regale, "buecher": {b["isbn"]: b for b in buecher}, "ohne_platz": ohne_platz}
+
+
+def standort_text(regale, standort):
+    if not standort:
+        return ""
+    regal = next((r for r in regale if r["id"] == standort[0]), None)
+    return f"{regal['name']}, Fach {standort[1]}" if regal else ""
+
+
+def umstellungen(plan):
+    """Bücher, die schon eingeräumt sind, aber woanders hin sollen."""
+    return [b for b in plan["buecher"].values() if b["ist"] and b["soll"] and b["ist"] != b["soll"]]
+
+
+def noch_einzuraeumen(plan):
+    return [b for b in plan["buecher"].values() if not b["ist"] and b["soll"]]
+
+
+def plan_uebernehmen():
+    """Merkt sich für alle Bücher den geplanten Standort (= alles wurde so eingeräumt)."""
+    plan = regal_plan()
+    with db_connection() as conn:
+        for isbn, b in plan["buecher"].items():
+            regal_id, fach = b["soll"] or (None, None)
+            conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (regal_id, fach, isbn))
+
+
+def buch_einraeumen(isbn):
+    """Für ein neues Buch: Liefert (Standort-Text, Anzahl nötiger Umstellungen, Grund falls kein Platz).
+    Der Platz wird gespeichert, sobald im Regal schon andere Bücher fest eingeräumt sind –
+    beim ersten Einräumen wird erst gespeichert, wenn der ganze Plan übernommen wird."""
+    plan = regal_plan()
+    if not plan["regale"]:
+        return "", 0, None
+    b = plan["buecher"].get(isbn)
+    if not b:
+        return "", 0, None
+    if not b["soll"]:
+        grund = next((g for x, g in plan["ohne_platz"] if x["isbn"] == isbn), "voll")
+        return "", 0, grund
+    regal_id = b["soll"][0]
+    if not b["ist"] and any(x["ist"] and x["ist"][0] == regal_id for x in plan["buecher"].values()):
+        with db_connection() as conn:
+            conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (*b["soll"], isbn))
+    andere = [x for x in umstellungen(plan) if x["isbn"] != isbn]
+    return standort_text(plan["regale"], b["soll"]), len(andere), None
+
+
+def standort_von(isbn, plan=None):
+    """(gespeicherter Standort, geplanter Standort falls anders) als Text."""
+    plan = plan or regal_plan()
+    b = plan["buecher"].get(isbn)
+    if not b or not plan["regale"]:
+        return "", ""
+    ist, soll = standort_text(plan["regale"], b["ist"]), standort_text(plan["regale"], b["soll"])
+    return ist, (soll if soll != ist else "")
+
+
+def zahl_eingabe(prompt, standard):
+    while True:
+        eingabe = input(f"{prompt} [{standard}]: ").strip()
+        if not eingabe:
+            return standard
+        if eingabe.isdigit() and int(eingabe) > 0:
+            return int(eingabe)
+        print("Bitte eine ganze Zahl größer 0 eingeben.")
+
+
+def regal_formular(regal=None):
+    regal = regal or {"id": None, "name": "", "faecher": 5, "kapazitaet": 30, "genres": []}
+    name = input(f"   Name{f' [{regal['name']}]' if regal['name'] else ' (z. B. Regal 1)'}: ").strip() or regal["name"]
+    if not name:
+        print("❌ Abgebrochen. Ein Name ist erforderlich.")
+        return
+    faecher = zahl_eingabe("   Anzahl Fächer", regal["faecher"])
+    kapazitaet = zahl_eingabe("   Bücher pro Fach (ungefähr)", regal["kapazitaet"])
+    vorhanden = alle_genres()
+    if vorhanden:
+        print(f"   Genres im Katalog: {', '.join(vorhanden)}")
+    aktuell = ", ".join(regal["genres"])
+    eingabe = input(f"   Genres, mit Komma getrennt (leer = alle übrigen Bücher){f' [{aktuell}]' if aktuell else ''}"
+                    f"{', - = leeren' if aktuell else ''}: ").strip()
+    genres = [] if eingabe == "-" else genre_liste(eingabe) if eingabe else regal["genres"]
+    regal_speichern(regal["id"], name, faecher, kapazitaet, genres)
+    print("✅ Regal gespeichert.")
+
+
+def zeige_regale(plan):
+    for nr, r in enumerate(plan["regale"], 1):
+        belegt = sum(b["anzahl"] for inhalt in r["inhalt"] for b in inhalt)
+        print(f"{nr}. {r['name']} – {r['faecher']} Fächer × {r['kapazitaet']} Bücher, belegt: {belegt}/{r['faecher'] * r['kapazitaet']}")
+        print(f"   Genres: {', '.join(r['genres']) or 'alle übrigen Bücher'}")
+
+
+def waehle_regal(plan):
+    if not plan["regale"]:
+        print("Noch keine Regale angelegt.")
+        return None
+    zeige_regale(plan)
+    wahl = input("\nNummer des Regals (oder [ENTER] zum Abbrechen): ").strip()
+    if wahl.isdigit() and 1 <= int(wahl) <= len(plan["regale"]):
+        return plan["regale"][int(wahl) - 1]
+    return None
+
+
+def zeige_einraeumplan(plan):
+    regale = plan["regale"]
+    for r in regale:
+        ueberschrift(f"🗄️ {r['name']}", 75)
+        for fach_nr, inhalt in enumerate(r["inhalt"], 1):
+            belegt = sum(b["anzahl"] for b in inhalt)
+            print(f"\nFach {fach_nr} ({belegt}/{r['kapazitaet']}):")
+            for b in inhalt:
+                hinweis = ""
+                if not b["ist"]:
+                    hinweis = "  ➕ neu einräumen"
+                elif b["ist"] != b["soll"]:
+                    hinweis = f"  ↪️ umstellen von {standort_text(regale, b['ist'])}"
+                menge = f" ({b['anzahl']}x)" if b["anzahl"] > 1 else ""
+                print(f"   • {b['autor'][:22]:<22} | {b['titel'][:40]}{menge}{hinweis}")
+            if not inhalt:
+                print("   (leer)")
+    if plan["ohne_platz"]:
+        ueberschrift("⚠️ OHNE PLATZ", 75)
+        for b, grund in plan["ohne_platz"]:
+            text = "Regale voll" if grund == "voll" else f"kein Regal für: {', '.join(b['genres']) or 'ohne Genre'}"
+            print(f"   • {b['titel'][:45]} – {text}")
+
+
+def regale_menue():
+    while True:
+        plan = regal_plan()
+        ueberschrift("🗄️ REGALE & STANDORTE")
+        if plan["regale"]:
+            zeige_regale(plan)
+        else:
+            print("Lege deine Regale an. ScanBook sagt dir dann für jedes Buch, wo es hingehört.")
+        umstellen, neu = umstellungen(plan), noch_einzuraeumen(plan)
+        zu_tun = [text for anzahl, text in ((len(neu), "einräumen"), (len(umstellen), "umstellen")) if anzahl
+                  for text in [f"{anzahl} {'Buch' if anzahl == 1 else 'Bücher'} {text}"]]
+        if zu_tun:
+            print(f"\n📦 Zu tun: {', '.join(zu_tun)} (siehe Einräumplan, danach Punkt 6).")
+        if plan["ohne_platz"]:
+            print(f"⚠️ {len(plan['ohne_platz'])} Buch/Bücher haben keinen Platz – siehe Einräumplan.")
+        print("\n1. Regal anlegen")
+        print("2. Regal bearbeiten")
+        print("3. Regal löschen")
+        print("4. Regal nach vorne schieben (wird bei gleichen Genres zuerst gefüllt)")
+        print("5. Einräumplan anzeigen (was steht wo, was muss umgestellt werden)")
+        print("6. Alles eingeräumt – Plan übernehmen")
+        print("7. Zurück zum Hauptmenü")
+        wahl = input("\nWähle eine Option (1-7): ").strip()
+
+        if wahl == "1":
+            regal_formular()
+        elif wahl == "2":
+            regal = waehle_regal(plan)
+            if regal:
+                regal_formular(regal)
+        elif wahl == "3":
+            regal = waehle_regal(plan)
+            if regal and ja_nein(f"⚠️ '{regal['name']}' wirklich löschen?"):
+                regal_loeschen(regal["id"])
+                print("🗑️ Regal gelöscht.")
+        elif wahl == "4":
+            regal = waehle_regal(plan)
+            if regal:
+                regal_verschieben(regal["id"], -1)
+        elif wahl == "5":
+            zeige_einraeumplan(plan)
+            warte()
+        elif wahl == "6":
+            plan_uebernehmen()
+            print("✅ Gespeichert. Neue Bücher werden ab jetzt passend dazu einsortiert.")
+        elif wahl == "7":
+            return
+        else:
+            print("Ungültige Eingabe.")
+
+
+def standort_ausgeben(isbn, neu=False):
+    if neu:
+        text, andere, grund = buch_einraeumen(isbn)
+    else:
+        text, soll = standort_von(isbn)
+        andere, grund = 0, None
+        if soll:
+            text = f"{text or 'noch nicht eingeräumt'} → soll nach {soll}"
+    if text:
+        print(f"📍 Standort: {text}")
+    elif grund == "voll":
+        print("⚠️ Die passenden Regale sind voll – lege ein Fach oder Regal dazu.")
+    elif grund == "kein_regal":
+        print("⚠️ Für dieses Genre gibt es noch kein Regal.")
+    if andere:
+        print(f"↪️ Dafür sollten {andere} Buch/Bücher umgestellt werden (Menü 'Regale & Standorte').")
+
+
 # --- BUCH SCANNEN UND HINZUFÜGEN ---
 def scan_and_add():
     ueberschrift("📥 SCANNER-MODUS AKTIV")
@@ -1129,6 +1547,7 @@ def scan_and_add():
                     ''', (isbn,))
                 print(f"✅ '{vorhanden['titel']}' aufgestockt -> Gesamt: {vorhanden['anzahl_gesamt'] + 1}x "
                       f"(Verfügbar: {vorhanden['anzahl_verfuegbar'] + 1}x)")
+                standort_ausgeben(isbn)
                 continue
 
             print(f"🔍 Lade Daten für ISBN {isbn}...")
@@ -1149,6 +1568,7 @@ def scan_and_add():
             if wahl in ('ä', 'a'):
                 buchdaten_bearbeiten(daten)
             buch_speichern(isbn, daten, nachgeladen=True)
+            standort_ausgeben(isbn, neu=True)
 
         except EOFError:
             raise
@@ -1186,6 +1606,7 @@ def manuelle_eingabe(isbn=None):
     anzahl = int(anzahl_input) if anzahl_input.isdigit() and int(anzahl_input) > 0 else 1
 
     buch_speichern(isbn, daten, anzahl)
+    standort_ausgeben(isbn, neu=True)
 
 
 # --- KATALOG ANZEIGEN & SUCHEN ---
@@ -1256,6 +1677,9 @@ def manage_book():
         print(f"\n📖 ISBN {isbn}")
         zeige_buchdaten(daten)
         print(f"   {'Bestand:':<18} {daten['anzahl_verfuegbar']}/{daten['anzahl_gesamt']} verfügbar")
+        ist, soll = standort_von(isbn)
+        if ist or soll:
+            print(f"   {'Standort:':<18} {ist or 'noch nicht eingeräumt'}{f' → soll nach {soll}' if soll else ''}")
         print("\n1. Buchdaten bearbeiten")
         print("2. Ein Exemplar entfernen (z. B. verloren oder kaputt)")
         print("3. Buch komplett löschen")
@@ -1706,6 +2130,7 @@ MENUE = [
     ("Datenbank-Backup erstellen", backup_menu),
     ("Stammdaten", manage_stammdaten),
     ("Buchdaten online nachladen (Beschreibung, Cover, Serie)", buchdaten_nachladen_menue),
+    ("Regale & Standorte", regale_menue),
     ("Nach Programm-Updates suchen (GitHub)", checkForUpdates),
 ]
 

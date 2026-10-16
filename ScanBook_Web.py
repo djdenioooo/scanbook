@@ -5,8 +5,10 @@ Danach öffnet sich der Browser automatisch. Beenden mit Strg+C im Terminal.
 Die Oberfläche benutzt dieselbe Datenbank wie das Terminal-Programm ScanBook.py.
 """
 import io
+import os
 import csv
 import sys
+import time
 import json
 import threading
 import webbrowser
@@ -40,6 +42,7 @@ def buch_oder_fehler(isbn):
     if not buch:
         raise ApiFehler("Dieses Buch ist nicht im Katalog.", 404)
     buch["isbn"] = isbn
+    buch["standort"], buch["standort_soll"] = sb.standort_von(isbn)
     return buch
 
 
@@ -226,7 +229,10 @@ def api_book_create(body):
         raise ApiFehler("Dieses Buch ist schon im Katalog. Zum Aufstocken einfach scannen.")
     sb.buch_speichern(isbn, buchdaten_aus(body), positive_zahl(body.get("anzahl"), 1),
                       nachgeladen=body.get("nachgeladen") in (True, "1"))
-    return buch_oder_fehler(isbn)
+    _, umstellen, grund = sb.buch_einraeumen(isbn)
+    buch = buch_oder_fehler(isbn)
+    buch["umstellen"], buch["kein_platz"] = umstellen, grund
+    return buch
 
 
 def api_book_update(body):
@@ -399,6 +405,89 @@ def api_backup(_):
     return {"pfad": sb.erstelle_backup()}
 
 
+# --- REGALE ---
+def regal_buch(regale, b):
+    return {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "serie": b["serie"], "band": b["band"],
+            "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
+            "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else ""}
+
+
+def api_regale(_):
+    plan = sb.regal_plan()
+    regale = plan["regale"]
+    return {
+        "regale": [
+            {"id": r["id"], "name": r["name"], "faecher": r["faecher"], "kapazitaet": r["kapazitaet"], "genres": r["genres"],
+             "inhalt": [[regal_buch(regale, b) for b in fach] for fach in r["inhalt"]]}
+            for r in regale
+        ],
+        "umstellen": [dict(regal_buch(regale, b), nach=sb.standort_text(regale, b["soll"])) for b in sb.umstellungen(plan)],
+        "einraeumen": len(sb.noch_einzuraeumen(plan)),
+        "ohne_platz": [dict(regal_buch(regale, b), grund=grund) for b, grund in plan["ohne_platz"]],
+        "genres": sb.alle_genres(),
+    }
+
+
+def api_regal_save(body):
+    name = text(body, "name")
+    if not name:
+        raise ApiFehler("Bitte einen Namen für das Regal eingeben.")
+    faecher, kapazitaet = positive_zahl(body.get("faecher"), 0), positive_zahl(body.get("kapazitaet"), 0)
+    if not faecher or not kapazitaet:
+        raise ApiFehler("Fächer und Bücher pro Fach müssen mindestens 1 sein.")
+    regal_id = body.get("id") or None
+    if regal_id and regal_id not in {r["id"] for r in sb.lade_regale()}:
+        raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
+    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")))
+    return api_regale(None)
+
+
+def api_regal_delete(body):
+    sb.regal_loeschen(body.get("id"))
+    return api_regale(None)
+
+
+def api_regal_move(body):
+    sb.regal_verschieben(body.get("id"), -1 if body.get("richtung") == "hoch" else 1)
+    return api_regale(None)
+
+
+def api_regale_uebernehmen(_):
+    sb.plan_uebernehmen()
+    return api_regale(None)
+
+
+# --- PROGRAMM-UPDATE ---
+neustart = {"angefordert": False}
+
+
+def api_update_check(_):
+    try:
+        version, quelle, dateien = sb.update_suchen()
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    except Exception as e:
+        raise ApiFehler(f"GitHub ist gerade nicht erreichbar ({e}).", 502)
+    return {"installiert": sb.VERSION, "verfuegbar": version, "quelle": quelle, "neu": bool(dateien)}
+
+
+def api_update_install(_):
+    try:
+        version, _, dateien = sb.update_suchen()
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    except Exception as e:
+        raise ApiFehler(f"GitHub ist gerade nicht erreichbar ({e}).", 502)
+    if not dateien:
+        raise ApiFehler("ScanBook ist schon auf dem neuesten Stand.")
+    backups = sb.update_installieren(dateien)
+    print(f"🚀 Update auf Version {version} installiert – ScanBook startet neu ...")
+    neustart["angefordert"] = True
+    # Erst antworten, dann den Server anhalten; main() startet das Programm danach neu
+    threading.Thread(target=lambda: (time.sleep(0.5), server_ref["server"].shutdown()), daemon=True).start()
+    return {"version": version, "backups": backups}
+
+
 GET_ROUTEN = {
     "info": api_info,
     "books": api_books,
@@ -409,6 +498,8 @@ GET_ROUTEN = {
     "borrower": api_borrower,
     "stats": api_stats,
     "settings": api_settings,
+    "regale": api_regale,
+    "update_check": api_update_check,
 }
 
 POST_ROUTEN = {
@@ -424,6 +515,11 @@ POST_ROUTEN = {
     "extend": api_extend,
     "settings": api_settings_save,
     "backup": api_backup,
+    "regal_save": api_regal_save,
+    "regal_delete": api_regal_delete,
+    "regal_move": api_regal_move,
+    "regale_uebernehmen": api_regale_uebernehmen,
+    "update_install": api_update_install,
 }
 
 EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste")
@@ -511,8 +607,13 @@ class Handler(BaseHTTPRequestHandler):
         self._api_ausfuehren(POST_ROUTEN[name], body)
 
 
+server_ref = {}
+
+
 def starte_server():
-    for port in range(START_PORT, START_PORT + 20):
+    # Nach einem Update wieder denselben Port nehmen, damit die offene Seite weiterläuft
+    wunsch = [int(a.split("=", 1)[1]) for a in sys.argv[1:] if a.startswith("--port=") and a[7:].isdigit()]
+    for port in wunsch + list(range(START_PORT, START_PORT + 20)):
         try:
             return ThreadingHTTPServer((HOST, port), Handler), port
         except OSError:
@@ -527,6 +628,7 @@ def main():
     sb.alte_ausleihen_loeschen()
 
     server, port = starte_server()
+    server_ref["server"] = server
     url = f"http://localhost:{port}/"
     print(f"📚 ScanBook {sb.VERSION} – Oberfläche läuft unter: {url}")
     print("   Zum Beenden hier im Terminal Strg+C drücken.")
@@ -539,6 +641,10 @@ def main():
         print("\nProgramm beendet. Auf Wiedersehen!")
     finally:
         server.server_close()
+
+    if neustart["angefordert"]:
+        sys.argv = [sys.argv[0], "--no-browser", f"--port={port}"]
+        sb.neu_starten(os.path.realpath(__file__))
 
 
 # --- OBERFLÄCHE (HTML, CSS & JAVASCRIPT) ---
@@ -715,6 +821,30 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .nb-vorschau { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
 .nb-vorschau .cover-box { width: 70px; flex: none; }
 .nb-vorschau .sub { color: var(--muted); font-size: 13px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+/* Regale */
+.platz-box { margin-top: 12px; padding: 12px 14px; border-radius: 10px; background: var(--accent-soft); font-size: 15px; }
+.platz-box b { font-size: 18px; color: var(--accent); }
+.platz-box.warn { background: var(--warn-soft); color: var(--warn); }
+.regal { border: 1px solid var(--border); border-radius: 10px; margin-top: 12px; background: var(--surface-2); }
+.regal-kopf { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 14px; }
+.regal-kopf .grow { flex: 1; min-width: 200px; }
+.regal-kopf .sub { color: var(--muted); font-size: 13px; }
+.regal summary { cursor: pointer; padding: 0 14px 12px; color: var(--accent); font-size: 14px; }
+.fach { display: grid; grid-template-columns: 70px 1fr; gap: 4px 12px; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface); }
+.fach-nr { font-weight: 600; font-size: 14px; }
+.fach-nr .sub { display: block; font-weight: 400; }
+.fach .balken { margin: 0 0 8px; }
+.fach .balken.voll > div { background: var(--warn); }
+.fach-buecher { display: flex; flex-wrap: wrap; gap: 5px; }
+.buch-chip { font-size: 13px; padding: 2px 9px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.buch-chip:hover { border-color: var(--accent); }
+.buch-chip.neu { border-color: var(--accent); background: var(--accent-soft); }
+.buch-chip.umstellen { border-color: var(--warn); background: var(--warn-soft); }
+.legende { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 6px; }
+.legende .buch-chip { cursor: default; }
+.aufgaben li { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+.aufgaben .pfad { color: var(--muted); font-size: 13px; }
+#update-hinweis { margin-left: 8px; }
 @keyframes rein { from { opacity: 0; transform: translateY(8px); } }
 </style>
 </head>
@@ -722,11 +852,12 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 <header>
   <div class="header-inner">
     <div class="brand">
-      <h1>📚 ScanBook</h1><span class="bib" id="bib-name"></span><span class="version" id="version"></span>
+      <h1>📚 ScanBook</h1><span class="bib" id="bib-name"></span><span class="version" id="version"></span><button class="btn small hidden" type="button" id="update-hinweis"></button>
     </div>
     <nav id="nav">
       <button data-tab="scan">Scannen</button>
       <button data-tab="katalog">Katalog</button>
+      <button data-tab="regale">Regale</button>
       <button data-tab="ausleihe">Ausleihe</button>
       <button data-tab="personen">Ausleiher</button>
       <button data-tab="statistik">Statistik &amp; Export</button>
@@ -745,6 +876,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
         <input id="scan-isbn" class="big grow" placeholder="ISBN scannen oder eingeben …" autocomplete="off" inputmode="numeric">
         <button class="btn" type="submit">Hinzufügen</button>
       </form>
+      <div class="platz-box hidden" id="platz-box"></div>
       <button class="link" id="manual-btn" type="button">Buch ohne Scan von Hand eintragen</button>
     </div>
 
@@ -802,6 +934,30 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
           <tbody id="katalog-body"></tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <!-- REGALE -->
+  <section id="tab-regale">
+    <div class="card hidden" id="regal-aufgaben">
+      <h2>📦 Zu tun</h2>
+      <p class="hint" id="regal-aufgaben-text"></p>
+      <ul class="log aufgaben" id="regal-umstellen"></ul>
+      <div class="actions"><button class="btn" type="button" id="regal-uebernehmen">Erledigt – so eingeräumt</button></div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <h2 class="grow" style="margin:0">Regale</h2>
+        <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
+      </div>
+      <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
+      <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span></div>
+      <div id="regale-liste"></div>
+    </div>
+    <div class="card hidden" id="ohne-platz">
+      <h2>⚠️ Ohne Platz</h2>
+      <p class="hint">Diese Bücher passen in kein Regal. Lege mehr Fächer an, erhöhe „Bücher pro Fach“ oder lege ein Regal ohne Genres für alle übrigen Bücher an.</p>
+      <ul class="log aufgaben" id="ohne-platz-liste"></ul>
     </div>
   </section>
 
@@ -891,6 +1047,14 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
         <div class="actions"><button class="btn" type="submit">Speichern</button></div>
       </form>
     </div>
+    <div class="card" id="update-karte">
+      <h2>Programm-Update</h2>
+      <p class="hint" id="update-text">Prüft auf GitHub, ob es eine neuere Version von ScanBook gibt. Deine Daten bleiben beim Update erhalten.</p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn secondary" type="button" id="update-check">Nach Updates suchen</button>
+        <button class="btn hidden" type="button" id="update-install">Jetzt installieren</button>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -939,6 +1103,26 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <button class="btn secondary" type="button" id="pv-close" style="margin-left:auto">Schließen</button>
     </div>
   </div>
+</dialog>
+
+<!-- REGAL-DIALOG -->
+<dialog id="regal-dialog">
+  <form id="regal-form" class="dlg-body">
+    <h2 id="regal-dlg-titel">Regal</h2>
+    <p class="hint">„Bücher pro Fach“ ist ein ungefährer Wert – lieber etwas weniger angeben, dann bleibt Platz für neue Bücher.</p>
+    <input type="hidden" name="regal_id">
+    <div class="form-grid">
+      <div class="full"><label for="rg-name">Name</label><input id="rg-name" name="name" placeholder="z. B. Regal 1 oder Wohnzimmer links" autocomplete="off"></div>
+      <div><label for="rg-faecher">Anzahl Fächer</label><input id="rg-faecher" name="faecher" type="number" min="1"></div>
+      <div><label for="rg-kapazitaet">Bücher pro Fach</label><input id="rg-kapazitaet" name="kapazitaet" type="number" min="1"></div>
+      <div class="full"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
+    </div>
+    <div class="chips" id="rg-genre-chips"></div>
+    <div class="actions">
+      <button class="btn" type="submit">Speichern</button>
+      <button class="btn secondary" type="button" id="rg-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
 </dialog>
 
 <datalist id="serien-liste"></datalist>
@@ -1035,6 +1219,7 @@ async function versuche(fn) {
 const LADER = {
   scan: () => $("#scan-isbn").focus(),
   katalog: () => ladeKatalog(),
+  regale: () => ladeRegale(),
   ausleihe: () => { ladeAusleihen(); ladeNamen(); $("#co-isbn").focus(); },
   personen: () => ladePersonen(),
   statistik: () => ladeStatistik(),
@@ -1091,6 +1276,25 @@ function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
   (!isbn ? form.isbn : fehlend.length ? form[fehlend[0]] : $("#nb-save")).focus();
 }
 
+// Großer Hinweis unter dem Scan-Feld: Wo gehört das Buch hin?
+function zeigePlatz(b) {
+  const box = $("#platz-box");
+  const platz = b.standort_soll || b.standort;
+  box.classList.toggle("warn", !platz);
+  if (platz) {
+    box.innerHTML = `📍 „${esc(b.titel)}“ gehört nach <b>${esc(platz)}</b>`
+      + (b.umstellen ? `<div class="sub">Dafür ${b.umstellen === 1 ? "muss 1 anderes Buch" : `müssen ${b.umstellen} andere Bücher`} umgestellt werden – siehe Tab „Regale“.</div>` : "");
+  } else if (b.kein_platz === "voll") {
+    box.textContent = `Für „${b.titel}“ ist in den passenden Regalen kein Platz mehr. Lege im Tab „Regale“ ein Fach oder Regal dazu.`;
+  } else if (b.kein_platz === "kein_regal") {
+    box.textContent = `Für das Genre von „${b.titel}“ gibt es noch kein Regal. Lege im Tab „Regale“ eins an (oder eins ohne Genres für alle übrigen Bücher).`;
+  } else {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+}
+
 function schliesseNeuesBuch() {
   $("#new-book-card").classList.add("hidden");
   $("#scan-isbn").focus();
@@ -1109,7 +1313,8 @@ $("#scan-form").addEventListener("submit", (e) => {
       if (r.status === "aufgestockt") {
         const b = r.buch;
         toast(`„${b.titel}“ aufgestockt – jetzt ${b.anzahl_gesamt}×`);
-        logEintrag(`➕ <b>${esc(b.titel)}</b> aufgestockt (${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar)`);
+        logEintrag(`➕ <b>${esc(b.titel)}</b> aufgestockt (${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar)${b.standort ? ` · 📍 ${esc(b.standort)}` : ""}`);
+        zeigePlatz(b);
       } else if (r.daten) {
         zeigeNeuesBuch(r.isbn, r.daten, r.fehlend,
           r.fehlend.length ? "Gefunden! Gelb markierte Angaben fehlen – du kannst sie ergänzen. [Enter] speichert." : "Gefunden! Bitte kurz prüfen. [Enter] speichert.");
@@ -1130,7 +1335,10 @@ $("#new-book-form").addEventListener("submit", (e) => {
   versuche(async () => {
     const b = await post("book_create", formDaten(e.target));
     toast(`„${b.titel}“ gespeichert`);
-    logEintrag(`✨ <b>${esc(b.titel)}</b> neu hinzugefügt (${b.anzahl_gesamt}×)`);
+    const platz = b.standort_soll || b.standort;
+    logEintrag(`✨ <b>${esc(b.titel)}</b> neu hinzugefügt (${b.anzahl_gesamt}×)${platz ? ` · 📍 ${esc(platz)}` : ""}`
+      + (b.umstellen ? ` · ↪️ ${b.umstellen} Buch${b.umstellen === 1 ? "" : "er"} umstellen (Tab „Regale“)` : ""));
+    zeigePlatz(b);
     schliesseNeuesBuch();
     if (b.serie) get("books").then(setzeSerienListe).catch(() => {});
   });
@@ -1281,6 +1489,8 @@ async function oeffneVorschau(isbn) {
     $("#pv-autor").textContent = leer(b.autoren) ? "Autor unbekannt" : b.autoren;
     $("#pv-bestand").innerHTML = `<span class="badge ${b.anzahl_verfuegbar > 0 ? "ok" : "danger"}">${b.anzahl_verfuegbar} von ${b.anzahl_gesamt} verfügbar</span>`;
     const daten = [
+      ["Standort", b.standort ? (b.standort_soll ? `${b.standort} (umstellen nach ${b.standort_soll})` : b.standort)
+        : (b.standort_soll ? `${b.standort_soll} (noch nicht eingeräumt)` : "")],
       ["Serie", serieText(b.serie, b.band)], ["Genre", b.genre], ["Verlag", b.verlag],
       ["Erschienen", b.erscheinungsjahr], ["ISBN", isbn],
     ].filter(([, w]) => !leer(w));
@@ -1372,6 +1582,157 @@ $("#ed-delete").addEventListener("click", () => {
     toast(`„${titel}“ gelöscht`);
     $("#edit-dialog").close();
     ladeKatalog();
+  });
+});
+
+// --- Regale ---
+let regalDaten = { regale: [], genres: [] };
+function buchChip(b) {
+  const mitSerie = b.serie && b.band && !b.titel.toLowerCase().includes(b.serie.toLowerCase());
+  const titel = (mitSerie ? `${b.serie} ${b.band}: ` : "") + b.titel + (b.anzahl > 1 ? ` (${b.anzahl}×)` : "");
+  const klasse = b.neu ? "neu" : b.von ? "umstellen" : "";
+  const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : ""].filter(Boolean).join(" · ");
+  return `<span class="buch-chip ${klasse}" data-isbn="${esc(b.isbn)}" title="${esc(tipp)}">${esc(titel)}</span>`;
+}
+function zeichneRegale(d) {
+  regalDaten = d;
+  const anzahl = d.regale.length;
+  $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
+    const belegt = r.inhalt.flat().reduce((n, b) => n + b.anzahl, 0);
+    const platz = r.faecher * r.kapazitaet;
+    const faecher = r.inhalt.map((fach, f) => {
+      const n = fach.reduce((s, b) => s + b.anzahl, 0);
+      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${r.kapazitaet}</span></div>
+        <div><div class="balken ${n >= r.kapazitaet ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / r.kapazitaet))}%"></div></div>
+        <div class="fach-buecher">${fach.map(buchChip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
+    }).join("");
+    return `<div class="regal">
+      <div class="regal-kopf">
+        <div class="grow"><b>${esc(r.name)}</b>
+          <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${r.genres.length ? esc(r.genres.join(", ")) : "alle übrigen Bücher"}</div></div>
+        <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
+        <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
+        <button class="btn small secondary" data-bearbeiten="${r.id}">Bearbeiten</button>
+        <button class="btn small danger" data-loeschen="${r.id}">Löschen</button>
+      </div>
+      <details ${speicherLesen("regalOffen" + r.id, "1") === "1" ? "open" : ""} data-regal="${r.id}"><summary>Fächer anzeigen</summary>${faecher}</details>
+    </div>`;
+  }).join("") : `<p class="empty" style="padding-left:0">Noch keine Regale. Klicke auf „Regal hinzufügen“.</p>`;
+
+  const zuTun = d.umstellen.length + d.einraeumen;
+  $("#regal-aufgaben").classList.toggle("hidden", !zuTun);
+  const teile = [];
+  if (d.einraeumen) teile.push(`${d.einraeumen} Buch${d.einraeumen === 1 ? "" : "er"} noch einräumen (grün markiert)`);
+  if (d.umstellen.length) teile.push(`${d.umstellen.length} Buch${d.umstellen.length === 1 ? "" : "er"} umstellen (gelb markiert)`);
+  $("#regal-aufgaben-text").textContent = teile.join(", ") + ". Wenn alles so steht wie unten angezeigt, klicke auf „Erledigt“. Neue Bücher werden danach passend dazu einsortiert.";
+  $("#regal-umstellen").innerHTML = d.umstellen.map((b) =>
+    `<li>↪️ <b>${esc(b.titel)}</b><span class="pfad">${esc(b.von)} → ${esc(b.nach)}</span></li>`).join("");
+
+  $("#ohne-platz").classList.toggle("hidden", !d.ohne_platz.length);
+  $("#ohne-platz-liste").innerHTML = d.ohne_platz.map((b) =>
+    `<li><b>${esc(b.titel)}</b><span class="pfad">${b.grund === "voll" ? "passende Regale sind voll" : `kein Regal für: ${esc(b.genre || "ohne Genre")}`}</span></li>`).join("");
+}
+async function ladeRegale() {
+  await versuche(async () => zeichneRegale(await get("regale")));
+}
+function genreChips() {
+  const feld = $("#rg-genres");
+  const gewaehlt = feld.value.split(",").map((g) => g.trim().toLowerCase()).filter(Boolean);
+  $("#rg-genre-chips").innerHTML = regalDaten.genres.map((g) =>
+    `<button type="button" class="chip ${gewaehlt.includes(g.toLowerCase()) ? "active" : ""}" data-genre="${esc(g)}">${esc(g)}</button>`).join("");
+}
+function oeffneRegal(r) {
+  const form = $("#regal-form");
+  form.regal_id.value = r?.id ?? "";
+  form.name.value = r?.name ?? `Regal ${regalDaten.regale.length + 1}`;
+  form.faecher.value = r?.faecher ?? 5;
+  form.kapazitaet.value = r?.kapazitaet ?? 30;
+  form.genres.value = r ? r.genres.join(", ") : "";
+  $("#regal-dlg-titel").textContent = r ? "Regal bearbeiten" : "Neues Regal";
+  genreChips();
+  $("#regal-dialog").showModal();
+  form.name.focus();
+}
+$("#regal-neu").addEventListener("click", () => oeffneRegal(null));
+$("#rg-close").addEventListener("click", () => $("#regal-dialog").close());
+$("#rg-genres").addEventListener("input", genreChips);
+$("#rg-genre-chips").addEventListener("click", (e) => {
+  const g = e.target.dataset.genre;
+  if (!g) return;
+  const feld = $("#rg-genres");
+  const liste = feld.value.split(",").map((x) => x.trim()).filter(Boolean);
+  const pos = liste.findIndex((x) => x.toLowerCase() === g.toLowerCase());
+  pos >= 0 ? liste.splice(pos, 1) : liste.push(g);
+  feld.value = liste.join(", ");
+  genreChips();
+});
+$("#regal-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    const daten = formDaten(e.target);
+    zeichneRegale(await post("regal_save", { ...daten, id: Number(daten.regal_id) || null }));
+    $("#regal-dialog").close();
+    toast("Regal gespeichert");
+  });
+});
+$("#regale-liste").addEventListener("click", (e) => {
+  const d = e.target.dataset;
+  if (d.isbn) return oeffneVorschau(d.isbn);
+  if (d.bearbeiten) return oeffneRegal(regalDaten.regale.find((r) => r.id === Number(d.bearbeiten)));
+  if (d.hoch || d.runter) return versuche(async () =>
+    zeichneRegale(await post("regal_move", { id: Number(d.hoch || d.runter), richtung: d.hoch ? "hoch" : "runter" })));
+  if (d.loeschen) {
+    const r = regalDaten.regale.find((x) => x.id === Number(d.loeschen));
+    if (confirm(`Regal „${r.name}“ löschen? Die Bücher bleiben im Katalog und werden auf die anderen Regale verteilt.`))
+      versuche(async () => { zeichneRegale(await post("regal_delete", { id: r.id })); toast("Regal gelöscht"); });
+  }
+});
+$("#regale-liste").addEventListener("toggle", (e) => {
+  if (e.target.dataset.regal) speicherSchreiben("regalOffen" + e.target.dataset.regal, e.target.open ? "1" : "0");
+}, true);
+$("#regal-uebernehmen").addEventListener("click", () => versuche(async () => {
+  zeichneRegale(await post("regale_uebernehmen"));
+  toast("Gespeichert – so stehen die Bücher jetzt im Regal");
+}));
+
+// --- Programm-Update ---
+function zeigeUpdate(r) {
+  $("#update-text").textContent = r.neu
+    ? `Version ${r.verfuegbar} ist verfügbar (installiert: ${r.installiert}). Deine Daten bleiben beim Update erhalten, ScanBook startet danach von selbst neu.`
+    : `ScanBook ist auf dem neuesten Stand (Version ${r.installiert}).`;
+  $("#update-install").classList.toggle("hidden", !r.neu);
+  $("#update-install").textContent = r.neu ? `Version ${r.verfuegbar} installieren` : "";
+  $("#update-hinweis").classList.toggle("hidden", !r.neu);
+  $("#update-hinweis").textContent = `Update auf ${r.verfuegbar}`;
+}
+$("#update-check").addEventListener("click", () => versuche(async () => {
+  const knopf = $("#update-check");
+  knopf.disabled = true;
+  knopf.textContent = "Suche …";
+  try { zeigeUpdate(await get("update_check")); } finally { knopf.disabled = false; knopf.textContent = "Nach Updates suchen"; }
+}));
+$("#update-hinweis").addEventListener("click", () => {
+  zeigeTab("einstellungen");
+  $("#update-karte").scrollIntoView({ behavior: "smooth" });
+});
+$("#update-install").addEventListener("click", () => {
+  if (!confirm("Update jetzt installieren? ScanBook startet danach neu, die Seite lädt sich von selbst neu.")) return;
+  versuche(async () => {
+    const knopf = $("#update-install");
+    knopf.disabled = true;
+    knopf.textContent = "Installiere …";
+    const alt = info.version;
+    const r = await post("update_install");
+    $("#update-text").textContent = `Version ${r.version} installiert. ScanBook startet neu …`;
+    // Warten, bis der neu gestartete Server antwortet, dann die Seite neu laden
+    for (let i = 0; i < 40; i++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      const neu = await get("info").catch(() => null);
+      if (neu && neu.version !== alt) { location.reload(); return; }
+    }
+    knopf.disabled = false;
+    knopf.textContent = "Jetzt installieren";
+    toast("ScanBook antwortet nicht. Bitte im Terminal neu starten und die Seite neu laden.", true);
   });
 });
 
@@ -1598,6 +1959,7 @@ $("#settings-form").addEventListener("submit", (e) => {
 ladeInfo().catch((e) => toast(e.message, true));
 get("books").then(setzeSerienListe).catch(() => {});
 zeigeTab(location.hash.slice(1));
+get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund, Fehler nicht anzeigen
 </script>
 </body>
 </html>
