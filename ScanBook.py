@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -476,6 +476,12 @@ def init_db():
             cursor.execute("ALTER TABLE ausleihen ADD COLUMN schueler_id INTEGER")
         if "exemplar" not in vorhandene_spalten:
             cursor.execute("ALTER TABLE ausleihen ADD COLUMN exemplar TEXT")
+
+        # Indizes, damit Schülerliste, Ausleihen und Buchvorschau auch bei vielen Einträgen sofort da sind
+        cursor.execute("CREATE INDEX IF NOT EXISTS ausleihen_status ON ausleihen(status, rueckgabe_bis)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS ausleihen_schueler ON ausleihen(schueler_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS ausleihen_isbn ON ausleihen(isbn, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS ausleihen_name ON ausleihen(ausleiher)")
 
         for key, val in DEFAULT_EINSTELLUNGEN.items():
             cursor.execute("INSERT OR IGNORE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (key, val))
