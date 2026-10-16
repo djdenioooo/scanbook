@@ -550,11 +550,13 @@ def schueler_daten(row):
             "name": sb.schueler_name(vorname, nachname), "aktiv": aktiv, "ueberfaellig": ueberfaellig}
 
 
+# Aktive Ausleihen einmal pro Schüler zusammenzählen (statt zwei Unterabfragen je Schüler)
 SCHUELER_SQL = '''
-    SELECT s.id, s.ausweis, s.vorname, s.nachname, s.klasse,
-           (SELECT COUNT(*) FROM ausleihen a WHERE a.schueler_id = s.id AND a.status = 'aktiv'),
-           (SELECT COUNT(*) FROM ausleihen a WHERE a.schueler_id = s.id AND a.status = 'aktiv' AND a.rueckgabe_bis < ?)
-    FROM schueler s
+    SELECT s.id, s.ausweis, s.vorname, s.nachname, s.klasse, COALESCE(z.aktiv, 0), COALESCE(z.ueber, 0)
+    FROM schueler s LEFT JOIN (
+        SELECT schueler_id, COUNT(*) AS aktiv, SUM(rueckgabe_bis < ?) AS ueber
+        FROM ausleihen WHERE status = 'aktiv' AND schueler_id IS NOT NULL GROUP BY schueler_id
+    ) z ON z.schueler_id = s.id
 '''
 
 
@@ -1032,7 +1034,7 @@ section.active { display: block; animation: rein .25s ease-out; }
     padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); background: var(--bar); border-top: .5px solid var(--border);
     -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
   }
-  nav button { flex: 1 0 72px; flex-direction: column; gap: 2px; padding: 4px 2px; font-size: 10px; color: var(--muted); text-align: center; }
+  nav button { flex: 1 1 0; min-width: 54px; flex-direction: column; gap: 2px; padding: 4px 2px; font-size: 10px; color: var(--muted); text-align: center; }
   nav button span { overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   nav button svg { width: 24px; height: 24px; color: inherit; }
   nav button:hover { background: none; }
@@ -1220,6 +1222,28 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .person-box .sub { color: var(--muted); font-size: 13px; }
 #co-log { margin-top: 10px; }
 #co-log:empty { display: none; }
+/* Segment-Umschalter wie in iOS */
+.segment { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--fill); margin-bottom: 12px; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.segment button { border: 0; background: none; color: var(--text); font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px; border-radius: 7px; cursor: pointer; white-space: nowrap; transition: background .15s; }
+.segment button.active { background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+@media (prefers-color-scheme: dark) { .segment button.active { background: #636366; } }
+.segment button span { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: 2px; }
+.segment.gross { margin-bottom: 18px; }
+.segment.gross button { font-size: 14px; padding: 6px 20px; }
+/* Kennzahlen oben auf der Ausleihe-Seite */
+.tiles.klein { grid-template-columns: repeat(4, 1fr); margin-bottom: 22px; }
+.tiles.klein .tile { padding: 12px 16px; cursor: pointer; transition: transform .1s; }
+.tiles.klein .tile:active { transform: scale(.98); }
+.tiles.klein .value { font-size: 24px; }
+.tile.warn .value { color: var(--warn); }
+@media (max-width: 860px) { .tiles.klein { grid-template-columns: repeat(2, 1fr); } }
+/* Lange Listen stückweise zeichnen */
+.mehr { padding: 14px 20px 18px; text-align: center; color: var(--muted); font-size: 13px; box-shadow: inset 0 .5px 0 var(--border); }
+.mehr button { margin-left: 8px; }
+.chips.zeile { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; }
+.chips.zeile .chip { flex: none; }
+#katalog-filter .chip, #klassen-chips .chip { padding: 4px 12px; font-size: 13px; }
+td.titel-zelle { min-width: 220px; }
 @keyframes rein { from { opacity: 0; transform: translateY(6px); } }
 @keyframes toast { from { opacity: 0; transform: translateY(-12px) scale(.96); } }
 @keyframes sheet { from { opacity: 0; transform: translateY(24px) scale(.98); } }
@@ -1233,14 +1257,12 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <h1>ScanBook</h1><span class="bib" id="bib-name"></span><span class="version" id="version"></span><button class="btn small hidden" type="button" id="update-hinweis"></button>
     </div>
     <nav id="nav">
-      <button data-tab="scan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 8v8M11 8v8M14 8v8M17 8v8"/></svg><span>Scannen</span></button>
-      <button data-tab="katalog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14.5M9 19.5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v12.5"/><path d="m14.5 7.8 2.9-.8a1 1 0 0 1 1.2.7l2.9 10.9a1 1 0 0 1-.7 1.2l-2.9.8a1 1 0 0 1-1.2-.7L14 8.9"/><path d="M3 20h12"/></svg><span>Katalog</span></button>
-      <button data-tab="regale"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M7 5.5v2M10 5.5v2M7 11.5v2M14 17.5v2M17 17.5v2"/></svg><span>Regale</span></button>
       <button data-tab="ausleihe"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4 3 8l4 4M3 8h13M17 20l4-4-4-4M21 16H8"/></svg><span>Ausleihe</span></button>
+      <button data-tab="katalog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14.5M9 19.5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v12.5"/><path d="m14.5 7.8 2.9-.8a1 1 0 0 1 1.2.7l2.9 10.9a1 1 0 0 1-.7 1.2l-2.9.8a1 1 0 0 1-1.2-.7L14 8.9"/><path d="M3 20h12"/></svg><span>Katalog</span></button>
       <button data-tab="schueler"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><circle cx="8.5" cy="11" r="2.2"/><path d="M5 16.2c.5-1.7 1.8-2.6 3.5-2.6s3 .9 3.5 2.6M14.5 10h4M14.5 13.5h3"/></svg><span>Schüler</span></button>
-      <button data-tab="personen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 19.5c.6-3.2 3-5 6-5s5.4 1.8 6 5"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14c2.2 0 3.7 1.3 4.2 3.6"/></svg><span>Ausleiher</span></button>
-      <button data-tab="statistik"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V11M10 20V5M16 20v-6M3 20h18"/></svg><span>Statistik &amp; Export</span></button>
-      <button data-tab="einstellungen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg><span>Einstellungen</span></button>
+      <button data-tab="scan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 8v8M11 8v8M14 8v8M17 8v8"/></svg><span>Erfassen</span></button>
+      <button data-tab="regale"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M7 5.5v2M10 5.5v2M7 11.5v2M14 17.5v2M17 17.5v2"/></svg><span>Regale</span></button>
+      <button data-tab="verwaltung"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg><span>Verwaltung</span></button>
     </nav>
   </div>
 </header>
@@ -1259,6 +1281,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <div class="platz-box hidden" id="code-box"></div>
       <div class="platz-box hidden" id="platz-box"></div>
       <button class="link" id="manual-btn" type="button">Buch ohne Scan von Hand eintragen</button>
+      <p class="hint" style="margin:10px 0 0">Eigenes Etikett im Buch? Erst das Etikett scannen, dann die ISBN. Codes erzeugen und Etiketten drucken findest du unter <a href="#verwaltung">Verwaltung</a>.</p>
     </div>
 
     <div class="card hidden" id="new-book-card">
@@ -1293,16 +1316,6 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       <ul class="log" id="scan-log"><li class="sub" style="color:var(--muted)">Noch nichts gescannt.</li></ul>
     </div>
 
-    <div class="card">
-      <h2>Mediencodes &amp; Etiketten</h2>
-      <p class="hint">Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. Beim Ausleihen und Zurückgeben lässt sich dann der Mediencode statt der ISBN scannen, und du siehst genau, welches Exemplar wer hat.</p>
-      <p class="hint"><b>Eigene Etiketten verwenden:</b> den Code des Etiketts oben ins Scan-Feld scannen, danach die ISBN des Buchs. ScanBook merkt sich den Code für dieses Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.</p>
-      <p class="hint" id="codes-status"></p>
-      <div class="actions" style="margin-top:0">
-        <button class="btn secondary" type="button" id="codes-erzeugen">Codes für alle Exemplare ohne Code erzeugen</button>
-        <button class="btn secondary" type="button" id="etiketten-drucken">Neue Etiketten drucken</button>
-      </div>
-    </div>
   </section>
 
   <!-- KATALOG -->
@@ -1313,7 +1326,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
         <span class="sub" id="katalog-anzahl" style="color:var(--muted)"></span>
       </div>
       <div class="toolbar">
-        <p class="hint">Klicke auf ein Buch für die Vorschau. Von dort aus lässt es sich auch bearbeiten.</p>
+        <div class="chips" id="katalog-filter" style="margin:0"></div>
         <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
       </div>
       <div class="nachladen hidden" id="nachladen-box">
@@ -1322,9 +1335,10 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Autor</th><th>Titel</th><th>Jahr</th><th>Genre</th><th>Bestand</th><th>ISBN</th></tr></thead>
+          <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Genre</th><th>Verfügbar</th></tr></thead>
           <tbody id="katalog-body"></tbody>
         </table>
+        <div class="mehr hidden" id="katalog-mehr"></div>
       </div>
     </div>
   </section>
@@ -1355,7 +1369,8 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 
   <!-- AUSLEIHE -->
   <section id="tab-ausleihe">
-    <div class="grid-2" style="margin-bottom:18px">
+    <div class="tiles klein" id="ausleihe-tiles"></div>
+    <div class="grid-2" style="margin-bottom:22px">
       <div class="card">
         <h2>Buch ausleihen</h2>
         <p class="hint">Schülerausweis scannen, dann die Bücher scannen. Jedes Buch wird sofort ausgeliehen.</p>
@@ -1387,27 +1402,38 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 
     <div class="card">
       <div class="row" style="margin-bottom:14px">
-        <h2 class="grow" style="margin:0">Aktuelle Ausleihen <span class="sub" id="loans-summary" style="color:var(--muted);font-weight:400;font-size:14px"></span></h2>
+        <h2 class="grow" style="margin:0">Aktuelle Ausleihen</h2>
         <input id="loans-filter" style="max-width:260px" placeholder="Filtern nach Name, Klasse oder Titel …" autocomplete="off">
+      </div>
+      <div class="segment" id="loans-status">
+        <button type="button" data-status="alle" class="active">Alle <span id="anz-alle"></span></button>
+        <button type="button" data-status="ueber">Überfällig <span id="anz-ueber"></span></button>
+        <button type="button" data-status="bald">Bald fällig <span id="anz-bald"></span></button>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Buch</th><th>Ausleiher</th><th>Geliehen am</th><th>Rückgabe bis</th><th>Status</th><th></th></tr></thead>
           <tbody id="loans-body"></tbody>
         </table>
+        <div class="mehr hidden" id="loans-mehr"></div>
       </div>
     </div>
   </section>
 
   <!-- SCHÜLER -->
   <section id="tab-schueler">
+    <div class="segment gross" id="schueler-ansicht">
+      <button type="button" data-ansicht="liste" class="active">Schülerliste</button>
+      <button type="button" data-ansicht="verlauf">Ausleih-Verlauf</button>
+    </div>
+    <div id="ansicht-liste">
     <div class="card">
       <div class="row">
         <input id="schueler-suche" class="grow" placeholder="Suchen nach Name oder Ausweisnummer …" autocomplete="off">
         <button class="btn" type="button" id="schueler-neu">Schüler hinzufügen</button>
         <button class="btn secondary" type="button" id="schueler-import-btn">Klassenliste importieren</button>
       </div>
-      <div class="chips" id="klassen-chips"></div>
+      <div class="chips zeile" id="klassen-chips"></div>
       <div class="toolbar">
         <p class="hint" id="schueler-anzahl"></p>
         <button class="btn small secondary" type="button" id="ausweise-drucken" style="margin-left:auto">Ausweise drucken</button>
@@ -1417,25 +1443,24 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
           <thead><tr><th>Name</th><th>Klasse</th><th>Ausweis</th><th>Ausgeliehen</th><th></th></tr></thead>
           <tbody id="schueler-body"></tbody>
         </table>
+        <div class="mehr hidden" id="schueler-mehr"></div>
       </div>
     </div>
-  </section>
-
-  <!-- AUSLEIHER -->
-  <section id="tab-personen">
+    </div>
+    <div id="ansicht-verlauf" class="hidden">
     <div class="card">
-      <h2>Ausleiher-Übersicht</h2>
-      <p class="hint">Was hat eine bestimmte Person gerade oder früher ausgeliehen?</p>
+      <p class="hint">Was hat jemand gerade oder früher ausgeliehen? Auch Ausleihen ohne Schülerausweis (z. B. Lehrkräfte).</p>
       <input id="personen-suche" placeholder="Name suchen …" autocomplete="off">
       <div class="chips" id="personen-liste"></div>
     </div>
     <div id="person-detail"></div>
+    </div>
   </section>
 
-  <!-- STATISTIK -->
-  <section id="tab-statistik">
+  <!-- VERWALTUNG -->
+  <section id="tab-verwaltung">
     <div class="tiles" id="stat-tiles"></div>
-    <div class="grid-2">
+    <div class="grid-2" style="margin-bottom:22px">
       <div class="card">
         <h3>🏆 Meistgeliehene Bücher</h3>
         <div id="stat-top"></div>
@@ -1452,10 +1477,16 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
         <button class="btn secondary" type="button" id="backup-btn">Backup jetzt erstellen</button>
       </div>
     </div>
-  </section>
-
-  <!-- EINSTELLUNGEN -->
-  <section id="tab-einstellungen">
+    <div class="card">
+      <h2>Mediencodes &amp; Etiketten</h2>
+      <p class="hint">Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. Beim Ausleihen und Zurückgeben lässt sich dann der Mediencode statt der ISBN scannen, und du siehst genau, welches Exemplar wer hat.</p>
+      <p class="hint"><b>Eigene Etiketten verwenden:</b> den Code des Etiketts unter „Erfassen“ ins Scan-Feld scannen, danach die ISBN des Buchs. ScanBook merkt sich den Code für dieses Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.</p>
+      <p class="hint" id="codes-status"></p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn secondary" type="button" id="codes-erzeugen">Codes für alle Exemplare ohne Code erzeugen</button>
+        <button class="btn secondary" type="button" id="etiketten-drucken">Neue Etiketten drucken</button>
+      </div>
+    </div>
     <div class="card">
       <h2>Stammdaten &amp; Einstellungen</h2>
       <p class="hint">Abgeschlossene Ausleihen werden nach der Löschfrist beim Programmstart automatisch gelöscht (Datenschutz).</p>
@@ -1681,25 +1712,69 @@ function codeHtml(code) {
 function drucken(pfad, params = {}) {
   window.open(`/druck/${pfad}?` + new URLSearchParams(params), "_blank");
 }
+// Liefert null, wenn sich die Antwort seit dem letzten Mal nicht geändert hat –
+// dann bleibt die Liste stehen, statt beim Tabwechsel neu aufgebaut zu werden.
+const letzteAntwort = new Map();
+async function getNeu(name, params = {}) {
+  const res = await fetch(`/api/${name}?` + new URLSearchParams(params));
+  const text = await res.text();
+  let daten = {};
+  try { daten = JSON.parse(text); } catch { /* leer lassen */ }
+  if (!res.ok) throw new Error(daten.fehler || "Unbekannter Fehler");
+  if (letzteAntwort.get(name) === text) return null;
+  letzteAntwort.set(name, text);
+  return daten;
+}
+// Lange Listen in Stücken zeichnen: erst SCHRITT Zeilen, weitere beim Herunterscrollen.
+// behalten = so viele Zeilen wie vorher zeigen (z. B. nach dem Aufklappen einer Serie)
+const SCHRITT = 100;
+const mehrBeobachter = "IntersectionObserver" in window
+  ? new IntersectionObserver((eintraege) => eintraege.forEach((e) => e.isIntersecting && e.target.weiter?.()), { rootMargin: "600px" })
+  : null;
+function stueckweise(tbody, mehr, liste, zeile, leerHtml, behalten = false) {
+  const ziel = behalten ? Math.max(SCHRITT, mehr.gezeigt || 0) : SCHRITT;
+  let n = 0;
+  mehr.weiter = (anzahl = SCHRITT) => {
+    if (n >= liste.length) return;
+    const teil = liste.slice(n, n + anzahl);
+    n += teil.length;
+    mehr.gezeigt = n;
+    tbody.insertAdjacentHTML("beforeend", teil.map(zeile).join(""));
+    const rest = liste.length - n;
+    mehr.classList.toggle("hidden", rest <= 0);
+    if (rest > 0) mehr.innerHTML = `${n} von ${liste.length} angezeigt <button class="btn small secondary" type="button">Weitere anzeigen</button>`;
+  };
+  if (mehrBeobachter && !mehr.beobachtet) { mehrBeobachter.observe(mehr); mehr.beobachtet = true; }
+  tbody.innerHTML = liste.length ? "" : leerHtml;
+  mehr.classList.add("hidden");
+  mehr.gezeigt = 0;
+  mehr.weiter(ziel);
+}
+document.addEventListener("click", (e) => {
+  const box = e.target.closest(".mehr");
+  if (box && e.target.closest("button")) box.weiter?.();
+});
 async function versuche(fn) {
   try { return await fn(); } catch (e) { toast(e.message, true); }
 }
 
 // --- Navigation ---
 const LADER = {
-  scan: () => { $("#scan-isbn").focus(); ladeCodesStatus(); },
+  scan: () => $("#scan-isbn").focus(),
   katalog: () => ladeKatalog(),
   regale: () => ladeRegale(),
   ausleihe: () => { ladeAusleihen(); ladeNamen(); (ausleihPerson ? $("#co-isbn") : $("#co-name")).focus(); },
-  schueler: () => ladeSchueler(),
-  personen: () => ladePersonen(),
-  statistik: () => ladeStatistik(),
-  einstellungen: () => ladeEinstellungen(),
+  schueler: () => (schuelerAnsicht === "verlauf" ? ladePersonen() : ladeSchueler()),
+  verwaltung: () => { ladeStatistik(); ladeCodesStatus(); ladeEinstellungen(); },
 };
+// Alte Lesezeichen weiter unterstützen
+const ALTE_TABS = { personen: "schueler", statistik: "verwaltung", einstellungen: "verwaltung" };
+const SEITEN_TITEL = { scan: "Bücher erfassen" };
 function zeigeTab(name) {
-  if (!LADER[name]) name = "scan";
+  if (ALTE_TABS[name]) { if (name === "personen") zeigeSchuelerAnsicht("verlauf", false); name = ALTE_TABS[name]; }
+  if (!LADER[name]) name = "ausleihe";
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
-  $("#seiten-titel").textContent = $(`nav button[data-tab="${name}"]`).textContent;
+  $("#seiten-titel").textContent = SEITEN_TITEL[name] || $(`nav button[data-tab="${name}"]`).textContent;
   document.querySelectorAll("main > section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + name));
   if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
   LADER[name]();
@@ -1843,7 +1918,7 @@ $("#new-book-form").addEventListener("submit", (e) => {
       + (b.umstellen ? ` · ↪️ ${b.umstellen} Buch${b.umstellen === 1 ? "" : "er"} umstellen (Tab „Regale“)` : ""));
     zeigePlatz(b);
     schliesseNeuesBuch();
-    if (b.serie) get("books").then(setzeSerienListe).catch(() => {});
+    if (b.serie) katalogHolen().catch(() => {});
   });
 });
 
@@ -1881,15 +1956,14 @@ function buchZeile(b, alsBand = false) {
   const titel = alsBand
     ? `${b.band ? `<span class="band-nr">${esc(b.band)}</span>` : ""}<b>${esc(b.titel)}</b>`
     : `<b>${esc(b.titel)}</b>${b.serie ? `<div class="serie-tag">📚 ${esc(serieText(b.serie, b.band))}</div>` : ""}`;
-  const verlag = !alsBand && b.verlag && b.verlag !== "N/A" ? `<div class="sub">${esc(b.verlag)}</div>` : "";
+  const verlag = !alsBand && b.verlag && !LEERWERTE.includes(b.verlag) ? `${esc(b.verlag)} · ` : "";
   return `
       <tr class="clickable${alsBand ? " band-zeile" : ""}" data-isbn="${esc(b.isbn)}">
+        <td class="titel-zelle">${titel}<div class="sub">${verlag}${esc(b.isbn)}</div></td>
         <td>${esc(b.autor)}</td>
-        <td>${titel}${verlag}</td>
         <td class="num">${esc(b.jahr)}</td>
         <td>${esc(b.genre)}</td>
-        <td class="num"><span class="badge ${b.verfuegbar > 0 ? "ok" : "danger"}">${b.verfuegbar}/${b.gesamt} verfügbar</span></td>
-        <td class="num sub">${esc(b.isbn)}</td>
+        <td class="num"><span class="badge ${b.verfuegbar > 0 ? "ok" : "danger"}">${b.verfuegbar} von ${b.gesamt}</span></td>
       </tr>`;
 }
 
@@ -1902,25 +1976,36 @@ function serienZeilen(g, offen) {
   const genres = [...new Set(g.baende.map((b) => b.genre).filter((x) => !LEERWERTE.includes(x)))];
   return `
       <tr class="clickable serie-zeile${offen ? " offen" : ""}" data-serie="${esc(g.schluessel)}">
+        <td class="titel-zelle"><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände · ${offen ? "zuklappen" : "aufklappen"}</div></td>
         <td>${esc(autoren.length > 2 ? autoren.slice(0, 2).join(", ") + " u. a." : autoren.join(", "))}</td>
-        <td><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände im Katalog</div></td>
         <td class="num">${jahre.length ? (von === bis ? von : `${von}–${bis}`) : ""}</td>
         <td>${esc(genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
-        <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar}/${gesamt} verfügbar</span></td>
-        <td class="num sub">${offen ? "zuklappen" : "aufklappen"}</td>
+        <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar} von ${gesamt}</span></td>
       </tr>` + (offen ? g.baende.map((b) => buchZeile(b, true)).join("") : "");
 }
 
-let katalog = [];
-function zeichneKatalog() {
-  const suche = $("#katalog-suche").value.trim();
-  let html = "";
-  if (!$("#serien-gruppieren").checked) {
-    html = katalog.map((b) => buchZeile(b)).join("");
-  } else {
+// Der Katalog wird einmal geladen und dann im Browser durchsucht – das geht ohne Wartezeit
+let katalog = [], katalogGeladen = false, katalogFilter = "alle";
+function passtZurSuche(b, worte) {
+  const text = `${b.titel} ${b.autoren} ${b.autor} ${b.genre} ${b.isbn} ${b.verlag} ${b.serie}`.toLowerCase();
+  return worte.every((w) => text.includes(w) || text.includes(w.replace(/-/g, "")));
+}
+function zeichneKatalog(behalten = false) {
+  const suche = $("#katalog-suche").value.trim().toLowerCase();
+  const worte = suche.split(/\s+/).filter(Boolean);
+  const liste = katalog.filter((b) =>
+    (katalogFilter === "alle" || (katalogFilter === "da" ? b.verfuegbar > 0 : b.verfuegbar === 0)) &&
+    (!worte.length || passtZurSuche(b, worte)));
+  $("#katalog-anzahl").textContent = liste.length === katalog.length ? `${katalog.length} Titel` : `${liste.length} von ${katalog.length} Titeln`;
+  const weg = katalog.filter((b) => b.verfuegbar === 0).length;
+  $("#katalog-filter").innerHTML = [["alle", "Alle"], ["da", "Verfügbar"], ["weg", `Alle ausgeliehen${weg ? ` · ${weg}` : ""}`]]
+    .map(([k, t]) => `<button class="chip ${k === katalogFilter ? "active" : ""}" type="button" data-filter="${k}">${t}</button>`).join("");
+  let eintraege = liste;
+  if ($("#serien-gruppieren").checked) {
     // Bände einer Serie an der Stelle des ersten Bandes zusammenfassen
-    const gruppen = new Map(), eintraege = [];
-    for (const b of katalog) {
+    const gruppen = new Map();
+    eintraege = [];
+    for (const b of liste) {
       const schluessel = b.serie.trim().toLowerCase();
       if (!schluessel) { eintraege.push(b); continue; }
       if (!gruppen.has(schluessel)) {
@@ -1930,14 +2015,15 @@ function zeichneKatalog() {
       }
       gruppen.get(schluessel).baende.push(b);
     }
-    html = eintraege.map((e) => {
-      if (!e.baende) return buchZeile(e);
-      if (e.baende.length === 1) return buchZeile(e.baende[0]);
-      e.baende.sort(nachBand);
-      return serienZeilen(e, Boolean(suche) || offeneSerien.has(e.schluessel));
-    }).join("");
+    eintraege = eintraege.map((e) => (e.baende && e.baende.length === 1 ? e.baende[0] : e));
   }
-  $("#katalog-body").innerHTML = html || `<tr><td colspan="6" class="empty">${suche ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch im Tab „Scannen“."}</td></tr>`;
+  const zeile = (e) => {
+    if (!e.baende) return buchZeile(e);
+    e.baende.sort(nachBand);
+    return serienZeilen(e, Boolean(suche) || offeneSerien.has(e.schluessel));
+  };
+  const leer = `<tr><td colspan="5" class="empty">${suche || katalogFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“."}</td></tr>`;
+  stueckweise($("#katalog-body"), $("#katalog-mehr"), eintraege, zeile, leer, behalten);
 }
 
 // Vorschläge für das Serien-Feld, damit derselbe Name immer gleich geschrieben wird
@@ -1946,16 +2032,27 @@ function setzeSerienListe(buecher) {
   $("#serien-liste").innerHTML = serien.map((s) => `<option value="${esc(s)}">`).join("");
 }
 
+async function katalogHolen() {
+  const neu = await getNeu("books");
+  if (!neu) return false;
+  katalog = neu;
+  katalogGeladen = true;
+  setzeSerienListe(katalog);
+  return true;
+}
 async function ladeKatalog() {
+  if (katalogGeladen) zeichneKatalog(true);  // sofort zeigen, was schon da ist, dann still abgleichen
   await versuche(async () => {
-    katalog = await get("books", { q: $("#katalog-suche").value });
-    $("#katalog-anzahl").textContent = `${katalog.length} Titel`;
-    zeichneKatalog();
-    if (!$("#katalog-suche").value.trim()) setzeSerienListe(katalog);
+    if (await katalogHolen() || !$("#katalog-body").children.length) zeichneKatalog(true);
   });
   zeigeNachladen(await get("refresh_status").catch(() => null));
 }
-$("#katalog-suche").addEventListener("input", debounce(ladeKatalog));
+$("#katalog-suche").addEventListener("input", debounce(() => zeichneKatalog(), 120));
+$("#katalog-filter").addEventListener("click", (e) => {
+  if (!e.target.dataset.filter) return;
+  katalogFilter = e.target.dataset.filter;
+  zeichneKatalog();
+});
 $("#serien-gruppieren").addEventListener("change", (e) => {
   speicherSchreiben("serienGruppieren", e.target.checked ? "1" : "0");
   zeichneKatalog();
@@ -1965,7 +2062,7 @@ $("#katalog-body").addEventListener("click", (e) => {
   if (serie) {
     const s = serie.dataset.serie;
     offeneSerien.has(s) ? offeneSerien.delete(s) : offeneSerien.add(s);
-    zeichneKatalog();
+    zeichneKatalog(true);
     return;
   }
   const zeile = e.target.closest("tr[data-isbn]");
@@ -2294,7 +2391,7 @@ $("#update-check").addEventListener("click", () => versuche(async () => {
   try { zeigeUpdate(await get("update_check")); } finally { knopf.disabled = false; knopf.textContent = "Nach Updates suchen"; }
 }));
 $("#update-hinweis").addEventListener("click", () => {
-  zeigeTab("einstellungen");
+  zeigeTab("verwaltung");
   $("#update-karte").scrollIntoView({ behavior: "smooth" });
 });
 $("#update-install").addEventListener("click", () => {
@@ -2331,21 +2428,48 @@ async function ladeNamen() {
   $("#namen-liste").innerHTML = vorschlaege.map((n) => `<option value="${esc(n)}">`).join("");
 }
 
+let ausleihStatus = "alle";
+const AUSLEIH_STATUS = { alle: () => true, ueber: (a) => a.tage < 0, bald: (a) => a.tage >= 0 && a.tage <= 2 };
 async function ladeAusleihen() {
   await versuche(async () => {
-    ausleihen = await get("loans");
-    const ueber = ausleihen.filter((a) => a.tage < 0).length;
-    $("#loans-summary").textContent = `· ${ausleihen.length} insgesamt` + (ueber ? `, ${ueber} überfällig` : "");
+    const neu = await getNeu("loans");
+    if (!neu && $("#loans-body").children.length) return;  // nichts geändert
+    if (neu) ausleihen = neu;
+    const anzahl = (k) => ausleihen.filter(AUSLEIH_STATUS[k]).length;
+    const ueber = anzahl("ueber"), bald = anzahl("bald");
+    const personen = new Set(ausleihen.map((a) => a.ausleiher.toLowerCase())).size;
+    $("#ausleihe-tiles").innerHTML = [
+      [ausleihen.length, "Ausgeliehen", "alle", ""],
+      [ueber, "Überfällig", "ueber", ueber ? "alert" : ""],
+      [bald, "Bald fällig", "bald", bald ? "warn" : ""],
+      [personen, personen === 1 ? "Person mit Büchern" : "Personen mit Büchern", "", ""],
+    ].map(([wert, label, status, art]) =>
+      `<div class="tile ${art}" ${status ? `data-status="${status}" role="button" tabindex="0"` : ""}><div class="value">${wert}</div><div class="label">${label}</div></div>`).join("");
+    $("#anz-alle").textContent = ausleihen.length;
+    $("#anz-ueber").textContent = ueber;
+    $("#anz-bald").textContent = bald;
     zeichneAusleihen();
   });
 }
 
-function zeichneAusleihen() {
-  const filter = $("#loans-filter").value.trim().toLowerCase();
-  const liste = ausleihen.filter((a) =>
-    (!markierteIsbn || a.isbn === markierteIsbn) &&
-    (!filter || [a.ausleiher, a.titel, a.klasse, a.exemplar].some((x) => x.toLowerCase().includes(filter))));
-  $("#loans-body").innerHTML = liste.length ? liste.map((a) => `
+function setzeAusleihStatus(status) {
+  ausleihStatus = status;
+  document.querySelectorAll("#loans-status button").forEach((b) => b.classList.toggle("active", b.dataset.status === status));
+  zeichneAusleihen();
+}
+$("#loans-status").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-status]");
+  if (b) setzeAusleihStatus(b.dataset.status);
+});
+$("#ausleihe-tiles").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-status]");
+  if (!t) return;
+  setzeAusleihStatus(t.dataset.status);
+  $("#loans-status").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+function ausleihZeile(a) {
+  return `
     <tr class="${markierteIsbn ? "highlight" : ""}">
       <td><b>${esc(a.titel)}</b><div class="sub">${esc(a.autor)}${a.exemplar ? ` · ${esc(a.exemplar)}` : ""}</div></td>
       <td>${esc(a.ausleiher)}${a.klasse ? `<div class="sub">Klasse ${esc(a.klasse)}</div>` : ""}</td>
@@ -2356,7 +2480,16 @@ function zeichneAusleihen() {
         <button class="btn small" data-return="${a.id}">Zurückgeben</button>
         <button class="btn small secondary" data-extend="${a.id}">Verlängern</button>
       </td>
-    </tr>`).join("") : `<tr><td colspan="6" class="empty">${ausleihen.length ? "Keine passenden Ausleihen." : "Keine Bücher ausgeliehen – alle Exemplare sind in der Bücherei."}</td></tr>`;
+    </tr>`;
+}
+function zeichneAusleihen() {
+  const filter = $("#loans-filter").value.trim().toLowerCase();
+  const liste = ausleihen.filter((a) =>
+    (!markierteIsbn || a.isbn === markierteIsbn) &&
+    (markierteIsbn || AUSLEIH_STATUS[ausleihStatus](a)) &&
+    (!filter || [a.ausleiher, a.titel, a.klasse, a.exemplar].some((x) => x.toLowerCase().includes(filter))));
+  const leer = `<tr><td colspan="6" class="empty">${ausleihen.length ? "Keine passenden Ausleihen." : "Keine Bücher ausgeliehen – alle Exemplare sind in der Bücherei."}</td></tr>`;
+  stueckweise($("#loans-body"), $("#loans-mehr"), liste, ausleihZeile, leer, true);
 }
 $("#loans-filter").addEventListener("input", zeichneAusleihen);
 
@@ -2507,6 +2640,18 @@ $("#return-form").addEventListener("submit", (e) => {
 
 // --- Schüler ---
 let schuelerDaten = { schueler: [], klassen: [] };
+let schuelerAnsicht = "liste";
+function zeigeSchuelerAnsicht(ansicht, laden = true) {
+  schuelerAnsicht = ansicht;
+  document.querySelectorAll("#schueler-ansicht button").forEach((b) => b.classList.toggle("active", b.dataset.ansicht === ansicht));
+  $("#ansicht-liste").classList.toggle("hidden", ansicht !== "liste");
+  $("#ansicht-verlauf").classList.toggle("hidden", ansicht !== "verlauf");
+  if (laden) LADER.schueler();
+}
+$("#schueler-ansicht").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-ansicht]");
+  if (b) zeigeSchuelerAnsicht(b.dataset.ansicht);
+});
 let aktiveKlasse = null;
 async function ladeSchueler() {
   await versuche(async () => {
@@ -2525,14 +2670,15 @@ async function ladeSchueler() {
       : "";
     $("#ausweise-drucken").disabled = !liste.length;
     $("#ausweise-drucken").textContent = aktiveKlasse ? `Ausweise Klasse ${aktiveKlasse} drucken` : "Alle Ausweise drucken";
-    $("#schueler-body").innerHTML = liste.length ? liste.map((x) => `
+    const leer = `<tr><td colspan="5" class="empty">${$("#schueler-suche").value.trim() ? "Niemand gefunden." : "Noch keine Schüler. Lege sie einzeln an oder importiere eine Klassenliste."}</td></tr>`;
+    stueckweise($("#schueler-body"), $("#schueler-mehr"), liste, (x) => `
       <tr class="clickable" data-id="${x.id}">
         <td><b>${esc(x.nachname)}</b>, ${esc(x.vorname)}</td>
         <td>${esc(x.klasse)}</td>
         <td>${codeHtml(x.ausweis)}</td>
         <td>${x.aktiv ? `${x.aktiv} ${x.aktiv === 1 ? "Buch" : "Bücher"}` : `<span class="sub">–</span>`}${x.ueberfaellig ? ` <span class="badge danger">${x.ueberfaellig} überfällig</span>` : ""}</td>
         <td style="text-align:right"><button class="btn small secondary" type="button" data-ausweis="${x.id}">Ausweis</button></td>
-      </tr>`).join("") : `<tr><td colspan="5" class="empty">${$("#schueler-suche").value.trim() ? "Niemand gefunden." : "Noch keine Schüler. Lege sie einzeln an oder importiere eine Klassenliste."}</td></tr>`;
+      </tr>`, leer);
   });
 }
 $("#schueler-suche").addEventListener("input", debounce(ladeSchueler));
@@ -2632,8 +2778,10 @@ let aktivePerson = null;
 async function ladePersonen() {
   await versuche(async () => {
     const namen = await get("borrowers", { q: $("#personen-suche").value });
+    const zeigen = namen.slice(0, 40);
     $("#personen-liste").innerHTML = namen.length
-      ? namen.map((n) => `<button class="chip ${n === aktivePerson ? "active" : ""}" data-name="${esc(n)}">${esc(n)}</button>`).join("")
+      ? zeigen.map((n) => `<button class="chip ${n === aktivePerson ? "active" : ""}" data-name="${esc(n)}">${esc(n)}</button>`).join("")
+        + (namen.length > zeigen.length ? `<span class="hint" style="align-self:center;margin:0">… und ${namen.length >= 500 ? "viele" : namen.length - zeigen.length} weitere – tippe einen Namen ein.</span>` : "")
       : `<span class="hint">Niemand gefunden.</span>`;
   });
 }
@@ -2706,7 +2854,7 @@ $("#settings-form").addEventListener("submit", (e) => {
 
 // --- Start ---
 ladeInfo().catch((e) => toast(e.message, true));
-get("books").then(setzeSerienListe).catch(() => {});
+katalogHolen().catch(() => {});
 zeigeTab(location.hash.slice(1));
 get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund, Fehler nicht anzeigen
 </script>

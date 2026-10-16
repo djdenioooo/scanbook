@@ -35,6 +35,8 @@ Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`export
 
 ## Funktionen
 
+Die Browser-Oberfläche hat sechs Bereiche: **Ausleihe** (Startseite), **Katalog**, **Schüler**, **Erfassen** (neue Bücher scannen), **Regale** und **Verwaltung** (Statistik, Export, Backup, Mediencodes, Einstellungen und Updates). Lange Listen werden stückweise beim Herunterscrollen angezeigt, die Katalogsuche läuft direkt im Browser.
+
 | Nr. | Funktion | Beschreibung |
 |----|----------|--------------|
 | 1 | Bücher scannen | ISBN scannen. Neue Bücher werden online nachgeschlagen, bekannte Bücher aufgestockt. Gefundene Daten können vor dem Speichern geprüft und korrigiert werden. |
@@ -45,15 +47,15 @@ Die Datenbank (`buecherei_system.db`), Backups (`backups/`) und Exporte (`export
 | 6 | Ausleihen | Buch scannen (Mediencode oder ISBN), dann Schülerausweis scannen oder Namen eingeben. |
 | 7 | Zurückgeben | Buch scannen, Mediencode oder ISBN (oder aus der Liste wählen). |
 | 8 | Verlängern | Rückgabedatum einer Ausleihe nach hinten schieben. |
-| 9 | Ausleih-Übersicht | Alle aktuellen Ausleihen, überfällige werden markiert. |
-| 10 | Ausleiher-Übersicht | Was hat eine bestimmte Person gerade oder früher ausgeliehen? |
+| 9 | Ausleih-Übersicht | Alle aktuellen Ausleihen, überfällige werden markiert. In der Browser-Oberfläche oben mit Zahlen und Filtern „Überfällig“ und „Bald fällig“. |
+| 10 | Ausleiher-Übersicht | Was hat eine bestimmte Person gerade oder früher ausgeliehen? Im Browser unter „Schüler“ → „Ausleih-Verlauf“. |
 | 11 | Statistik | Bestand, Ausleihen, überfällige und meistgeliehene Bücher. |
 | 12 | Export | Katalog, Ausleihen oder Mahnliste als CSV (öffnet sich direkt in Excel). Ausleihen und Mahnliste sind nach Klasse sortiert. |
 | 13 | Backup | Sicherungskopie der Datenbank. Zusätzlich wird einmal täglich beim Start automatisch gesichert. |
 | 14 | Stammdaten | Schulname, Standard-Leihdauer, Löschfrist usw. |
 | 15 | Buchdaten nachladen | Sucht für Bücher, die schon im Katalog sind, online nach Beschreibung, Cover und Serie. Von Hand eingetragene Angaben bleiben unverändert. |
 | 16 | Regale & Standorte | Regale mit Fächern anlegen; ScanBook sagt für jedes Buch, wo es hingehört (siehe unten). |
-| 17 | Updates | Prüft auf GitHub, ob es eine neuere Version gibt. In der Browser-Oberfläche unter „Einstellungen“ → „Programm-Update“. |
+| 17 | Updates | Prüft auf GitHub, ob es eine neuere Version gibt. In der Browser-Oberfläche unter „Verwaltung“ → „Programm-Update“. |
 
 ## Buchvorschau und Serien
 
@@ -87,11 +89,11 @@ Ausleihen im Tab „Ausleihe“: Ausweis scannen, dann nacheinander die Bücher 
 
 Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. Beim Ausleihen und Zurückgeben scannst du dann den Mediencode statt der ISBN. So weiß ScanBook genau, welches Exemplar wer hat, und die Rückgabe geht ohne Rückfrage. Bücher ohne Mediencode funktionieren weiter wie bisher mit der ISBN.
 
-- **Eigene Etiketten:** Den Code des vorhandenen Etiketts im Tab „Scannen“ scannen, danach die ISBN des Buchs. ScanBook ordnet den Code diesem Exemplar zu. Haben schon alle Exemplare einen Code, zählt es als neues Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.
+- **Eigene Etiketten:** Den Code des vorhandenen Etiketts unter „Erfassen“ scannen, danach die ISBN des Buchs. ScanBook ordnet den Code diesem Exemplar zu. Haben schon alle Exemplare einen Code, zählt es als neues Exemplar. Einzelne Codes lassen sich auch in der Buchvorschau eintragen.
 - **Von ScanBook erzeugte Codes:** „Codes für alle Exemplare ohne Code erzeugen“ vergibt fortlaufende Nummern (z. B. `M00001`), „Neue Etiketten drucken“ druckt sie auf Etikettenbögen 70 × 37 mm (24 pro A4-Seite, z. B. Zweckform 3474). Angebrochene Bögen lassen sich weiter verwenden.
 - In der Buchvorschau stehen alle Codes eines Buchs, wer welches Exemplar gerade hat, und Knöpfe zum Ausmustern einzelner Exemplare.
 
-Die Vorsilben für Ausweisnummern (`S`) und Mediencodes (`M`) lassen sich unter „Einstellungen“ ändern. Barcodes werden als Code 128 erzeugt, den jeder übliche Barcode-Scanner liest.
+Die Vorsilben für Ausweisnummern (`S`) und Mediencodes (`M`) lassen sich unter „Verwaltung“ ändern. Barcodes werden als Code 128 erzeugt, den jeder übliche Barcode-Scanner liest.
 
 ## ISBN-Prüfung
 
@@ -111,7 +113,7 @@ Die Datenbank enthält Namen von Ausleihern und wird deshalb über `.gitignore` 
 
 Ein Update ersetzt `ScanBook.py` und `ScanBook_Web.py`. Es wird nur installiert, wenn die Versionsnummer in `ScanBook.py` höher ist und beide Dateien fehlerfrei geladen werden können. Die letzten 3 alten Versionen werden in `backups/` aufbewahrt.
 
-In der Browser-Oberfläche gibt es dafür unter „Einstellungen“ den Bereich „Programm-Update“. Ist eine neue Version da, erscheint oben neben der Versionsnummer ein Knopf. Nach dem Installieren startet ScanBook von selbst neu und die Seite lädt sich neu.
+In der Browser-Oberfläche gibt es dafür unter „Verwaltung“ den Bereich „Programm-Update“. Ist eine neue Version da, erscheint oben neben der Versionsnummer ein Knopf. Nach dem Installieren startet ScanBook von selbst neu und die Seite lädt sich neu.
 
 Die Updates werden ohne Anmeldung von GitHub geladen. Das Repository muss deshalb **öffentlich** sein.
 
