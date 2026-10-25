@@ -86,7 +86,7 @@ def api_info(_):
 
 def api_books(params):
     suche = params.get("q", "").strip()
-    sql = f"SELECT {sb.BUCH_SPALTEN}, autoren, verlag FROM buecher"
+    sql = f"SELECT {sb.BUCH_SPALTEN}, autoren, verlag, cover_url FROM buecher"
     werte = ()
     if suche:
         muster = f"%{sb.normalize_isbn(suche) or suche}%"
@@ -105,6 +105,7 @@ def api_books(params):
             "autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
             "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10],
             "standort": ort, "geplant": geplant, "regal": regal_name.get(regal_id, ""), "regal_nr": regal_nr.get(regal_id, -1),
+            "cover_url": r[11] or "",
         })
     return buecher
 
@@ -1014,7 +1015,7 @@ HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ScanBook</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='112' fill='%23234a70'/><path d='M92 170Q172 140 250 176V386Q172 352 92 378Z' fill='%23fff'/><path d='M420 170Q340 140 262 176V386Q340 352 420 378Z' fill='%23fff'/><rect x='68' y='252' width='376' height='24' rx='12' fill='%23ff5a4e'/></svg>">
 <style>
 /* Gestaltung nach Apples Human Interface Guidelines: Systemschrift, Systemfarben,
    gruppierte Listen, Seitenleiste (breit) bzw. Tab-Leiste unten (schmal), Hell/Dunkel automatisch */
@@ -1022,7 +1023,10 @@ HTML = r"""<!doctype html>
   --bg: #f2f2f7; --surface: #ffffff; --surface-2: #f2f2f7; --fill: rgba(118, 118, 128, .12); --border: rgba(60, 60, 67, .18);
   --text: #000000; --muted: rgba(60, 60, 67, .6); --accent: #007aff; --accent-hover: #0066d6; --accent-soft: rgba(0, 122, 255, .1);
   --danger: #ff3b30; --danger-soft: rgba(255, 59, 48, .12); --warn: #c77c00; --warn-soft: rgba(255, 149, 0, .14); --ok: #248a3d; --ok-soft: rgba(52, 199, 89, .14);
-  --bar: rgba(249, 249, 249, .78); --sidebar: rgba(236, 236, 241, .85);
+  --bar: rgba(249, 249, 249, .78);
+  /* Seitenleiste in Nachtblau, passend zum Logo */
+  --side: linear-gradient(180deg, #22385f, #16263f); --side-text: rgba(255, 255, 255, .86); --side-muted: rgba(255, 255, 255, .55);
+  --side-icon: #8fb4ff; --side-hover: rgba(255, 255, 255, .08); --side-active: rgba(255, 255, 255, .15); --marke: #ff5a4e;
   --shadow: none;
   --radius: 12px;
   color-scheme: light;
@@ -1032,7 +1036,7 @@ HTML = r"""<!doctype html>
     --bg: #000000; --surface: #1c1c1e; --surface-2: #2c2c2e; --fill: rgba(118, 118, 128, .24); --border: rgba(84, 84, 88, .6);
     --text: #ffffff; --muted: rgba(235, 235, 245, .6); --accent: #0a84ff; --accent-hover: #409cff; --accent-soft: rgba(10, 132, 255, .2);
     --danger: #ff453a; --danger-soft: rgba(255, 69, 58, .2); --warn: #ff9f0a; --warn-soft: rgba(255, 159, 10, .18); --ok: #30d158; --ok-soft: rgba(48, 209, 88, .18);
-    --bar: rgba(22, 22, 24, .8); --sidebar: rgba(28, 28, 30, .85);
+    --bar: rgba(22, 22, 24, .8); --side: linear-gradient(180deg, #15233b, #0b1424);
     color-scheme: dark;
   }
 }
@@ -1045,23 +1049,24 @@ body {
 /* Seitenleiste */
 header {
   position: fixed; top: 0; bottom: 0; left: 0; width: 232px; z-index: 10;
-  background: var(--sidebar); border-right: .5px solid var(--border);
-  -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px);
+  background: var(--side);
 }
 .header-inner { height: 100%; display: flex; flex-direction: column; padding: 18px 10px 14px; }
-.brand { display: flex; flex-direction: column; gap: 2px; padding: 4px 10px 16px; }
-.brand h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
-.brand .bib { color: var(--muted); font-size: 13px; }
-.brand .version { order: 9; position: absolute; bottom: 16px; left: 20px; color: var(--muted); font-size: 12px; }
+.brand { display: grid; grid-template-columns: 42px 1fr; column-gap: 12px; align-items: center; padding: 2px 8px 20px; }
+.brand .logo { grid-row: 1 / span 2; width: 42px; height: 42px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, .35); }
+.brand h1 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -.02em; color: #fff; align-self: end; }
+.brand .bib { color: var(--side-muted); font-size: 12px; line-height: 1.3; align-self: start; }
+.brand .version { position: absolute; bottom: 16px; left: 20px; color: var(--side-muted); font-size: 12px; }
+#update-hinweis { grid-column: 1 / -1; }
 nav { display: flex; flex-direction: column; gap: 2px; }
 nav button {
   display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
-  border: 0; background: none; color: var(--text); font: inherit; font-size: 14px; font-weight: 500;
+  border: 0; background: none; color: var(--side-text); font: inherit; font-size: 14px; font-weight: 500;
   padding: 7px 10px; border-radius: 8px; cursor: pointer; white-space: nowrap;
 }
-nav button svg { width: 19px; height: 19px; flex: none; color: var(--accent); }
-nav button:hover { background: var(--fill); }
-nav button.active { background: var(--accent); color: #fff; }
+nav button svg { width: 19px; height: 19px; flex: none; color: var(--side-icon); }
+nav button:hover { background: var(--side-hover); }
+nav button.active { background: var(--side-active); color: #fff; box-shadow: inset 3px 0 0 var(--marke); }
 nav button.active svg { color: #fff; }
 main { margin-left: 232px; max-width: 1060px; padding: 34px 36px 60px; }
 .seiten-titel { margin: 0 0 18px; font-size: 34px; font-weight: 700; letter-spacing: -.025em; line-height: 1.15; }
@@ -1070,10 +1075,12 @@ section.active { display: block; animation: rein .25s ease-out; }
 /* Schmale Fenster: Titelleiste oben, Tab-Leiste unten wie auf dem iPhone */
 @media (max-width: 860px) {
   /* ohne backdrop-filter, sonst hängt die fixierte Tab-Leiste am Kopf statt am Fensterrand */
-  header { position: sticky; bottom: auto; right: 0; width: auto; border-right: 0; border-bottom: .5px solid var(--border); background: var(--surface); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  header { position: sticky; bottom: auto; right: 0; width: auto; }
   .header-inner { padding: 10px 16px; }
-  .brand { flex-direction: row; align-items: baseline; gap: 8px; padding: 0; }
-  .brand h1 { font-size: 17px; font-weight: 600; }
+  .brand { display: flex; align-items: center; gap: 8px; padding: 0; }
+  .brand .logo { width: 28px; height: 28px; border-radius: 7px; box-shadow: none; }
+  .brand h1 { font-size: 17px; font-weight: 600; align-self: auto; }
+  .brand .bib { align-self: auto; }
   .brand .version { display: none; }
   nav {
     position: fixed; left: 0; right: 0; bottom: 0; flex-direction: row; gap: 0; overflow-x: auto; scrollbar-width: none;
@@ -1084,7 +1091,7 @@ section.active { display: block; animation: rein .25s ease-out; }
   nav button span { overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   nav button svg { width: 24px; height: 24px; color: inherit; }
   nav button:hover { background: none; }
-  nav button.active { background: none; color: var(--accent); }
+  nav button.active { background: none; color: var(--accent); box-shadow: none; }
   nav button.active svg { color: var(--accent); }
   main { margin-left: 0; padding: 18px 16px 110px; }
   .seiten-titel { font-size: 30px; margin-bottom: 14px; }
@@ -1260,7 +1267,7 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .legende .buch-chip { cursor: default; }
 .aufgaben li { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .aufgaben .pfad { color: var(--muted); font-size: 13px; }
-#update-hinweis { margin-top: 8px; align-self: flex-start; }
+#update-hinweis { margin-top: 8px; justify-self: start; }
 @media (max-width: 860px) { #update-hinweis { margin: 0 0 0 auto; } }
 /* Schüler & Mediencodes */
 .code { font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: .03em; padding: 1px 7px; border-radius: 6px; background: var(--fill); white-space: nowrap; }
@@ -1295,6 +1302,43 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .chips.zeile .chip { flex: none; }
 #katalog-filter .chip, #regal-filter .chip, #klassen-chips .chip { padding: 4px 12px; font-size: 13px; }
 td.titel-zelle { min-width: 220px; }
+/* Katalog als Cover-Wand: echtes Cover, sonst ein gemaltes in der Farbe des Genres */
+.cover-wand { display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 22px 18px; padding: 6px 20px 20px; }
+.cover-wand > .empty { grid-column: 1 / -1; padding: 0; }
+.kachel { border: 0; background: none; padding: 0; font: inherit; color: var(--text); text-align: left; cursor: pointer; min-width: 0; }
+.kachel:focus-visible { outline: none; }
+.kachel:focus-visible .cover { box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 50%, transparent); }
+.cover {
+  aspect-ratio: 2 / 3; position: relative; overflow: hidden; border-radius: 4px 10px 10px 4px; color: #fff;
+  background: linear-gradient(180deg, transparent 55%, rgba(0, 0, 0, .25)), linear-gradient(150deg, var(--c2), var(--c1));
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .15), 0 10px 22px rgba(20, 40, 80, .18); transition: transform .15s;
+}
+.kachel:hover .cover { transform: translateY(-4px) rotate(-.6deg); }
+.cover::before { content: ""; position: absolute; z-index: 2; left: 0; top: 0; bottom: 0; width: 7px; background: rgba(0, 0, 0, .18); box-shadow: 1px 0 0 rgba(255, 255, 255, .25); }
+.cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: var(--surface); }
+.cover-text { position: absolute; inset: 0; padding: 14px 12px 12px 18px; display: flex; flex-direction: column; justify-content: space-between; }
+.cover-titel { font: 700 15px/1.2 Georgia, "Times New Roman", serif; letter-spacing: 0; text-shadow: 0 1px 2px rgba(0, 0, 0, .2); display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.cover-autor { font-size: 11px; opacity: .9; text-transform: uppercase; letter-spacing: .06em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cover.mit-band .cover-text { padding-top: 38px; }
+.cover-band { position: absolute; z-index: 3; top: 11px; left: 17px; background: rgba(255, 255, 255, .92); color: #16263f; font-size: 11px; font-weight: 700; border-radius: 999px; padding: 1px 7px; }
+/* Serie: als Stapel, aufgeklappt mit Rahmen */
+.stapel { position: relative; isolation: isolate; margin-bottom: 8px; }
+.stapel::before, .stapel::after { content: ""; position: absolute; z-index: -1; inset: 0; border-radius: 4px 10px 10px 4px; }
+.stapel::before { transform: translate(8px, 8px); background: color-mix(in srgb, var(--c2) 25%, var(--surface)); }
+.stapel::after { transform: translate(4px, 4px); background: color-mix(in srgb, var(--c2) 50%, var(--surface)); }
+.kachel.band .cover { outline: 2px solid var(--accent-soft); outline-offset: 3px; }
+.kachel-titel { margin-top: 9px; font-size: 13px; font-weight: 600; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kachel-sub { color: var(--muted); font-size: 12px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.punkt { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--ok); vertical-align: 0; }
+.punkt.weg { background: var(--warn); }
+@media (max-width: 560px) {
+  .cover-wand { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 16px 12px; padding: 4px 16px 16px; }
+  .cover-text { padding: 10px 8px 8px 13px; }
+  .cover.mit-band .cover-text { padding-top: 32px; }
+  .cover-band { top: 8px; left: 12px; }
+  .cover-titel { font-size: 12.5px; }
+  .cover-autor { font-size: 9.5px; }
+}
 @keyframes rein { from { opacity: 0; transform: translateY(6px); } }
 @keyframes toast { from { opacity: 0; transform: translateY(-12px) scale(.96); } }
 @keyframes sheet { from { opacity: 0; transform: translateY(24px) scale(.98); } }
@@ -1305,6 +1349,14 @@ td.titel-zelle { min-width: 220px; }
 <header>
   <div class="header-inner">
     <div class="brand">
+      <svg class="logo" viewBox="0 0 512 512" aria-hidden="true">
+        <defs><linearGradient id="logo-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b5c8a"/><stop offset="1" stop-color="#173452"/></linearGradient>
+        <clipPath id="logo-seiten"><path d="M92 170Q172 140 250 176V386Q172 352 92 378Z"/><path d="M420 170Q340 140 262 176V386Q340 352 420 378Z"/></clipPath></defs>
+        <rect width="512" height="512" rx="112" fill="url(#logo-bg)"/>
+        <path d="M92 170Q172 140 250 176V386Q172 352 92 378Z" fill="#fff"/><path d="M420 170Q340 140 262 176V386Q340 352 420 378Z" fill="#fff"/>
+        <g clip-path="url(#logo-seiten)" fill="#173452"><rect x="118" y="196" width="8" height="150"/><rect x="132" y="196" width="4" height="150"/><rect x="142" y="196" width="12" height="150"/><rect x="160" y="196" width="4" height="150"/><rect x="170" y="196" width="6" height="150"/><rect x="182" y="196" width="10" height="150"/><rect x="198" y="196" width="4" height="150"/><rect x="208" y="196" width="8" height="150"/><rect x="222" y="196" width="4" height="150"/><rect x="286" y="196" width="4" height="150"/><rect x="296" y="196" width="10" height="150"/><rect x="312" y="196" width="4" height="150"/><rect x="322" y="196" width="8" height="150"/><rect x="336" y="196" width="12" height="150"/><rect x="354" y="196" width="4" height="150"/><rect x="364" y="196" width="6" height="150"/><rect x="376" y="196" width="10" height="150"/></g>
+        <rect x="68" y="258" width="376" height="12" rx="6" fill="#ff5a4e" opacity=".35"/><rect x="68" y="260" width="376" height="8" rx="4" fill="#ff5a4e"/>
+      </svg>
       <h1>ScanBook</h1><span class="bib" id="bib-name"></span><span class="version" id="version"></span><button class="btn small hidden" type="button" id="update-hinweis"></button>
     </div>
     <nav id="nav">
@@ -1380,16 +1432,18 @@ td.titel-zelle { min-width: 220px; }
         <div class="chips" id="katalog-filter" style="margin:0"></div>
         <div class="chips hidden" id="regal-filter" style="margin:0"></div>
         <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
+        <div class="segment" id="katalog-ansicht" style="margin:0"><button type="button" data-ansicht="cover">Cover</button><button type="button" data-ansicht="liste">Liste</button></div>
       </div>
       <div class="nachladen hidden" id="nachladen-box">
         <div class="grow"><span id="nachladen-text"></span><div class="balken hidden" id="nachladen-balken"><div></div></div></div>
         <button class="btn small" type="button" id="nachladen-btn">Alle Bücher nachladen</button>
       </div>
       <div class="table-wrap">
-        <table>
+        <table id="katalog-tabelle">
           <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Genre</th><th>Standort</th><th>Verfügbar</th></tr></thead>
           <tbody id="katalog-body"></tbody>
         </table>
+        <div class="cover-wand" id="katalog-wand"></div>
         <div class="mehr hidden" id="katalog-mehr"></div>
       </div>
     </div>
@@ -2055,8 +2109,46 @@ function serienZeilen(g, offen) {
       </tr>` + (offen ? g.baende.map((b) => buchZeile(b, true)).join("") : "");
 }
 
+// Cover-Ansicht: gemaltes Cover in der Farbe des Genres, darüber das echte, sobald es geladen ist
+const COVER_FARBEN = [["#5a3d9a", "#8e5ccf"], ["#d65a2e", "#f29a52"], ["#1f86b5", "#4cc3e8"], ["#2b2d42", "#55597a"], ["#2e8b57", "#5cc189"],
+  ["#b83227", "#e2665a"], ["#7a6650", "#a8907a"], ["#1d4e89", "#3a7bd5"], ["#a83c66", "#e07a9f"], ["#2f6f69", "#5faea4"]];
+function coverFarbe(text) {
+  let h = 0;
+  for (const z of String(text).toLowerCase()) h = (h * 31 + z.codePointAt(0)) >>> 0;
+  const [c1, c2] = COVER_FARBEN[h % COVER_FARBEN.length];
+  return `--c1:${c1};--c2:${c2}`;
+}
+function coverHtml(b, titel, autor, band = "") {
+  const genre = LEERWERTE.includes(b.genre) ? "" : b.genre;
+  const bild = b.cover_url ? `<img src="${esc(b.cover_url)}" alt="" loading="lazy" onerror="this.remove()" onload="if (this.naturalWidth < 20) this.remove()">` : "";
+  return `<div class="cover${band ? " mit-band" : ""}" style="${coverFarbe(genre || titel)}"><div class="cover-text"><span class="cover-titel">${esc(titel)}</span><span class="cover-autor">${esc(autor)}</span></div>${bild}${band ? `<span class="cover-band">${esc(band)}</span>` : ""}</div>`;
+}
+function buchKachel(b, alsBand = false) {
+  const da = b.verfuegbar > 0 ? `${b.verfuegbar} von ${b.gesamt} da` : "alle ausgeliehen";
+  return `
+      <button class="kachel${alsBand ? " band" : ""}" type="button" data-isbn="${esc(b.isbn)}" title="${esc(b.titel)}">
+        ${coverHtml(b, b.titel, b.autor, b.band ? `Bd. ${b.band}` : "")}
+        <div class="kachel-titel">${esc(b.titel)}</div>
+        <div class="kachel-sub"><i class="punkt${b.verfuegbar > 0 ? "" : " weg"}"></i>${da}</div>
+        ${b.standort ? `<div class="kachel-sub" title="${esc(b.standort)}">📍 ${esc(b.standort)}${b.geplant ? " (geplant)" : ""}</div>` : ""}
+      </button>`;
+}
+function serienKacheln(g, offen) {
+  const verfuegbar = g.baende.reduce((n, b) => n + b.verfuegbar, 0);
+  const gesamt = g.baende.reduce((n, b) => n + b.gesamt, 0);
+  const erster = g.baende[0];
+  return `
+      <button class="kachel serie" type="button" data-serie="${esc(g.schluessel)}" title="${esc(g.serie)}">
+        <div class="stapel" style="${coverFarbe(g.serie)}">${coverHtml({ ...erster, genre: "" }, g.serie, erster.autor, `${g.baende.length} Bände`)}</div>
+        <div class="kachel-titel">📚 ${esc(g.serie)}</div>
+        <div class="kachel-sub"><i class="punkt${verfuegbar > 0 ? "" : " weg"}"></i>${verfuegbar} von ${gesamt} da · ${offen ? "zuklappen" : "aufklappen"}</div>
+      </button>` + (offen ? g.baende.map((b) => buchKachel(b, true)).join("") : "");
+}
+
 // Der Katalog wird einmal geladen und dann im Browser durchsucht – das geht ohne Wartezeit
 let katalog = [], katalogGeladen = false, katalogFilter = "alle", regalFilter = "alle";
+let katalogAnsicht = speicherLesen("katalogAnsicht", "cover") === "liste" ? "liste" : "cover";
+const katalogZiel = () => $(katalogAnsicht === "cover" ? "#katalog-wand" : "#katalog-body");
 function passtZurSuche(b, worte) {
   const text = `${b.titel} ${b.autoren} ${b.autor} ${b.genre} ${b.isbn} ${b.verlag} ${b.serie} ${b.standort}`.toLowerCase();
   return worte.every((w) => text.includes(w) || text.includes(w.replace(/-/g, "")));
@@ -2090,13 +2182,20 @@ function zeichneKatalog(behalten = false) {
     }
     eintraege = eintraege.map((e) => (e.baende && e.baende.length === 1 ? e.baende[0] : e));
   }
+  const wand = katalogAnsicht === "cover";
+  $("#katalog-tabelle").classList.toggle("hidden", wand);
+  $("#katalog-wand").classList.toggle("hidden", !wand);
+  $("#katalog-ansicht").querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.ansicht === katalogAnsicht));
   const zeile = (e) => {
-    if (!e.baende) return buchZeile(e);
+    if (!e.baende) return wand ? buchKachel(e) : buchZeile(e);
     e.baende.sort(nachBand);
-    return serienZeilen(e, Boolean(suche) || offeneSerien.has(e.schluessel));
+    const offen = Boolean(suche) || offeneSerien.has(e.schluessel);
+    return wand ? serienKacheln(e, offen) : serienZeilen(e, offen);
   };
-  const leer = `<tr><td colspan="6" class="empty">${suche || katalogFilter !== "alle" || regalFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“."}</td></tr>`;
-  stueckweise($("#katalog-body"), $("#katalog-mehr"), eintraege, zeile, leer, behalten);
+  const hinweis = suche || katalogFilter !== "alle" || regalFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“.";
+  const leer = wand ? `<div class="empty">${hinweis}</div>` : `<tr><td colspan="6" class="empty">${hinweis}</td></tr>`;
+  $(wand ? "#katalog-body" : "#katalog-wand").innerHTML = "";
+  stueckweise(katalogZiel(), $("#katalog-mehr"), eintraege, zeile, leer, behalten);
 }
 
 // Regal-Filter: nur sichtbar, wenn Regale angelegt sind; Reihenfolge wie im Tab „Regale“
@@ -2131,7 +2230,7 @@ async function katalogHolen() {
 async function ladeKatalog() {
   if (katalogGeladen) zeichneKatalog(true);  // sofort zeigen, was schon da ist, dann still abgleichen
   await versuche(async () => {
-    if (await katalogHolen() || !$("#katalog-body").children.length) zeichneKatalog(true);
+    if (await katalogHolen() || !katalogZiel().children.length) zeichneKatalog(true);
   });
   zeigeNachladen(await get("refresh_status").catch(() => null));
 }
@@ -2150,6 +2249,24 @@ $("#regal-filter").addEventListener("click", (e) => {
 $("#serien-gruppieren").addEventListener("change", (e) => {
   speicherSchreiben("serienGruppieren", e.target.checked ? "1" : "0");
   zeichneKatalog();
+});
+$("#katalog-ansicht").addEventListener("click", (e) => {
+  const knopf = e.target.closest("[data-ansicht]");
+  if (!knopf || knopf.dataset.ansicht === katalogAnsicht) return;
+  katalogAnsicht = knopf.dataset.ansicht;
+  speicherSchreiben("katalogAnsicht", katalogAnsicht);
+  zeichneKatalog(true);
+});
+$("#katalog-wand").addEventListener("click", (e) => {
+  const serie = e.target.closest("[data-serie]");
+  if (serie) {
+    const s = serie.dataset.serie;
+    offeneSerien.has(s) ? offeneSerien.delete(s) : offeneSerien.add(s);
+    zeichneKatalog(true);
+    return;
+  }
+  const kachel = e.target.closest("[data-isbn]");
+  if (kachel) oeffneVorschau(kachel.dataset.isbn);
 });
 $("#katalog-body").addEventListener("click", (e) => {
   const serie = e.target.closest("tr[data-serie]");
