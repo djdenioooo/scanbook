@@ -63,6 +63,8 @@ In der Browser-Oberfläche öffnet ein Klick auf ein Buch im Katalog eine Vorsch
 
 Serie und Band werden beim Scannen aus Google Books und der Deutschen Nationalbibliothek übernommen, soweit die Quellen sie kennen (Verlagsreihen wie „dtv“ oder „rororo“ werden ignoriert). Fehlt die Serie, lässt sie sich unter „Bearbeiten“ eintragen; das Feld schlägt bereits vorhandene Seriennamen vor, damit alle Bände gleich geschrieben werden. Im Katalog werden die Bände einer Serie zu einer Zeile zusammengefasst, die sich aufklappen lässt („Serien zusammenfassen“ ein- oder ausschalten).
 
+Der Katalog lässt sich oben rechts zwischen „Cover“ und „Liste“ umschalten; die Wahl wird im Browser gemerkt. In der Cover-Ansicht steht jedes Buch mit seinem Cover, ob es da ist und in welchem Regal es steht. Hat ein Buch noch kein gespeichertes Cover, malt ScanBook eins in der Farbe seines Genres. Serien erscheinen als Stapel, ein Klick klappt die Bände auf.
+
 Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog den Knopf „Alle Bücher nachladen“ (Terminal: Menüpunkt 15). Er ergänzt nur leere Angaben. Die Cover werden direkt im Browser von Google Books, Open Library oder der DNB geladen.
 
 ## Datensicherung
