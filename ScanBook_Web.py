@@ -486,6 +486,7 @@ def api_regale(_):
     return {
         "regale": [
             {"id": r["id"], "name": r["name"], "faecher": r["faecher"], "kapazitaet": r["kapazitaet"], "genres": r["genres"],
+             "fach_genres": r["fach_genres"],
              "inhalt": [[regal_buch(regale, b) for b in fach] for fach in r["inhalt"]]}
             for r in regale
         ],
@@ -506,7 +507,9 @@ def api_regal_save(body):
     regal_id = body.get("id") or None
     if regal_id and regal_id not in {r["id"] for r in sb.lade_regale()}:
         raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
-    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")))
+    fach_genres = body.get("fach_genres")
+    fach_genres = [sb.genre_liste(str(g or "")) for g in fach_genres] if isinstance(fach_genres, list) else None
+    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres)
     return api_regale(None)
 
 
@@ -1258,12 +1261,17 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .regal-kopf .grow { flex: 1; min-width: 200px; }
 .regal-kopf .sub { color: var(--muted); font-size: 13px; }
 .regal summary { cursor: pointer; padding: 0 16px 12px; color: var(--accent); font-size: 14px; }
-.fach { display: grid; grid-template-columns: 70px 1fr; gap: 4px 12px; padding: 10px 16px; box-shadow: inset 0 .5px 0 var(--border); background: var(--surface); }
+.fach { display: grid; grid-template-columns: 90px 1fr; gap: 4px 12px; padding: 10px 16px; box-shadow: inset 0 .5px 0 var(--border); background: var(--surface); }
 .fach-nr { font-weight: 600; font-size: 14px; }
 .fach-nr .sub { display: block; font-weight: 400; }
 .fach .balken { margin: 0 0 8px; }
 .fach .balken.voll > div { background: var(--warn); }
 .fach-buecher { display: flex; flex-wrap: wrap; gap: 5px; }
+.fach-nr .fach-genre { display: block; font-weight: 500; font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
+#rg-fach-details { margin-top: 12px; }
+#rg-fach-details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.fach-genres { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; }
+.fach-genres span { font-size: 14px; font-weight: 600; white-space: nowrap; }
 .buch-chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 0; background: var(--fill); cursor: pointer; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .buch-chip:hover { filter: brightness(.95); }
 .buch-chip.neu { background: var(--ok-soft); color: var(--ok); }
@@ -1692,6 +1700,12 @@ td.titel-zelle { min-width: 220px; }
       <div><label for="rg-kapazitaet">Bücher pro Fach</label><input id="rg-kapazitaet" name="kapazitaet" type="number" min="1"></div>
       <div class="full"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
     </div>
+    <details id="rg-fach-details">
+      <summary>Eigene Genres für einzelne Fächer</summary>
+      <p class="hint">Leer = das Fach nimmt, was zum Regal passt. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer.</p>
+      <div class="fach-genres" id="rg-fach-genres"></div>
+    </details>
+    <p class="hint" style="margin:10px 0 0">Genre antippen, um es ins ausgewählte Feld zu übernehmen:</p>
     <div class="chips" id="rg-genre-chips"></div>
     <div class="actions">
       <button class="btn" type="submit">Speichern</button>
@@ -2489,6 +2503,13 @@ function buchChip(b) {
   const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : ""].filter(Boolean).join(" · ");
   return `<span class="buch-chip ${klasse}" data-isbn="${esc(b.isbn)}" title="${esc(tipp)}">${esc(titel)}</span>`;
 }
+function regalGenreText(r) {
+  const eigene = r.fach_genres.map((g, f) => (g.length ? `Fach ${f + 1}: ${g.join(", ")}` : "")).filter(Boolean);
+  const rest = r.fach_genres.some((g) => !g.length);
+  const teile = [...eigene];
+  if (rest) teile.push((eigene.length ? "sonst " : "") + (r.genres.length ? r.genres.join(", ") : "alle übrigen Bücher"));
+  return esc(teile.join(" · "));
+}
 function zeichneRegale(d) {
   regalDaten = d;
   const anzahl = d.regale.length;
@@ -2497,14 +2518,15 @@ function zeichneRegale(d) {
     const platz = r.faecher * r.kapazitaet;
     const faecher = r.inhalt.map((fach, f) => {
       const n = fach.reduce((s, b) => s + b.anzahl, 0);
-      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${r.kapazitaet}</span></div>
+      const eigene = r.fach_genres[f] || [];
+      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${r.kapazitaet}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}</div>
         <div><div class="balken ${n >= r.kapazitaet ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / r.kapazitaet))}%"></div></div>
         <div class="fach-buecher">${fach.map(buchChip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
     }).join("");
     return `<div class="regal">
       <div class="regal-kopf">
         <div class="grow"><b>${esc(r.name)}</b>
-          <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${r.genres.length ? esc(r.genres.join(", ")) : "alle übrigen Bücher"}</div></div>
+          <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
         <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
         <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
         <button class="btn small secondary" data-bearbeiten="${r.id}">Bearbeiten</button>
@@ -2530,8 +2552,18 @@ function zeichneRegale(d) {
 async function ladeRegale() {
   await versuche(async () => zeichneRegale(await get("regale")));
 }
+// Genre-Chips wirken auf das zuletzt angeklickte Feld (Regal oder ein Fach)
+let genreFeld = null;
+function zeichneFachGenres(werte) {
+  const box = $("#rg-fach-genres");
+  const alt = werte || [...box.querySelectorAll("input")].map((i) => i.value);
+  const anzahl = Math.min(50, Math.max(1, Number($("#rg-faecher").value) || 1));
+  box.innerHTML = Array.from({ length: anzahl }, (_, f) =>
+    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">`).join("");
+  if (genreFeld && !genreFeld.isConnected) genreFeld = $("#rg-genres");
+}
 function genreChips() {
-  const feld = $("#rg-genres");
+  const feld = genreFeld || $("#rg-genres");
   const gewaehlt = feld.value.split(",").map((g) => g.trim().toLowerCase()).filter(Boolean);
   $("#rg-genre-chips").innerHTML = regalDaten.genres.map((g) =>
     `<button type="button" class="chip ${gewaehlt.includes(g.toLowerCase()) ? "active" : ""}" data-genre="${esc(g)}">${esc(g)}</button>`).join("");
@@ -2544,17 +2576,27 @@ function oeffneRegal(r) {
   form.kapazitaet.value = r?.kapazitaet ?? 30;
   form.genres.value = r ? r.genres.join(", ") : "";
   $("#regal-dlg-titel").textContent = r ? "Regal bearbeiten" : "Neues Regal";
+  const fachGenres = (r?.fach_genres || []).map((g) => g.join(", "));
+  zeichneFachGenres(fachGenres);
+  $("#rg-fach-details").open = fachGenres.some(Boolean);
+  genreFeld = $("#rg-genres");
   genreChips();
   $("#regal-dialog").showModal();
   form.name.focus();
 }
 $("#regal-neu").addEventListener("click", () => oeffneRegal(null));
 $("#rg-close").addEventListener("click", () => $("#regal-dialog").close());
-$("#rg-genres").addEventListener("input", genreChips);
+$("#regal-form").addEventListener("focusin", (e) => {
+  if (e.target.id === "rg-genres" || e.target.dataset.fach !== undefined) { genreFeld = e.target; genreChips(); }
+});
+$("#regal-form").addEventListener("input", (e) => {
+  if (e.target === genreFeld) genreChips();
+  if (e.target.id === "rg-faecher") zeichneFachGenres();
+});
 $("#rg-genre-chips").addEventListener("click", (e) => {
   const g = e.target.dataset.genre;
   if (!g) return;
-  const feld = $("#rg-genres");
+  const feld = genreFeld || $("#rg-genres");
   const liste = feld.value.split(",").map((x) => x.trim()).filter(Boolean);
   const pos = liste.findIndex((x) => x.toLowerCase() === g.toLowerCase());
   pos >= 0 ? liste.splice(pos, 1) : liste.push(g);
@@ -2565,7 +2607,8 @@ $("#regal-form").addEventListener("submit", (e) => {
   e.preventDefault();
   versuche(async () => {
     const daten = formDaten(e.target);
-    zeichneRegale(await post("regal_save", { ...daten, id: Number(daten.regal_id) || null }));
+    const fach_genres = [...$("#rg-fach-genres").querySelectorAll("input")].map((i) => i.value);
+    zeichneRegale(await post("regal_save", { ...daten, fach_genres, id: Number(daten.regal_id) || null }));
     $("#regal-dialog").close();
     toast("Regal gespeichert");
   });
