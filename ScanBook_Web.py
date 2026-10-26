@@ -1962,7 +1962,7 @@ td.titel-zelle { min-width: 220px; }
           <div class="full"><label for="nb-autoren">Autor(en), mit Komma getrennt</label><input id="nb-autoren" name="autoren"></div>
           <div><label for="nb-verlag">Verlag</label><input id="nb-verlag" name="verlag"></div>
           <div><label for="nb-erscheinungsjahr">Erscheinungsjahr</label><input id="nb-erscheinungsjahr" name="erscheinungsjahr"></div>
-          <div class="full"><label for="nb-genre">Genre</label><input id="nb-genre" name="genre"></div>
+          <div class="full"><label for="nb-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="nb-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
           <div><label for="nb-serie">Serie (leer = keine)</label><input id="nb-serie" name="serie" list="serien-liste" autocomplete="off"></div>
           <div><label for="nb-band">Band</label><input id="nb-band" name="band" inputmode="numeric" autocomplete="off"></div>
         </div>
@@ -2222,7 +2222,7 @@ td.titel-zelle { min-width: 220px; }
       <div class="full"><label for="ed-autoren">Autor(en), mit Komma getrennt</label><input id="ed-autoren" name="autoren"></div>
       <div><label for="ed-verlag">Verlag</label><input id="ed-verlag" name="verlag"></div>
       <div><label for="ed-erscheinungsjahr">Erscheinungsjahr</label><input id="ed-erscheinungsjahr" name="erscheinungsjahr"></div>
-      <div class="full"><label for="ed-genre">Genre</label><input id="ed-genre" name="genre"></div>
+      <div class="full"><label for="ed-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="ed-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
       <div><label for="ed-serie">Serie (leer = keine)</label><input id="ed-serie" name="serie" list="serien-liste" autocomplete="off"></div>
       <div><label for="ed-band">Band</label><input id="ed-band" name="band" inputmode="numeric" autocomplete="off"></div>
       <div class="full"><label for="ed-beschreibung">Beschreibung</label><textarea id="ed-beschreibung" name="beschreibung" rows="5"></textarea></div>
