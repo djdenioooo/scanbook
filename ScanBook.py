@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.13.3"
+VERSION = "2.14.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -41,6 +41,7 @@ MAX_AUTO_BACKUPS = 14
 BACKUP_ORDNER_EINSTELLUNG = "backup_ordner"  # optionaler zweiter Ordner, z. B. USB-Stick oder OneDrive
 MAX_UPDATE_BACKUPS = 3
 VERSION_EINSTELLUNG = "programm_version"  # zuletzt gestartete Version, für das Backup vor einem Update
+EINRAEUMEN_BESTAETIGEN = "einraeumen_bestaetigen"  # "1": neu erfasste Bücher erst nach Bestätigung als eingeräumt merken
 
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
 GITHUB_REPO = "djdenioooo/scanbook"
@@ -1755,7 +1756,8 @@ def buecher_freigeben(isbns):
 def buch_einraeumen(isbn):
     """Für ein neues Buch: Liefert (Standort-Text, Anzahl nötiger Umstellungen, Grund falls kein Platz).
     Der Platz wird gespeichert, sobald im Regal schon andere Bücher fest eingeräumt sind –
-    beim ersten Einräumen wird erst gespeichert, wenn der ganze Plan übernommen wird."""
+    beim ersten Einräumen wird erst gespeichert, wenn der ganze Plan übernommen wird.
+    Ist „erst nach Bestätigung“ eingeschaltet, bleibt der Platz nur geplant, bis das Buch bestätigt wird."""
     plan = regal_plan()
     if not plan["regale"]:
         return "", 0, None
@@ -1766,7 +1768,8 @@ def buch_einraeumen(isbn):
         grund = next((g for x, g in plan["ohne_platz"] if x["isbn"] == isbn), "voll")
         return "", 0, grund
     regal_id = b["soll"][0]
-    if not b["ist"] and any(x["ist"] and x["ist"][0] == regal_id for x in plan["buecher"].values()):
+    if (not b["ist"] and get_einstellung(EINRAEUMEN_BESTAETIGEN) != "1"
+            and any(x["ist"] and x["ist"][0] == regal_id for x in plan["buecher"].values())):
         with db_connection() as conn:
             conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (*b["soll"], isbn))
         # Nur dieses Buch hat jetzt einen festen Platz – der Plan bleibt sonst gleich und muss nicht neu berechnet werden
