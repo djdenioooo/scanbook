@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.13.2"
+VERSION = "2.13.3"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -1615,8 +1615,14 @@ def regal_plan_berechnen():
         eigene = {g.lower() for g in genres}
         return not eigene or any(g.lower() in eigene for g in b["genres"])
 
+    def rang(genres, b):
+        """Welches Genre des Buchs passt (0 = das zuerst eingetragene), None = keins."""
+        eigene = {g.lower() for g in genres}
+        return next((i for i, g in enumerate(b["genres"]) if g.lower() in eigene), None)
+
     # Bereiche eines Regals: Fächer mit eigenen Genres (gleiche Genres = ein Bereich), danach der Rest
-    # der Fächer mit den Genres des Regals. Ein Buch kommt in den ersten Bereich, dessen Genres passen.
+    # der Fächer mit den Genres des Regals. Ein Buch kommt in den Bereich, der zu seinem zuerst
+    # eingetragenen Genre passt (bei "Krieg, Geschichte" also zu Krieg, sonst zu Geschichte).
     for regal in regale:
         regal["fest"] = [sorted((b for b in alle if b["fest"] and b["regal_id"] == regal["id"] and b["fach"] == f),
                                 key=lambda b: (b["nachname"], natuerlich(b["serie"]), band_sortierwert(b["band"]), natuerlich(b["titel"])))
@@ -1631,10 +1637,13 @@ def regal_plan_berechnen():
         regal["rest"] = {"genres": regal["genres"], "faecher": rest} if rest else None
 
     def bereich_fuer(regal, b):
-        bereich = next((x for x in regal["bereiche"] if passt(x["genres"], b)), None)
-        if bereich is None and regal["rest"] and passt(regal["rest"]["genres"], b):
-            bereich = regal["rest"]
-        return bereich
+        rest = regal["rest"]
+        mit_genres = regal["bereiche"] + ([rest] if rest and rest["genres"] else [])
+        raenge = [(rang(x["genres"], b), nr) for nr, x in enumerate(mit_genres)]
+        treffer = min(((r, nr) for r, nr in raenge if r is not None), default=None)
+        if treffer:
+            return mit_genres[treffer[1]]
+        return rest if rest and not rest["genres"] else None
 
     def nimmt_auf(regal, b):
         return bereich_fuer(regal, b) is not None
@@ -1645,9 +1654,10 @@ def regal_plan_berechnen():
         return bereich is not None and bool(bereich["genres"])
 
     def erstes_regal(b):
-        for nr, regal in enumerate(regale):
-            if genau_passend(regal, b):
-                return nr
+        # Das Regal für das zuerst eingetragene Genre; bei gleichem Genre das vordere Regal
+        passend = [(rang(bereich_fuer(regal, b)["genres"], b), nr) for nr, regal in enumerate(regale) if genau_passend(regal, b)]
+        if passend:
+            return min(passend)[1]
         return next((nr for nr, regal in enumerate(regale) if nimmt_auf(regal, b)), None)
 
     zuordnung = {b["isbn"]: erstes_regal(b) for b in buecher}

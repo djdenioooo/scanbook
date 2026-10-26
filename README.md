@@ -84,6 +84,7 @@ Im Tab „Regale“ (Terminal: Menüpunkt 16) legst du einmal deine Regale an: N
 ScanBook verteilt die Bücher dann selbst:
 
 - Ein Buch kommt in das erste Regal, das eines seiner Genres hat. Mit den Pfeilen legst du fest, welches Regal zuerst dran ist.
+- Hat ein Buch mehrere Genres, bestimmt das zuerst eingetragene den Platz: „Krieg, Geschichte“ kommt ins Krieg-Fach, „Geschichte, Krieg“ zu Geschichte. Gibt es für das erste Genre kein Fach, zählt das nächste. Die Suche findet das Buch unter allen seinen Genres.
 - Innerhalb eines Regals wird nach Genre (in der eingetragenen Reihenfolge) und dann nach Autor sortiert. Bände einer Serie stehen zusammen in der richtigen Reihenfolge.
 - Einzelne Fächer können eigene Genres bekommen (im Regal-Dialog unter „Einzelne Fächer: eigene Genres und Anzahl Bücher“, Terminal: beim Bearbeiten des Regals). Ein solches Fach bekommt genau diese Bücher, z. B. Fach 1 = Fantasy, Fach 2 = Krimi, die übrigen Fächer das, was zum Regal passt. Ist ein Fach voll, kommen seine Bücher in die übrigen Fächer des Regals und danach ins nächste passende Regal. Haben mehrere Fächer dieselben Genres, werden sie gemeinsam gefüllt.
 - Für jedes Fach lässt sich auch eine eigene Anzahl Bücher eintragen (im Regal-Dialog unter „Einzelne Fächer“, Terminal: beim Bearbeiten des Regals), z. B. 45 statt 30 für ein Fach mit schmalen Mangas. Leer = wie das Regal.
