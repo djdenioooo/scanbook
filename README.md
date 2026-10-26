@@ -83,10 +83,20 @@ ScanBook verteilt die Bücher dann selbst:
 
 - Ein Buch kommt in das erste Regal, das eines seiner Genres hat. Mit den Pfeilen legst du fest, welches Regal zuerst dran ist.
 - Innerhalb eines Regals wird nach Genre (in der eingetragenen Reihenfolge) und dann nach Autor sortiert. Bände einer Serie stehen zusammen in der richtigen Reihenfolge.
-- Einzelne Fächer können eigene Genres bekommen (im Regal-Dialog unter „Eigene Genres für einzelne Fächer“, Terminal: beim Bearbeiten des Regals). Ein solches Fach bekommt genau diese Bücher, z. B. Fach 1 = Fantasy, Fach 2 = Krimi, die übrigen Fächer das, was zum Regal passt. Ist ein Fach voll, kommen seine Bücher in die übrigen Fächer des Regals und danach ins nächste passende Regal. Haben mehrere Fächer dieselben Genres, werden sie gemeinsam gefüllt.
+- Einzelne Fächer können eigene Genres bekommen (im Regal-Dialog unter „Einzelne Fächer: eigene Genres und Anzahl Bücher“, Terminal: beim Bearbeiten des Regals). Ein solches Fach bekommt genau diese Bücher, z. B. Fach 1 = Fantasy, Fach 2 = Krimi, die übrigen Fächer das, was zum Regal passt. Ist ein Fach voll, kommen seine Bücher in die übrigen Fächer des Regals und danach ins nächste passende Regal. Haben mehrere Fächer dieselben Genres, werden sie gemeinsam gefüllt.
+- Für jedes Fach lässt sich auch eine eigene Anzahl Bücher eintragen (im Regal-Dialog unter „Einzelne Fächer“, Terminal: beim Bearbeiten des Regals), z. B. 45 statt 30 für ein Fach mit schmalen Mangas. Leer = wie das Regal.
 - Ist ein Regal voll, kommen die übrigen Bücher ins nächste Regal, das ihr Genre (oder alle übrigen Bücher) aufnimmt. Was nirgends hinpasst, steht unter „Ohne Platz“.
 
 Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau und in der Katalogliste (Spalte „Standort“, grau = geplant, noch nicht eingeräumt). Im Katalog lässt sich nach Regal filtern, die Suche findet auch Regalnamen, und der Katalog-Export enthält den Standort.
+
+### Bücher selbst umsortieren
+
+Soll ein Buch an einem bestimmten Platz stehen, stellst du es selbst dorthin. Es bekommt ein 📌 und bleibt in diesem Fach, auch wenn es nach der Sortierung woanders hingehören würde; ScanBook sortiert die übrigen Bücher drumherum und rechnet den Platz mit.
+
+- **Einzelnes Buch:** In der Buchvorschau unter „Standort selbst festlegen“ Regal und Fach wählen, dann „Hierhin stellen“.
+- **Mehrere Bücher:** Im Tab „Regale“ auf „Verschieben“ klicken, die Bücher antippen, unten Regal und Fach wählen und „Hierhin stellen“.
+- **Per Scan direkt am Regal:** „Per Scan einräumen“ (oder „Scannen“ neben einem Fach), Fach wählen und die Bücher scannen, die dort stehen sollen (ISBN oder Mediencode). Terminal: Menüpunkt 16, dann 7.
+- **Wieder automatisch:** löst das 📌, dann sortiert ScanBook das Buch wieder selbst ein (Terminal: Punkt 8).
 
 „Als Liste drucken“ (oben im Tab „Regale“) erzeugt eine Druckseite mit allen Regalen: jedes Regal auf einer eigenen Seite, darin Fach für Fach die Bücher mit Titel, Autor, Genre und Anzahl, dazu ein Kästchen zum Abhaken. Bücher, die noch eingeräumt oder umgestellt werden müssen, sind vermerkt. Mit „Drucken“ neben einem Regal druckst du nur dieses eine.
 

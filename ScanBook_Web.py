@@ -131,6 +131,10 @@ def api_book(params):
             ]
     buch["serie_baende"] = sorted(baende, key=lambda b: (sb.band_sortierwert(b["band"]), b["titel"]))
     buch["exemplare"] = sb.exemplare_von(isbn)
+    plan = sb.regal_plan()
+    b = plan["buecher"].get(isbn) or {}
+    buch["platz"] = {"ist": b.get("ist"), "soll": b.get("soll"), "fest": b.get("fest", False),
+                     "regale": [{"id": r["id"], "name": r["name"], "faecher": r["faecher"]} for r in plan["regale"]]}
     return buch
 
 
@@ -477,7 +481,8 @@ def backups_im_hintergrund():
 def regal_buch(regale, b):
     return {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "serie": b["serie"], "band": b["band"],
             "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
-            "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else ""}
+            "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else "",
+            "fest": b["fest"]}
 
 
 def api_regale(_):
@@ -486,7 +491,7 @@ def api_regale(_):
     return {
         "regale": [
             {"id": r["id"], "name": r["name"], "faecher": r["faecher"], "kapazitaet": r["kapazitaet"], "genres": r["genres"],
-             "fach_genres": r["fach_genres"],
+             "fach_genres": r["fach_genres"], "fach_kapazitaet": r["fach_kapazitaet"], "fach_kap": r["fach_kap"],
              "inhalt": [[regal_buch(regale, b) for b in fach] for fach in r["inhalt"]]}
             for r in regale
         ],
@@ -509,7 +514,9 @@ def api_regal_save(body):
         raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
     fach_genres = body.get("fach_genres")
     fach_genres = [sb.genre_liste(str(g or "")) for g in fach_genres] if isinstance(fach_genres, list) else None
-    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres)
+    fach_kap = body.get("fach_kapazitaet")
+    fach_kap = [positive_zahl(k, 0) for k in fach_kap] if isinstance(fach_kap, list) else None
+    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres, fach_kap)
     return api_regale(None)
 
 
@@ -526,6 +533,54 @@ def api_regal_move(body):
 def api_regale_uebernehmen(_):
     sb.plan_uebernehmen()
     return api_regale(None)
+
+
+def isbn_liste(body):
+    isbns = body.get("isbns")
+    if not isinstance(isbns, list) or not isbns:
+        raise ApiFehler("Bitte mindestens ein Buch auswählen.")
+    return [str(i) for i in isbns]
+
+
+def fach_aus(body):
+    regal_id, fach = body.get("regal_id"), body.get("fach")
+    if not isinstance(regal_id, int) or not isinstance(fach, int):
+        raise ApiFehler("Bitte Regal und Fach auswählen.")
+    return regal_id, fach
+
+
+def api_buecher_festlegen(body):
+    """Bücher selbst in ein Fach stellen – sie bleiben dort, auch wenn der Plan sie anders sortieren würde."""
+    try:
+        sb.buecher_festlegen(isbn_liste(body), *fach_aus(body))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return api_regale(None)
+
+
+def api_buecher_freigeben(body):
+    sb.buecher_freigeben(isbn_liste(body))
+    return api_regale(None)
+
+
+def api_fach_scan(body):
+    """Fach einräumen per Scan: ISBN oder Mediencode eines Buchs, das jetzt in diesem Fach steht."""
+    regal_id, fach = fach_aus(body)
+    treffer = sb.code_aufloesen(text(body, "code"))
+    if treffer and treffer[0] == "schueler":
+        raise ApiFehler("Das ist ein Schülerausweis, kein Buch.")
+    if not treffer:
+        raise ApiFehler("Unbekannter Code – bitte ISBN oder Mediencode scannen.")
+    isbn = treffer[1]
+    buch = sb.lade_buch(isbn)
+    if not buch:
+        raise ApiFehler("Dieses Buch ist noch nicht im Katalog. Erfasse es zuerst unter „Erfassen“.", 404)
+    vorher = sb.standort_von(isbn)[0]
+    try:
+        sb.buecher_festlegen([isbn], regal_id, fach)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return {"isbn": isbn, "titel": buch["titel"], "vorher": vorher, "jetzt": sb.standort_von(isbn)[0]}
 
 
 # --- PROGRAMM-UPDATE ---
@@ -878,7 +933,7 @@ def druck_regale(params):
             n = sum(b["anzahl"] for b in fach)
             gesamt += n
             genres = r["fach_genres"][nr - 1] or r["genres"]
-            zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["kapazitaet"]} Bücher'
+            zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["fach_kap"][nr - 1]} Bücher'
                           f'{" · " + html.escape(", ".join(genres)) if genres else ""}</span></td></tr>')
             zeilen += [zeile(b) for b in fach] or ['<tr class="leer"><td></td><td colspan="4">leer</td></tr>']
         seiten.append(f"""<h1>{html.escape(r["name"])}</h1>
@@ -935,6 +990,9 @@ POST_ROUTEN = {
     "regal_delete": api_regal_delete,
     "regal_move": api_regal_move,
     "regale_uebernehmen": api_regale_uebernehmen,
+    "buecher_festlegen": api_buecher_festlegen,
+    "buecher_freigeben": api_buecher_freigeben,
+    "fach_scan": api_fach_scan,
     "update_install": api_update_install,
     "schueler_save": api_schueler_save,
     "schueler_delete": api_schueler_delete,
@@ -1179,13 +1237,14 @@ section.active { display: block; animation: rein .25s ease-out; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row > .grow { flex: 1; min-width: 180px; }
 label { display: block; font-size: 13px; font-weight: 400; color: var(--muted); margin-bottom: 5px; }
-input, textarea {
+input, textarea, select {
   width: 100%; font: inherit; color: var(--text); background: var(--fill);
   border: 0; border-radius: 10px; padding: 9px 12px; transition: box-shadow .15s;
 }
 input::placeholder, textarea::placeholder { color: var(--muted); }
 textarea { resize: vertical; min-height: 90px; line-height: 1.45; }
-input:focus, textarea:focus { outline: none; box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 40%, transparent); }
+select { width: auto; padding-right: 28px; cursor: pointer; }
+input:focus, textarea:focus, select:focus { outline: none; box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 40%, transparent); }
 input.big { font-size: 20px; padding: 13px 16px; border-radius: 12px; }
 input.missing { background: var(--warn-soft); box-shadow: inset 0 0 0 1px var(--warn); }
 .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 14px; }
@@ -1331,12 +1390,24 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .fach-nr .fach-genre { display: block; font-weight: 500; font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
 #rg-fach-details { margin-top: 12px; }
 #rg-fach-details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
-.fach-genres { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; }
+.fach-genres { display: grid; grid-template-columns: auto 1fr 84px; gap: 6px 10px; align-items: center; }
+.fach-genres .kopf { font-size: 12px; font-weight: 400; color: var(--muted); }
 .fach-genres span { font-size: 14px; font-weight: 600; white-space: nowrap; }
 .buch-chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 0; background: var(--fill); cursor: pointer; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .buch-chip:hover { filter: brightness(.95); }
 .buch-chip.neu { background: var(--ok-soft); color: var(--ok); }
 .buch-chip.umstellen { background: var(--warn-soft); color: var(--warn); }
+.buch-chip.fest::before { content: "📌 "; }
+.fach > * { min-width: 0; }  /* lange Titel nicht über den Rand schieben (schmale Fenster) */
+.fach-buecher .buch-chip { max-width: min(260px, 100%); }
+.waehlen .buch-chip { box-shadow: inset 0 0 0 1px var(--border); }
+.waehlen .buch-chip.gewaehlt { background: var(--accent); color: #fff; box-shadow: none; }
+.fach-nr .fach-scan { margin-top: 6px; }
+.auswahl-leiste { position: sticky; bottom: 16px; z-index: 5; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-top: 14px; padding: 10px 14px; border-radius: 14px; background: var(--surface); box-shadow: 0 6px 24px rgba(0, 0, 0, .18), 0 0 0 .5px var(--border); }
+.auswahl-leiste b { margin-right: auto; }
+@media (max-width: 860px) { .auswahl-leiste { bottom: calc(72px + env(safe-area-inset-bottom)); } }
+.fach-wahl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .legende { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 6px; }
 .legende .buch-chip { cursor: default; }
 .aufgaben li { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
@@ -1535,11 +1606,20 @@ td.titel-zelle { min-width: 220px; }
       <div class="row">
         <h2 class="grow" style="margin:0">Regale</h2>
         <button class="btn secondary" type="button" id="regale-drucken">Als Liste drucken</button>
+        <button class="btn secondary" type="button" id="regal-waehlen" title="Bücher auswählen und selbst in ein anderes Fach stellen">Verschieben</button>
+        <button class="btn secondary" type="button" id="regal-scan" title="Fach wählen und die Bücher scannen, die dort stehen sollen">Per Scan einräumen</button>
         <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
       </div>
       <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
-      <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span></div>
+      <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span></div>
       <div id="regale-liste"></div>
+      <div class="auswahl-leiste hidden" id="auswahl-leiste">
+        <b id="auswahl-zahl">Bücher antippen, um sie auszuwählen</b>
+        <span class="fach-wahl"><select id="aw-regal" aria-label="Regal"></select><select id="aw-fach" aria-label="Fach"></select></span>
+        <button class="btn small" type="button" id="aw-verschieben">Hierhin stellen</button>
+        <button class="btn small secondary" type="button" id="aw-freigeben" title="ScanBook sortiert diese Bücher wieder selbst ein">Wieder automatisch</button>
+        <button class="btn small secondary" type="button" id="aw-ende">Fertig</button>
+      </div>
     </div>
     <div class="card hidden" id="ohne-platz">
       <h2>⚠️ Ohne Platz</h2>
@@ -1732,6 +1812,15 @@ td.titel-zelle { min-width: 220px; }
     <div class="beschreibung" id="pv-beschreibung"></div>
     <div class="vorschau-block hidden" id="pv-baende-block"><h3 id="pv-baende-titel"></h3><ul class="baende" id="pv-baende"></ul></div>
     <div class="vorschau-block hidden" id="pv-ausleihen-block"><h3>Gerade ausgeliehen</h3><ul class="log" id="pv-ausleihen"></ul></div>
+    <div class="vorschau-block hidden" id="pv-platz-block">
+      <h3>Standort selbst festlegen</h3>
+      <div class="code-zeile fach-wahl">
+        <select id="pv-regal" aria-label="Regal"></select><select id="pv-fach" aria-label="Fach"></select>
+        <button class="btn small" type="button" id="pv-festlegen">Hierhin stellen</button>
+        <button class="btn small secondary" type="button" id="pv-freigeben">Wieder automatisch</button>
+      </div>
+      <p class="hint" id="pv-platz-hint"></p>
+    </div>
     <div class="vorschau-block" id="pv-codes-block">
       <h3 id="pv-codes-titel">Mediencodes</h3>
       <ul class="log codes" id="pv-codes"></ul>
@@ -1750,6 +1839,18 @@ td.titel-zelle { min-width: 220px; }
   </div>
 </dialog>
 
+<!-- FACH PER SCAN EINRÄUMEN -->
+<dialog id="fach-scan-dialog">
+  <form class="dlg-body" id="fs-form">
+    <h2>Fach per Scan einräumen</h2>
+    <p class="hint">Fach wählen und dann die Bücher scannen, die dort stehen sollen (ISBN oder Mediencode). Sie werden fest in dieses Fach gestellt 📌 – ScanBook sortiert die übrigen Bücher drumherum.</p>
+    <div class="fach-wahl"><select id="fs-regal" aria-label="Regal"></select><select id="fs-fach" aria-label="Fach"></select></div>
+    <input class="big" id="fs-code" placeholder="Buch scannen …" autocomplete="off" style="margin-top:12px">
+    <ul class="log" id="fs-log"></ul>
+    <div class="actions"><button class="btn secondary" type="button" id="fs-close" style="margin-left:auto">Fertig</button></div>
+  </form>
+</dialog>
+
 <!-- REGAL-DIALOG -->
 <dialog id="regal-dialog">
   <form id="regal-form" class="dlg-body">
@@ -1763,8 +1864,8 @@ td.titel-zelle { min-width: 220px; }
       <div class="full"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
     </div>
     <details id="rg-fach-details">
-      <summary>Eigene Genres für einzelne Fächer</summary>
-      <p class="hint">Leer = das Fach nimmt, was zum Regal passt. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer.</p>
+      <summary>Einzelne Fächer: eigene Genres und Anzahl Bücher</summary>
+      <p class="hint">Leer = wie das Regal. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer. Bei „Bücher“ kannst du für schmale Bücher wie Mangas mehr eintragen (oder für dicke weniger).</p>
       <div class="fach-genres" id="rg-fach-genres"></div>
     </details>
     <p class="hint" style="margin:10px 0 0">Genre antippen, um es ins ausgewählte Feld zu übernehmen:</p>
@@ -2108,7 +2209,7 @@ $("#new-book-form").addEventListener("submit", (e) => {
     if (wartenderCode) ladeCodesStatus();
     const platz = b.standort_soll || b.standort;
     logEintrag(`✨ <b>${esc(b.titel)}</b> neu hinzugefügt (${b.anzahl_gesamt}×)${platz ? ` · 📍 ${esc(platz)}` : ""}`
-      + (b.umstellen ? ` · ↪️ ${b.umstellen} Buch${b.umstellen === 1 ? "" : "er"} umstellen (Tab „Regale“)` : ""));
+      + (b.umstellen ? ` · ↪️ ${b.umstellen} ${b.umstellen === 1 ? "Buch" : "Bücher"} umstellen (Tab „Regale“)` : ""));
     zeigePlatz(b);
     schliesseNeuesBuch();
     if (b.serie) katalogHolen().catch(() => {});
@@ -2407,7 +2508,7 @@ async function oeffneVorschau(isbn) {
     $("#pv-autor").textContent = leer(b.autoren) ? "Autor unbekannt" : b.autoren;
     $("#pv-bestand").innerHTML = `<span class="badge ${b.anzahl_verfuegbar > 0 ? "ok" : "danger"}">${b.anzahl_verfuegbar} von ${b.anzahl_gesamt} verfügbar</span>`;
     const daten = [
-      ["Standort", b.standort ? (b.standort_soll ? `${b.standort} (umstellen nach ${b.standort_soll})` : b.standort)
+      ["Standort", b.standort ? (b.standort_soll ? `${b.standort} (umstellen nach ${b.standort_soll})` : b.standort + (b.platz.fest ? " 📌" : ""))
         : (b.standort_soll ? `${b.standort_soll} (noch nicht eingeräumt)` : "")],
       ["Serie", serieText(b.serie, b.band)], ["Genre", b.genre], ["Verlag", b.verlag],
       ["Erschienen", b.erscheinungsjahr], ["ISBN", isbn],
@@ -2432,6 +2533,7 @@ async function oeffneVorschau(isbn) {
     $("#pv-ausleihen").innerHTML = b.ausleihen.map((a) =>
       `<li><span>${esc(a.name)}</span>${a.exemplar ? codeHtml(a.exemplar) : ""}<span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
     zeigeCodes(b);
+    zeigePlatz(b.platz);
 
     const dlg = $("#preview-dialog");
     if (!dlg.open) dlg.showModal();
@@ -2439,6 +2541,31 @@ async function oeffneVorschau(isbn) {
   });
 }
 $("#pv-close").addEventListener("click", () => $("#preview-dialog").close());
+
+function zeigePlatz(p) {
+  $("#pv-platz-block").classList.toggle("hidden", !p.regale.length);
+  if (!p.regale.length) return;
+  fachAuswahl($("#pv-regal"), $("#pv-fach"), p.regale, p.ist || p.soll || [p.regale[0].id, 1]);
+  $("#pv-freigeben").classList.toggle("hidden", !p.fest);
+  $("#pv-platz-hint").textContent = p.fest
+    ? "📌 Selbst festgelegt: Das Buch bleibt in diesem Fach. „Wieder automatisch“ lässt ScanBook es wieder selbst einsortieren."
+    : "Wähle ein Fach, um das Buch selbst dorthin zu stellen. ScanBook lässt es dann dort stehen und sortiert die übrigen Bücher drumherum.";
+}
+async function platzGeaendert(text) {
+  toast(text);
+  await oeffneVorschau(aktuelleIsbn);
+  if (katalogGeladen) ladeKatalog();
+  if ($("#tab-regale").classList.contains("active")) ladeRegale();
+}
+$("#pv-festlegen").addEventListener("click", () => versuche(async () => {
+  const ziel = gewaehltesFach($("#pv-regal"), $("#pv-fach"));
+  await post("buecher_festlegen", { isbns: [aktuelleIsbn], ...ziel });
+  await platzGeaendert(`📌 Steht jetzt in ${$("#pv-regal").selectedOptions[0].text}, Fach ${ziel.fach}`);
+}));
+$("#pv-freigeben").addEventListener("click", () => versuche(async () => {
+  await post("buecher_freigeben", { isbns: [aktuelleIsbn] });
+  await platzGeaendert("Wird wieder automatisch einsortiert");
+}));
 
 function zeigeCodes(b) {
   const codes = b.exemplare;
@@ -2558,11 +2685,28 @@ $("#ed-delete").addEventListener("click", () => {
 
 // --- Regale ---
 let regalDaten = { regale: [], genres: [] };
+let waehlen = false;
+const auswahl = new Set();
+// Regal- und Fach-Auswahl (für Vorschau, Verschieben und Einräumen per Scan)
+function fachAuswahl(regalSel, fachSel, regale, wahl) {
+  const alt = wahl || [Number(regalSel.value), Number(fachSel.value)];
+  regalSel.innerHTML = regale.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join("");
+  if (regale.some((r) => r.id === alt[0])) regalSel.value = alt[0];
+  const fachZeigen = (fach) => {
+    const r = regale.find((x) => x.id === Number(regalSel.value));
+    fachSel.innerHTML = r ? Array.from({ length: r.faecher }, (_, f) => `<option value="${f + 1}">Fach ${f + 1}</option>`).join("") : "";
+    if (fach && r && fach <= r.faecher) fachSel.value = fach;
+  };
+  regalSel.onchange = () => fachZeigen(1);
+  fachZeigen(alt[1]);
+}
+const gewaehltesFach = (regalSel, fachSel) => ({ regal_id: Number(regalSel.value), fach: Number(fachSel.value) });
 function buchChip(b) {
   const mitSerie = b.serie && b.band && !b.titel.toLowerCase().includes(b.serie.toLowerCase());
   const titel = (mitSerie ? `${b.serie} ${b.band}: ` : "") + b.titel + (b.anzahl > 1 ? ` (${b.anzahl}×)` : "");
-  const klasse = b.neu ? "neu" : b.von ? "umstellen" : "";
-  const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : ""].filter(Boolean).join(" · ");
+  const klasse = (b.neu ? "neu" : b.von ? "umstellen" : "") + (b.fest ? " fest" : "") + (auswahl.has(b.isbn) ? " gewaehlt" : "");
+  const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : "",
+    b.fest ? "selbst festgelegt" : ""].filter(Boolean).join(" · ");
   return `<span class="buch-chip ${klasse}" data-isbn="${esc(b.isbn)}" title="${esc(tipp)}">${esc(titel)}</span>`;
 }
 function regalGenreText(r) {
@@ -2576,20 +2720,32 @@ function zeichneRegale(d) {
   regalDaten = d;
   const anzahl = d.regale.length;
   $("#regale-drucken").disabled = !anzahl;
+  $("#regal-waehlen").disabled = $("#regal-scan").disabled = !anzahl;
+  if (!anzahl) waehlen = false;
+  $("#regale-liste").classList.toggle("waehlen", waehlen);
+  $("#auswahl-leiste").classList.toggle("hidden", !waehlen);
+  if (waehlen) {
+    const alle = new Set(d.regale.flatMap((r) => r.inhalt.flat().map((b) => b.isbn)));
+    for (const isbn of auswahl) if (!alle.has(isbn)) auswahl.delete(isbn);
+    fachAuswahl($("#aw-regal"), $("#aw-fach"), d.regale);
+    zeigeAuswahl();
+  }
   $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
     const belegt = r.inhalt.flat().reduce((n, b) => n + b.anzahl, 0);
-    const platz = r.faecher * r.kapazitaet;
+    const platz = r.fach_kap.reduce((a, k) => a + k, 0);
     const faecher = r.inhalt.map((fach, f) => {
       const n = fach.reduce((s, b) => s + b.anzahl, 0);
       const eigene = r.fach_genres[f] || [];
-      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${r.kapazitaet}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}</div>
-        <div><div class="balken ${n >= r.kapazitaet ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / r.kapazitaet))}%"></div></div>
+      const kap = r.fach_kap[f];
+      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}
+          <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button></div>
+        <div><div class="balken ${n >= kap ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / kap))}%"></div></div>
         <div class="fach-buecher">${fach.map(buchChip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
     }).join("");
     return `<div class="regal">
       <div class="regal-kopf">
         <div class="grow"><b>${esc(r.name)}</b>
-          <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
+          <div class="sub">${r.faecher} Fächer × ${r.fach_kapazitaet.some(Boolean) ? `${r.kapazitaet} Bücher (einzelne Fächer anders)` : `${r.kapazitaet} Bücher`} · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
         <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
         <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
         <button class="btn small secondary" data-drucken="${r.id}" title="Dieses Regal als Liste drucken">Drucken</button>
@@ -2603,8 +2759,8 @@ function zeichneRegale(d) {
   const zuTun = d.umstellen.length + d.einraeumen;
   $("#regal-aufgaben").classList.toggle("hidden", !zuTun);
   const teile = [];
-  if (d.einraeumen) teile.push(`${d.einraeumen} Buch${d.einraeumen === 1 ? "" : "er"} noch einräumen (grün markiert)`);
-  if (d.umstellen.length) teile.push(`${d.umstellen.length} Buch${d.umstellen.length === 1 ? "" : "er"} umstellen (gelb markiert)`);
+  if (d.einraeumen) teile.push(`${d.einraeumen} ${d.einraeumen === 1 ? "Buch" : "Bücher"} noch einräumen (grün markiert)`);
+  if (d.umstellen.length) teile.push(`${d.umstellen.length} ${d.umstellen.length === 1 ? "Buch" : "Bücher"} umstellen (gelb markiert)`);
   $("#regal-aufgaben-text").textContent = teile.join(", ") + ". Wenn alles so steht wie unten angezeigt, klicke auf „Erledigt“. Neue Bücher werden danach passend dazu einsortiert.";
   $("#regal-umstellen").innerHTML = d.umstellen.map((b) =>
     `<li>↪️ <b>${esc(b.titel)}</b><span class="pfad">${esc(b.von)} → ${esc(b.nach)}</span></li>`).join("");
@@ -2618,12 +2774,15 @@ async function ladeRegale() {
 }
 // Genre-Chips wirken auf das zuletzt angeklickte Feld (Regal oder ein Fach)
 let genreFeld = null;
-function zeichneFachGenres(werte) {
+function zeichneFachGenres(werte, kapWerte) {
   const box = $("#rg-fach-genres");
-  const alt = werte || [...box.querySelectorAll("input")].map((i) => i.value);
+  const alt = werte || [...box.querySelectorAll("input[data-fach]")].map((i) => i.value);
+  const altKap = kapWerte || [...box.querySelectorAll("input[data-kap]")].map((i) => i.value);
   const anzahl = Math.min(50, Math.max(1, Number($("#rg-faecher").value) || 1));
-  box.innerHTML = Array.from({ length: anzahl }, (_, f) =>
-    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">`).join("");
+  const standard = Number($("#rg-kapazitaet").value) || "";
+  box.innerHTML = `<span></span><span class="kopf">Genres</span><span class="kopf">Bücher</span>` + Array.from({ length: anzahl }, (_, f) =>
+    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">
+     <input data-kap="${f}" type="number" min="1" placeholder="${standard}" aria-label="Bücher in Fach ${f + 1}" value="${esc(altKap[f] || "")}">`).join("");
   if (genreFeld && !genreFeld.isConnected) genreFeld = $("#rg-genres");
 }
 function genreChips() {
@@ -2641,8 +2800,9 @@ function oeffneRegal(r) {
   form.genres.value = r ? r.genres.join(", ") : "";
   $("#regal-dlg-titel").textContent = r ? "Regal bearbeiten" : "Neues Regal";
   const fachGenres = (r?.fach_genres || []).map((g) => g.join(", "));
-  zeichneFachGenres(fachGenres);
-  $("#rg-fach-details").open = fachGenres.some(Boolean);
+  const fachKap = (r?.fach_kapazitaet || []).map((k) => k || "");
+  zeichneFachGenres(fachGenres, fachKap);
+  $("#rg-fach-details").open = fachGenres.some(Boolean) || fachKap.some(Boolean);
   genreFeld = $("#rg-genres");
   genreChips();
   $("#regal-dialog").showModal();
@@ -2656,7 +2816,7 @@ $("#regal-form").addEventListener("focusin", (e) => {
 });
 $("#regal-form").addEventListener("input", (e) => {
   if (e.target === genreFeld) genreChips();
-  if (e.target.id === "rg-faecher") zeichneFachGenres();
+  if (e.target.id === "rg-faecher" || e.target.id === "rg-kapazitaet") zeichneFachGenres();
 });
 $("#rg-genre-chips").addEventListener("click", (e) => {
   const g = e.target.dataset.genre;
@@ -2672,15 +2832,77 @@ $("#regal-form").addEventListener("submit", (e) => {
   e.preventDefault();
   versuche(async () => {
     const daten = formDaten(e.target);
-    const fach_genres = [...$("#rg-fach-genres").querySelectorAll("input")].map((i) => i.value);
-    zeichneRegale(await post("regal_save", { ...daten, fach_genres, id: Number(daten.regal_id) || null }));
+    const fach_genres = [...$("#rg-fach-genres").querySelectorAll("input[data-fach]")].map((i) => i.value);
+    // Gleich viel wie das Regal = keine eigene Anzahl
+    const fach_kapazitaet = [...$("#rg-fach-genres").querySelectorAll("input[data-kap]")]
+      .map((i) => (Number(i.value) === Number(daten.kapazitaet) ? 0 : Number(i.value) || 0));
+    zeichneRegale(await post("regal_save", { ...daten, fach_genres, fach_kapazitaet, id: Number(daten.regal_id) || null }));
     $("#regal-dialog").close();
     toast("Regal gespeichert");
   });
 });
+function zeigeAuswahl() {
+  const n = auswahl.size;
+  $("#auswahl-zahl").textContent = n ? `${n} ${n === 1 ? "Buch" : "Bücher"} ausgewählt` : "Bücher antippen, um sie auszuwählen";
+  $("#aw-verschieben").disabled = $("#aw-freigeben").disabled = !n;
+}
+$("#regal-waehlen").addEventListener("click", () => {
+  waehlen = !waehlen;
+  auswahl.clear();
+  zeichneRegale(regalDaten);
+  if (waehlen) $("#auswahl-leiste").scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+$("#aw-ende").addEventListener("click", () => { waehlen = false; auswahl.clear(); zeichneRegale(regalDaten); });
+$("#aw-verschieben").addEventListener("click", () => versuche(async () => {
+  const n = auswahl.size;
+  const ziel = gewaehltesFach($("#aw-regal"), $("#aw-fach"));
+  const d = await post("buecher_festlegen", { isbns: [...auswahl], ...ziel });
+  auswahl.clear();
+  zeichneRegale(d);
+  toast(`${n} ${n === 1 ? "Buch" : "Bücher"} nach ${$("#aw-regal").selectedOptions[0].text}, Fach ${ziel.fach} gestellt`);
+}));
+$("#aw-freigeben").addEventListener("click", () => versuche(async () => {
+  const n = auswahl.size;
+  const d = await post("buecher_freigeben", { isbns: [...auswahl] });
+  auswahl.clear();
+  zeichneRegale(d);
+  toast(`${n} ${n === 1 ? "Buch wird" : "Bücher werden"} wieder automatisch einsortiert`);
+}));
+
+// Fach per Scan einräumen
+function oeffneFachScan(regalId, fach) {
+  fachAuswahl($("#fs-regal"), $("#fs-fach"), regalDaten.regale, regalId ? [regalId, fach] : null);
+  $("#fs-log").innerHTML = "";
+  $("#fach-scan-dialog").showModal();
+  $("#fs-code").focus();
+}
+$("#regal-scan").addEventListener("click", () => oeffneFachScan());
+$("#fs-close").addEventListener("click", () => $("#fach-scan-dialog").close());
+$("#fach-scan-dialog").addEventListener("close", () => ladeRegale());
+$("#fs-fach").addEventListener("change", () => $("#fs-code").focus());
+$("#fs-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const feld = $("#fs-code");
+  const code = feld.value.trim();
+  feld.value = "";
+  feld.focus();
+  if (!code) return;
+  versuche(async () => {
+    const r = await post("fach_scan", { code, ...gewaehltesFach($("#fs-regal"), $("#fs-fach")) });
+    const von = r.vorher && r.vorher !== r.jetzt ? ` <span class="time">vorher ${esc(r.vorher)}</span>` : "";
+    $("#fs-log").insertAdjacentHTML("afterbegin", `<li><span>📌 <b>${esc(r.titel)}</b> → ${esc(r.jetzt)}</span>${von}</li>`);
+  });
+});
+
 $("#regale-liste").addEventListener("click", (e) => {
   const d = e.target.dataset;
+  if (d.isbn && waehlen) {
+    auswahl.has(d.isbn) ? auswahl.delete(d.isbn) : auswahl.add(d.isbn);
+    e.target.classList.toggle("gewaehlt", auswahl.has(d.isbn));
+    return zeigeAuswahl();
+  }
   if (d.isbn) return oeffneVorschau(d.isbn);
+  if (d.scanRegal) return oeffneFachScan(Number(d.scanRegal), Number(d.scanFach));
   if (d.drucken) return drucken("regale", { regal: d.drucken });
   if (d.bearbeiten) return oeffneRegal(regalDaten.regale.find((r) => r.id === Number(d.bearbeiten)));
   if (d.hoch || d.runter) return versuche(async () =>
