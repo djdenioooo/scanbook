@@ -2533,7 +2533,7 @@ async function oeffneVorschau(isbn) {
     $("#pv-ausleihen").innerHTML = b.ausleihen.map((a) =>
       `<li><span>${esc(a.name)}</span>${a.exemplar ? codeHtml(a.exemplar) : ""}<span class="time">bis ${deDatum(a.bis)}</span>${statusBadge(a.tage)}</li>`).join("");
     zeigeCodes(b);
-    zeigePlatz(b.platz);
+    zeigeVorschauPlatz(b.platz);
 
     const dlg = $("#preview-dialog");
     if (!dlg.open) dlg.showModal();
@@ -2542,7 +2542,7 @@ async function oeffneVorschau(isbn) {
 }
 $("#pv-close").addEventListener("click", () => $("#preview-dialog").close());
 
-function zeigePlatz(p) {
+function zeigeVorschauPlatz(p) {
   $("#pv-platz-block").classList.toggle("hidden", !p.regale.length);
   if (!p.regale.length) return;
   fachAuswahl($("#pv-regal"), $("#pv-fach"), p.regale, p.ist || p.soll || [p.regale[0].id, 1]);
