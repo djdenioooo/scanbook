@@ -486,7 +486,7 @@ def regal_buch(regale, b):
     return {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "serie": b["serie"], "band": b["band"],
             "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
             "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else "",
-            "fest": b["fest"]}
+            "fest": b["fest"], "nach": sb.standort_text(regale, b["soll"])}
 
 
 def api_regale(_):
@@ -499,7 +499,7 @@ def api_regale(_):
              "inhalt": [[regal_buch(regale, b) for b in fach] for fach in r["inhalt"]]}
             for r in regale
         ],
-        "umstellen": [dict(regal_buch(regale, b), nach=sb.standort_text(regale, b["soll"])) for b in sb.umstellungen(plan)],
+        "umstellen": [regal_buch(regale, b) for b in sb.umstellungen(plan)],
         "einraeumen": len(sb.noch_einzuraeumen(plan)),
         "ohne_platz": [dict(regal_buch(regale, b), grund=grund) for b, grund in plan["ohne_platz"]],
         "genres": sb.alle_genres(),
@@ -536,6 +536,12 @@ def api_regal_move(body):
 
 def api_regale_uebernehmen(_):
     sb.plan_uebernehmen()
+    return api_regale(None)
+
+
+def api_buecher_eingeraeumt(body):
+    """Einzelne Bücher als eingeräumt bzw. umgestellt bestätigen."""
+    sb.buecher_eingeraeumt(isbn_liste(body))
     return api_regale(None)
 
 
@@ -1292,6 +1298,7 @@ POST_ROUTEN = {
     "regal_delete": api_regal_delete,
     "regal_move": api_regal_move,
     "regale_uebernehmen": api_regale_uebernehmen,
+    "buecher_eingeraeumt": api_buecher_eingeraeumt,
     "buecher_festlegen": api_buecher_festlegen,
     "buecher_freigeben": api_buecher_freigeben,
     "fach_scan": api_fach_scan,
@@ -2018,7 +2025,7 @@ td.titel-zelle { min-width: 220px; }
         <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
       </div>
       <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
-      <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span></div>
+      <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span><span>Grüne und gelbe Bücher antippen, sobald sie an ihrem Platz stehen.</span></div>
       <div id="regale-liste"></div>
       <div class="auswahl-leiste hidden" id="auswahl-leiste">
         <b id="auswahl-zahl">Bücher antippen, um sie auszuwählen</b>
@@ -2281,6 +2288,19 @@ td.titel-zelle { min-width: 220px; }
     <ul class="log" id="fs-log"></ul>
     <div class="actions"><button class="btn secondary" type="button" id="fs-close" style="margin-left:auto">Fertig</button></div>
   </form>
+</dialog>
+
+<!-- EINGERÄUMT BESTÄTIGEN -->
+<dialog id="eingeraeumt-dialog">
+  <div class="dlg-body">
+    <h2 id="ei-titel"></h2>
+    <p id="ei-text"></p>
+    <div class="actions">
+      <button class="btn" type="button" id="ei-ja"></button>
+      <button class="btn secondary" type="button" id="ei-ansehen">Buch ansehen</button>
+      <button class="btn secondary" type="button" id="ei-abbrechen" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- REGAL-DIALOG -->
@@ -3278,9 +3298,9 @@ function zeichneRegale(d) {
   const teile = [];
   if (d.einraeumen) teile.push(`${d.einraeumen} ${d.einraeumen === 1 ? "Buch" : "Bücher"} noch einräumen (grün markiert)`);
   if (d.umstellen.length) teile.push(`${d.umstellen.length} ${d.umstellen.length === 1 ? "Buch" : "Bücher"} umstellen (gelb markiert)`);
-  $("#regal-aufgaben-text").textContent = teile.join(", ") + ". Wenn alles so steht wie unten angezeigt, klicke auf „Erledigt“. Neue Bücher werden danach passend dazu einsortiert.";
+  $("#regal-aufgaben-text").textContent = teile.join(", ") + ". Tippe ein grünes oder gelbes Buch an, sobald es an seinem Platz steht – oder klicke auf „Erledigt“, wenn alles so steht wie unten angezeigt. Neue Bücher werden danach passend dazu einsortiert.";
   $("#regal-umstellen").innerHTML = d.umstellen.map((b) =>
-    `<li>↪️ <b>${esc(b.titel)}</b><span class="pfad">${esc(b.von)} → ${esc(b.nach)}</span></li>`).join("");
+    `<li data-isbn="${esc(b.isbn)}" style="cursor:pointer" title="Antippen, wenn umgestellt">↪️ <b>${esc(b.titel)}</b><span class="pfad">${esc(b.von)} → ${esc(b.nach)}</span></li>`).join("");
 
   $("#ohne-platz").classList.toggle("hidden", !d.ohne_platz.length);
   $("#ohne-platz-liste").innerHTML = d.ohne_platz.map((b) =>
@@ -3418,7 +3438,7 @@ $("#regale-liste").addEventListener("click", (e) => {
     e.target.classList.toggle("gewaehlt", auswahl.has(d.isbn));
     return zeigeAuswahl();
   }
-  if (d.isbn) return oeffneVorschau(d.isbn);
+  if (d.isbn) return e.target.matches(".neu, .umstellen") ? fragEingeraeumt(d.isbn) : oeffneVorschau(d.isbn);
   if (d.scanRegal) return oeffneFachScan(Number(d.scanRegal), Number(d.scanFach));
   if (d.drucken) return drucken("regale", { regal: d.drucken });
   if (d.bearbeiten) return oeffneRegal(regalDaten.regale.find((r) => r.id === Number(d.bearbeiten)));
@@ -3433,6 +3453,32 @@ $("#regale-liste").addEventListener("click", (e) => {
 $("#regale-liste").addEventListener("toggle", (e) => {
   if (e.target.dataset.regal) speicherSchreiben("regalOffen" + e.target.dataset.regal, e.target.open ? "1" : "0");
 }, true);
+// Grünes/gelbes Buch antippen: bestätigen, dass es jetzt an seinem Platz steht
+let eiIsbn = null;
+function fragEingeraeumt(isbn) {
+  const b = regalDaten.regale.flatMap((r) => r.inhalt.flat()).find((x) => x.isbn === isbn);
+  if (!b) return oeffneVorschau(isbn);
+  eiIsbn = isbn;
+  $("#ei-titel").textContent = b.neu ? "Eingeräumt?" : "Umgestellt?";
+  $("#ei-text").innerHTML = b.neu
+    ? `Hast du <b>${esc(b.titel)}</b> in <b>${esc(b.nach)}</b> gestellt?`
+    : `Hast du <b>${esc(b.titel)}</b> von ${esc(b.von)} nach <b>${esc(b.nach)}</b> umgestellt?`;
+  $("#ei-ja").textContent = b.neu ? "Ja, steht drin" : "Ja, umgestellt";
+  $("#eingeraeumt-dialog").showModal();
+  $("#ei-ja").focus();
+}
+$("#ei-abbrechen").addEventListener("click", () => $("#eingeraeumt-dialog").close());
+$("#ei-ansehen").addEventListener("click", () => { $("#eingeraeumt-dialog").close(); oeffneVorschau(eiIsbn); });
+$("#ei-ja").addEventListener("click", () => versuche(async () => {
+  zeichneRegale(await post("buecher_eingeraeumt", { isbns: [eiIsbn] }));
+  $("#eingeraeumt-dialog").close();
+  toast("✓ Gespeichert");
+}));
+$("#regal-umstellen").addEventListener("click", (e) => {
+  const li = e.target.closest("[data-isbn]");
+  if (li) fragEingeraeumt(li.dataset.isbn);
+});
+
 $("#regal-uebernehmen").addEventListener("click", () => versuche(async () => {
   zeichneRegale(await post("regale_uebernehmen"));
   toast("Gespeichert – so stehen die Bücher jetzt im Regal");
