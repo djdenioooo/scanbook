@@ -1323,7 +1323,7 @@ KONTO_POST = {
 }
 OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
 VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
-NUR_ADMIN_POST = {"settings", "backup_ordner", "update_install", "notfall_neu"}
+NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu"}
 
 
 # --- WEBSERVER ---
@@ -2194,7 +2194,7 @@ td.titel-zelle { min-width: 220px; }
         <div class="actions"><button class="btn" type="submit">Speichern</button></div>
       </form>
     </div>
-    <div class="card nur-admin" id="update-karte">
+    <div class="card" id="update-karte">
       <h2>Programm-Update</h2>
       <p class="hint" id="update-text">Prüft auf GitHub, ob es eine neuere Version von ScanBook gibt. Deine Daten bleiben beim Update erhalten.</p>
       <div class="actions" style="margin-top:0">
@@ -3966,7 +3966,7 @@ function angemeldetAls(b) {
     ladeInfo().catch((e) => toast(e.message, true));
     katalogHolen().catch(() => {});
     zeigeTab(location.hash.slice(1));
-    if (b.rolle === "admin") get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund
+    get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund, Fehler nicht anzeigen
   } else {
     zeigeTab(location.hash.slice(1));
   }

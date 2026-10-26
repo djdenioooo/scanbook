@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.13.0"
+VERSION = "2.13.1"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -586,7 +586,7 @@ def set_einstellung(schluessel, wert):
 
 
 # --- BENUTZER & PASSWÖRTER ---
-# admin = alles; lehrkraft = alles außer Einstellungen/Update, verwaltet nur Bücherei-Zugänge;
+# admin = alles; lehrkraft = alles außer Einstellungen, verwaltet nur Bücherei-Zugänge;
 # buecherei = Bücherei-Kraft (Bufdi), Zugang endet automatisch am 31.07.
 ROLLEN = {"admin": "Admin", "lehrkraft": "Lehrkraft", "buecherei": "Bücherei-Kraft"}
 STICHTAG = (7, 31)  # Die Bücherei-Stelle wechselt zum 1. August
