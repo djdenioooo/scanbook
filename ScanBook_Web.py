@@ -767,11 +767,27 @@ body { margin: 0; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Helvetica N
 .etikett .titel { font-size: 8.5pt; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .etikett .barcode { height: 13mm; margin-top: auto; }
 .etikett .nummer { text-align: center; font: 9pt ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; }
+/* Regalliste: fließender Text über mehrere Seiten, jedes Regal auf eigener Seite */
+.blatt.liste { height: auto; min-height: 297mm; padding: 14mm 14mm 12mm; display: block; page: liste; }
+.liste h1 { font-size: 16pt; margin: 0; }
+.liste .unter { color: #555; margin: 1mm 0 4mm; }
+.liste table { width: 100%; border-collapse: collapse; }
+.liste th { text-align: left; font-size: 8pt; text-transform: uppercase; letter-spacing: .04em; color: #555; border-bottom: .4mm solid #000; padding: 1.5mm 2mm; }
+.liste td { border-bottom: .2mm solid #ddd; padding: 1.2mm 2mm; vertical-align: top; }
+.liste tr { break-inside: avoid; }
+.liste tr.fach td { background: #eef3ff; font-weight: 700; border-bottom: .3mm solid #007aff; padding-top: 2.5mm; }
+.liste tr.fach .sub { font-weight: 400; color: #555; margin-left: 2mm; }
+.liste .haken { width: 6mm; color: #999; }
+.liste .anz { width: 8mm; text-align: right; }
+.liste .hinweis { color: #8a5a00; font-size: 9pt; }
+.liste .leer td { color: #999; font-style: italic; }
+@page liste { size: A4; margin: 12mm 14mm; }
 @page { size: A4; margin: 0; }
 @media print {
   body { background: #fff; }
   .leiste { display: none; }
   .blatt { margin: 0; box-shadow: none; }
+  .blatt.liste { width: auto; min-height: 0; padding: 0; }
   .ausweis, .etikett { outline: none; }
 }
 """
@@ -835,7 +851,52 @@ def druck_etiketten(params):
                       "Beim Drucken 100 % wählen.", etiketten if rows else [], 24, "etiketten", skript)
 
 
-DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten}
+def druck_regale(params):
+    plan = sb.regal_plan()
+    regale = plan["regale"]
+    if params.get("regal"):
+        regale = [r for r in regale if str(r["id"]) == params["regal"]]
+        if not regale:
+            raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
+    bib = sb.get_einstellung("bib_name", "Schulbibliothek")
+    datum = date.today().strftime("%d.%m.%Y")
+
+    def zeile(b):
+        mit_serie = b["serie"] and b["band"] and b["serie"].lower() not in b["titel"].lower()
+        titel = (f'{b["serie"]} {b["band"]}: ' if mit_serie else "") + b["titel"]
+        hinweis = ("noch einräumen" if not b["ist"] else
+                   f'steht noch in {sb.standort_text(plan["regale"], b["ist"])}' if b["ist"] != b["soll"] else "")
+        return (f'<tr><td class="haken">☐</td><td>{html.escape(titel)}'
+                f'{f"""<div class="hinweis">{html.escape(hinweis)}</div>""" if hinweis else ""}</td>'
+                f'<td>{html.escape(b["autor"])}</td><td>{html.escape(", ".join(b["genres"]))}</td>'
+                f'<td class="anz">{b["anzahl"]}</td></tr>')
+
+    seiten, gesamt = [], 0
+    for r in regale:
+        zeilen = []
+        for nr, fach in enumerate(r["inhalt"], 1):
+            n = sum(b["anzahl"] for b in fach)
+            gesamt += n
+            genres = r["fach_genres"][nr - 1] or r["genres"]
+            zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["kapazitaet"]} Bücher'
+                          f'{" · " + html.escape(", ".join(genres)) if genres else ""}</span></td></tr>')
+            zeilen += [zeile(b) for b in fach] or ['<tr class="leer"><td></td><td colspan="4">leer</td></tr>']
+        seiten.append(f"""<h1>{html.escape(r["name"])}</h1>
+<div class="unter">{html.escape(bib)} · {r["faecher"]} Fächer · Stand {datum}</div>
+<table><thead><tr><th class="haken"></th><th>Titel</th><th>Autor</th><th>Genre</th><th class="anz">Anz.</th></tr></thead>
+<tbody>{"".join(zeilen)}</tbody></table>""")
+    if not params.get("regal") and plan["ohne_platz"]:
+        zeilen = [zeile(b) for b, _ in plan["ohne_platz"]]
+        seiten.append(f"""<h1>Ohne Platz</h1>
+<div class="unter">Diese Bücher passen in kein Regal · Stand {datum}</div>
+<table><thead><tr><th class="haken"></th><th>Titel</th><th>Autor</th><th>Genre</th><th class="anz">Anz.</th></tr></thead>
+<tbody>{"".join(zeilen)}</tbody></table>""")
+    titel = f'Regal {regale[0]["name"]}' if params.get("regal") else "Regalliste"
+    return druckseite(titel, f"{len(regale)} Regal(e), {gesamt} Bücher. Jedes Regal beginnt auf einer neuen Seite.",
+                      seiten, 1, "liste")
+
+
+DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten, "regale": druck_regale}
 
 
 GET_ROUTEN = {
@@ -1473,6 +1534,7 @@ td.titel-zelle { min-width: 220px; }
     <div class="card">
       <div class="row">
         <h2 class="grow" style="margin:0">Regale</h2>
+        <button class="btn secondary" type="button" id="regale-drucken">Als Liste drucken</button>
         <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
       </div>
       <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
@@ -2513,6 +2575,7 @@ function regalGenreText(r) {
 function zeichneRegale(d) {
   regalDaten = d;
   const anzahl = d.regale.length;
+  $("#regale-drucken").disabled = !anzahl;
   $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
     const belegt = r.inhalt.flat().reduce((n, b) => n + b.anzahl, 0);
     const platz = r.faecher * r.kapazitaet;
@@ -2529,6 +2592,7 @@ function zeichneRegale(d) {
           <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
         <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
         <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
+        <button class="btn small secondary" data-drucken="${r.id}" title="Dieses Regal als Liste drucken">Drucken</button>
         <button class="btn small secondary" data-bearbeiten="${r.id}">Bearbeiten</button>
         <button class="btn small danger" data-loeschen="${r.id}">Löschen</button>
       </div>
@@ -2585,6 +2649,7 @@ function oeffneRegal(r) {
   form.name.focus();
 }
 $("#regal-neu").addEventListener("click", () => oeffneRegal(null));
+$("#regale-drucken").addEventListener("click", () => drucken("regale"));
 $("#rg-close").addEventListener("click", () => $("#regal-dialog").close());
 $("#regal-form").addEventListener("focusin", (e) => {
   if (e.target.id === "rg-genres" || e.target.dataset.fach !== undefined) { genreFeld = e.target; genreChips(); }
@@ -2616,6 +2681,7 @@ $("#regal-form").addEventListener("submit", (e) => {
 $("#regale-liste").addEventListener("click", (e) => {
   const d = e.target.dataset;
   if (d.isbn) return oeffneVorschau(d.isbn);
+  if (d.drucken) return drucken("regale", { regal: d.drucken });
   if (d.bearbeiten) return oeffneRegal(regalDaten.regale.find((r) => r.id === Number(d.bearbeiten)));
   if (d.hoch || d.runter) return versuche(async () =>
     zeichneRegale(await post("regal_move", { id: Number(d.hoch || d.runter), richtung: d.hoch ? "hoch" : "runter" })));

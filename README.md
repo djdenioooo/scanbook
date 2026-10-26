@@ -88,6 +88,8 @@ ScanBook verteilt die Bücher dann selbst:
 
 Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau und in der Katalogliste (Spalte „Standort“, grau = geplant, noch nicht eingeräumt). Im Katalog lässt sich nach Regal filtern, die Suche findet auch Regalnamen, und der Katalog-Export enthält den Standort.
 
+„Als Liste drucken“ (oben im Tab „Regale“) erzeugt eine Druckseite mit allen Regalen: jedes Regal auf einer eigenen Seite, darin Fach für Fach die Bücher mit Titel, Autor, Genre und Anzahl, dazu ein Kästchen zum Abhaken. Bücher, die noch eingeräumt oder umgestellt werden müssen, sind vermerkt. Mit „Drucken“ neben einem Regal druckst du nur dieses eine.
+
 ## Schülerausweise
 
 Im Tab „Schüler“ der Browser-Oberfläche legst du Schüler mit Vorname, Nachname und Klasse an, einzeln oder als ganze Klassenliste („Klassenliste importieren“: Spalten aus Excel kopieren und einfügen oder eine CSV-Datei wählen, Reihenfolge Nachname, Vorname, Klasse). Jeder Schüler bekommt eine Ausweisnummer (z. B. `S0001`). Haben die Schüler schon einen Ausweis mit Barcode, trägst du dessen Nummer einfach als Ausweisnummer ein.
