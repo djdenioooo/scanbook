@@ -126,9 +126,9 @@ Die Browser-Oberfläche ist mit Benutzername und Passwort geschützt. Beim aller
 
 | Rolle | Gültig | Darf |
 | --- | --- | --- |
-| Admin | dauerhaft | alles, auch Einstellungen, Updates und alle Zugänge verwalten |
-| Lehrkraft | dauerhaft | Ausleihe, Katalog, Regale, Schüler; Zugänge der Bücherei-Kraft anlegen, sperren, verlängern |
-| Bücherei-Kraft | bis 31.07. | Ausleihe, Katalog, Regale, Schüler |
+| Admin | dauerhaft | alles, auch Einstellungen und alle Zugänge verwalten |
+| Lehrkraft | dauerhaft | Ausleihe, Katalog, Regale, Schüler, Updates; Zugänge der Bücherei-Kraft anlegen, sperren, verlängern |
+| Bücherei-Kraft | bis 31.07. | Ausleihe, Katalog, Regale, Schüler, Updates |
 
 **Jahreswechsel:** Der Zugang der Bücherei-Kraft endet automatisch am 31.07. Gibt es danach keinen gültigen Bücherei-Zugang mehr, erscheint auf der Anmeldeseite „Ich bin die neue Bücherei-Kraft“. Damit legt sich die neue Kraft ohne Hilfe einen eigenen Zugang an (nur direkt am Bücherei-PC). Admin und Lehrkraft sehen das danach in der Verwaltung und können den Zugang bei Bedarf sperren.
 
