@@ -416,7 +416,8 @@ def init_db():
                 kapazitaet INTEGER DEFAULT 30,
                 genres TEXT DEFAULT '',
                 reihenfolge INTEGER DEFAULT 0,
-                fach_genres TEXT DEFAULT ''
+                fach_genres TEXT DEFAULT '',
+                fach_kapazitaet TEXT DEFAULT ''
             )
         ''')
 
@@ -481,8 +482,12 @@ def init_db():
             cursor.execute("ALTER TABLE buecher ADD COLUMN fest INTEGER DEFAULT 0")
 
         # Eigene Genres je Fach: JSON-Liste mit einem Text je Fach ("" = wie das Regal)
-        if "fach_genres" not in {row[1] for row in cursor.execute("PRAGMA table_info(regale)")}:
+        regal_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(regale)")}
+        if "fach_genres" not in regal_spalten:
             cursor.execute("ALTER TABLE regale ADD COLUMN fach_genres TEXT DEFAULT ''")
+        # Eigene Anzahl Bücher je Fach (z. B. schmale Mangas): JSON-Liste mit einer Zahl je Fach (0 = wie das Regal)
+        if "fach_kapazitaet" not in regal_spalten:
+            cursor.execute("ALTER TABLE regale ADD COLUMN fach_kapazitaet TEXT DEFAULT ''")
 
         vorhandene_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(ausleihen)")}
         if "zurueckgegeben_am" not in vorhandene_spalten:
@@ -1208,34 +1213,52 @@ def fach_genres_laden(text, faecher):
     return [genre_liste(werte[i]) if i < len(werte) and isinstance(werte[i], str) else [] for i in range(faecher)]
 
 
+def fach_kapazitaet_laden(text, faecher):
+    """Eigene Anzahl Bücher je Fach aus der Datenbank: Liste mit einer Zahl je Fach (0 = wie das Regal)."""
+    try:
+        werte = json.loads(text or "[]")
+    except ValueError:
+        werte = []
+    if not isinstance(werte, list):
+        werte = []
+    return [werte[i] if i < len(werte) and isinstance(werte[i], int) and werte[i] > 0 else 0 for i in range(faecher)]
+
+
 def lade_regale():
     with db_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, name, faecher, kapazitaet, genres, fach_genres FROM regale ORDER BY reihenfolge, id").fetchall()
+        rows = conn.execute("SELECT id, name, faecher, kapazitaet, genres, fach_genres, fach_kapazitaet "
+                            "FROM regale ORDER BY reihenfolge, id").fetchall()
     regale = []
     for r in rows:
-        faecher = max(1, r[2] or 1)
-        regale.append({"id": r[0], "name": r[1], "faecher": faecher, "kapazitaet": max(1, r[3] or 1),
-                       "genres": genre_liste(r[4]), "fach_genres": fach_genres_laden(r[5], faecher)})
+        faecher, kapazitaet = max(1, r[2] or 1), max(1, r[3] or 1)
+        eigene = fach_kapazitaet_laden(r[6], faecher)
+        regale.append({"id": r[0], "name": r[1], "faecher": faecher, "kapazitaet": kapazitaet,
+                       "genres": genre_liste(r[4]), "fach_genres": fach_genres_laden(r[5], faecher),
+                       "fach_kapazitaet": eigene,  # 0 = wie das Regal
+                       "fach_kap": [k or kapazitaet for k in eigene]})  # tatsächliche Anzahl je Fach
     return regale
 
 
-def regal_speichern(regal_id, name, faecher, kapazitaet, genres, fach_genres=None):
+def regal_speichern(regal_id, name, faecher, kapazitaet, genres, fach_genres=None, fach_kapazitaet=None):
     """Legt ein Regal an (regal_id None) oder ändert es. genres = Liste, fach_genres = Liste mit einer
-    Genre-Liste je Fach (None = so lassen, wie es ist). Liefert die ID."""
-    werte = (name.strip(), int(faecher), int(kapazitaet), ", ".join(genres))
+    Genre-Liste je Fach, fach_kapazitaet = Liste mit einer Zahl je Fach (0 = wie das Regal; beide
+    None = so lassen, wie es ist). Liefert die ID."""
+    faecher = int(faecher)
+    spalten = {"name": name.strip(), "faecher": faecher, "kapazitaet": int(kapazitaet), "genres": ", ".join(genres)}
+    if fach_genres is not None:
+        fach_genres = fach_genres[:faecher]
+        spalten["fach_genres"] = json.dumps([", ".join(g) for g in fach_genres], ensure_ascii=False) if any(fach_genres) else ""
+    if fach_kapazitaet is not None:
+        fach_kapazitaet = [max(0, int(k or 0)) for k in fach_kapazitaet[:faecher]]
+        spalten["fach_kapazitaet"] = json.dumps(fach_kapazitaet) if any(fach_kapazitaet) else ""
     with db_connection() as conn:
-        if fach_genres is not None:
-            fach_text = json.dumps([", ".join(g) for g in fach_genres[:int(faecher)]], ensure_ascii=False)
-            werte += (fach_text if any(fach_genres[:int(faecher)]) else "",)
         if regal_id:
-            spalten = "name = ?, faecher = ?, kapazitaet = ?, genres = ?" + (", fach_genres = ?" if fach_genres is not None else "")
-            conn.execute(f"UPDATE regale SET {spalten} WHERE id = ?", (*werte, regal_id))
+            conn.execute(f"UPDATE regale SET {', '.join(f'{s} = ?' for s in spalten)} WHERE id = ?",
+                         (*spalten.values(), regal_id))
             return regal_id
-        naechste = conn.execute("SELECT COALESCE(MAX(reihenfolge), 0) + 1 FROM regale").fetchone()[0]
-        werte += ("",) * (5 - len(werte))
-        return conn.execute("INSERT INTO regale (name, faecher, kapazitaet, genres, fach_genres, reihenfolge) "
-                            "VALUES (?, ?, ?, ?, ?, ?)", (*werte, naechste)).lastrowid
+        spalten["reihenfolge"] = conn.execute("SELECT COALESCE(MAX(reihenfolge), 0) + 1 FROM regale").fetchone()[0]
+        return conn.execute(f"INSERT INTO regale ({', '.join(spalten)}) VALUES ({', '.join('?' * len(spalten))})",
+                            tuple(spalten.values())).lastrowid
 
 
 def regal_loeschen(regal_id):
@@ -1295,7 +1318,7 @@ def faecher_belegen(buecher, regal, faecher=None, schon_belegt=None):
     schon_belegt = schon_belegt or {}
     anzahl_faecher = len(faecher)
     # Freier Platz je Fach (Index 1..n), festgelegte Bücher gehen ab
-    kap = [0] + [max(0, regal["kapazitaet"] - schon_belegt.get(f, 0)) for f in faecher] + [0]
+    kap = [0] + [max(0, regal["fach_kap"][f - 1] - schon_belegt.get(f, 0)) for f in faecher] + [0]
     position = {f: nr for nr, f in enumerate(faecher, 1)}  # echte Fachnummer → 1..anzahl_faecher
     platz = [max(1, b["anzahl"]) for b in buecher]
     gespeichert = [position.get(b["fach"]) if b["regal_id"] == regal["id"] else None for b in buecher]
@@ -1591,7 +1614,7 @@ def zahl_eingabe(prompt, standard):
 
 
 def regal_formular(regal=None):
-    regal = regal or {"id": None, "name": "", "faecher": 5, "kapazitaet": 30, "genres": [], "fach_genres": []}
+    regal = regal or {"id": None, "name": "", "faecher": 5, "kapazitaet": 30, "genres": [], "fach_genres": [], "fach_kapazitaet": []}
     name = input(f"   Name{f' [{regal['name']}]' if regal['name'] else ' (z. B. Regal 1)'}: ").strip() or regal["name"]
     if not name:
         print("❌ Abgebrochen. Ein Name ist erforderlich.")
@@ -1615,18 +1638,25 @@ def regal_formular(regal=None):
                 fach_genres[i] = []
             elif eingabe:
                 fach_genres[i] = genre_liste(eingabe)
-    regal_speichern(regal["id"], name, faecher, kapazitaet, genres, fach_genres)
+    fach_kap = [(regal["fach_kapazitaet"][i] if i < len(regal["fach_kapazitaet"]) else 0) for i in range(faecher)]
+    if ja_nein("   Eigene Anzahl Bücher für einzelne Fächer festlegen (z. B. für schmale Mangas)?"):
+        print(f"   Leer = so lassen, 0 = wie das Regal ({kapazitaet}).")
+        for i in range(faecher):
+            eingabe = input(f"   Fach {i + 1} [{fach_kap[i] or kapazitaet}]: ").strip()
+            if eingabe.isdigit():
+                fach_kap[i] = 0 if int(eingabe) == kapazitaet else int(eingabe)
+    regal_speichern(regal["id"], name, faecher, kapazitaet, genres, fach_genres, fach_kap)
     print("✅ Regal gespeichert.")
 
 
 def zeige_regale(plan):
     for nr, r in enumerate(plan["regale"], 1):
         belegt = sum(b["anzahl"] for inhalt in r["inhalt"] for b in inhalt)
-        print(f"{nr}. {r['name']} – {r['faecher']} Fächer × {r['kapazitaet']} Bücher, belegt: {belegt}/{r['faecher'] * r['kapazitaet']}")
+        print(f"{nr}. {r['name']} – {r['faecher']} Fächer × {r['kapazitaet']} Bücher, belegt: {belegt}/{sum(r['fach_kap'])}")
         print(f"   Genres: {', '.join(r['genres']) or 'alle übrigen Bücher'}")
-        for fach_nr, genres in enumerate(r["fach_genres"], 1):
-            if genres:
-                print(f"   Fach {fach_nr}: {', '.join(genres)}")
+        for fach_nr, (genres, kap) in enumerate(zip(r["fach_genres"], r["fach_kapazitaet"]), 1):
+            if genres or kap:
+                print(f"   Fach {fach_nr}: {', '.join(genres) or 'wie das Regal'}{f' · {kap} Bücher' if kap else ''}")
 
 
 def waehle_regal(plan):
@@ -1647,7 +1677,7 @@ def zeige_einraeumplan(plan):
         for fach_nr, inhalt in enumerate(r["inhalt"], 1):
             belegt = sum(b["anzahl"] for b in inhalt)
             eigene = ", ".join(r["fach_genres"][fach_nr - 1])
-            print(f"\nFach {fach_nr} ({belegt}/{r['kapazitaet']}){f' – {eigene}' if eigene else ''}:")
+            print(f"\nFach {fach_nr} ({belegt}/{r['fach_kap'][fach_nr - 1]}){f' – {eigene}' if eigene else ''}:")
             for b in inhalt:
                 hinweis = ""
                 if not b["ist"]:

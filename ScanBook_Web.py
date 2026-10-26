@@ -491,7 +491,7 @@ def api_regale(_):
     return {
         "regale": [
             {"id": r["id"], "name": r["name"], "faecher": r["faecher"], "kapazitaet": r["kapazitaet"], "genres": r["genres"],
-             "fach_genres": r["fach_genres"],
+             "fach_genres": r["fach_genres"], "fach_kapazitaet": r["fach_kapazitaet"], "fach_kap": r["fach_kap"],
              "inhalt": [[regal_buch(regale, b) for b in fach] for fach in r["inhalt"]]}
             for r in regale
         ],
@@ -514,7 +514,9 @@ def api_regal_save(body):
         raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
     fach_genres = body.get("fach_genres")
     fach_genres = [sb.genre_liste(str(g or "")) for g in fach_genres] if isinstance(fach_genres, list) else None
-    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres)
+    fach_kap = body.get("fach_kapazitaet")
+    fach_kap = [positive_zahl(k, 0) for k in fach_kap] if isinstance(fach_kap, list) else None
+    sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres, fach_kap)
     return api_regale(None)
 
 
@@ -931,7 +933,7 @@ def druck_regale(params):
             n = sum(b["anzahl"] for b in fach)
             gesamt += n
             genres = r["fach_genres"][nr - 1] or r["genres"]
-            zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["kapazitaet"]} Bücher'
+            zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["fach_kap"][nr - 1]} Bücher'
                           f'{" · " + html.escape(", ".join(genres)) if genres else ""}</span></td></tr>')
             zeilen += [zeile(b) for b in fach] or ['<tr class="leer"><td></td><td colspan="4">leer</td></tr>']
         seiten.append(f"""<h1>{html.escape(r["name"])}</h1>
@@ -1388,7 +1390,8 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .fach-nr .fach-genre { display: block; font-weight: 500; font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
 #rg-fach-details { margin-top: 12px; }
 #rg-fach-details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
-.fach-genres { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; }
+.fach-genres { display: grid; grid-template-columns: auto 1fr 84px; gap: 6px 10px; align-items: center; }
+.fach-genres .kopf { font-size: 12px; font-weight: 400; color: var(--muted); }
 .fach-genres span { font-size: 14px; font-weight: 600; white-space: nowrap; }
 .buch-chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 0; background: var(--fill); cursor: pointer; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .buch-chip:hover { filter: brightness(.95); }
@@ -1861,8 +1864,8 @@ td.titel-zelle { min-width: 220px; }
       <div class="full"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
     </div>
     <details id="rg-fach-details">
-      <summary>Eigene Genres für einzelne Fächer</summary>
-      <p class="hint">Leer = das Fach nimmt, was zum Regal passt. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer.</p>
+      <summary>Einzelne Fächer: eigene Genres und Anzahl Bücher</summary>
+      <p class="hint">Leer = wie das Regal. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer. Bei „Bücher“ kannst du für schmale Bücher wie Mangas mehr eintragen (oder für dicke weniger).</p>
       <div class="fach-genres" id="rg-fach-genres"></div>
     </details>
     <p class="hint" style="margin:10px 0 0">Genre antippen, um es ins ausgewählte Feld zu übernehmen:</p>
@@ -2729,19 +2732,20 @@ function zeichneRegale(d) {
   }
   $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
     const belegt = r.inhalt.flat().reduce((n, b) => n + b.anzahl, 0);
-    const platz = r.faecher * r.kapazitaet;
+    const platz = r.fach_kap.reduce((a, k) => a + k, 0);
     const faecher = r.inhalt.map((fach, f) => {
       const n = fach.reduce((s, b) => s + b.anzahl, 0);
       const eigene = r.fach_genres[f] || [];
-      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${r.kapazitaet}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}
+      const kap = r.fach_kap[f];
+      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}
           <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button></div>
-        <div><div class="balken ${n >= r.kapazitaet ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / r.kapazitaet))}%"></div></div>
+        <div><div class="balken ${n >= kap ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / kap))}%"></div></div>
         <div class="fach-buecher">${fach.map(buchChip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
     }).join("");
     return `<div class="regal">
       <div class="regal-kopf">
         <div class="grow"><b>${esc(r.name)}</b>
-          <div class="sub">${r.faecher} Fächer × ${r.kapazitaet} Bücher · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
+          <div class="sub">${r.faecher} Fächer × ${r.fach_kapazitaet.some(Boolean) ? `${r.kapazitaet} Bücher (einzelne Fächer anders)` : `${r.kapazitaet} Bücher`} · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
         <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
         <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
         <button class="btn small secondary" data-drucken="${r.id}" title="Dieses Regal als Liste drucken">Drucken</button>
@@ -2770,12 +2774,15 @@ async function ladeRegale() {
 }
 // Genre-Chips wirken auf das zuletzt angeklickte Feld (Regal oder ein Fach)
 let genreFeld = null;
-function zeichneFachGenres(werte) {
+function zeichneFachGenres(werte, kapWerte) {
   const box = $("#rg-fach-genres");
-  const alt = werte || [...box.querySelectorAll("input")].map((i) => i.value);
+  const alt = werte || [...box.querySelectorAll("input[data-fach]")].map((i) => i.value);
+  const altKap = kapWerte || [...box.querySelectorAll("input[data-kap]")].map((i) => i.value);
   const anzahl = Math.min(50, Math.max(1, Number($("#rg-faecher").value) || 1));
-  box.innerHTML = Array.from({ length: anzahl }, (_, f) =>
-    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">`).join("");
+  const standard = Number($("#rg-kapazitaet").value) || "";
+  box.innerHTML = `<span></span><span class="kopf">Genres</span><span class="kopf">Bücher</span>` + Array.from({ length: anzahl }, (_, f) =>
+    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">
+     <input data-kap="${f}" type="number" min="1" placeholder="${standard}" aria-label="Bücher in Fach ${f + 1}" value="${esc(altKap[f] || "")}">`).join("");
   if (genreFeld && !genreFeld.isConnected) genreFeld = $("#rg-genres");
 }
 function genreChips() {
@@ -2793,8 +2800,9 @@ function oeffneRegal(r) {
   form.genres.value = r ? r.genres.join(", ") : "";
   $("#regal-dlg-titel").textContent = r ? "Regal bearbeiten" : "Neues Regal";
   const fachGenres = (r?.fach_genres || []).map((g) => g.join(", "));
-  zeichneFachGenres(fachGenres);
-  $("#rg-fach-details").open = fachGenres.some(Boolean);
+  const fachKap = (r?.fach_kapazitaet || []).map((k) => k || "");
+  zeichneFachGenres(fachGenres, fachKap);
+  $("#rg-fach-details").open = fachGenres.some(Boolean) || fachKap.some(Boolean);
   genreFeld = $("#rg-genres");
   genreChips();
   $("#regal-dialog").showModal();
@@ -2808,7 +2816,7 @@ $("#regal-form").addEventListener("focusin", (e) => {
 });
 $("#regal-form").addEventListener("input", (e) => {
   if (e.target === genreFeld) genreChips();
-  if (e.target.id === "rg-faecher") zeichneFachGenres();
+  if (e.target.id === "rg-faecher" || e.target.id === "rg-kapazitaet") zeichneFachGenres();
 });
 $("#rg-genre-chips").addEventListener("click", (e) => {
   const g = e.target.dataset.genre;
@@ -2824,8 +2832,11 @@ $("#regal-form").addEventListener("submit", (e) => {
   e.preventDefault();
   versuche(async () => {
     const daten = formDaten(e.target);
-    const fach_genres = [...$("#rg-fach-genres").querySelectorAll("input")].map((i) => i.value);
-    zeichneRegale(await post("regal_save", { ...daten, fach_genres, id: Number(daten.regal_id) || null }));
+    const fach_genres = [...$("#rg-fach-genres").querySelectorAll("input[data-fach]")].map((i) => i.value);
+    // Gleich viel wie das Regal = keine eigene Anzahl
+    const fach_kapazitaet = [...$("#rg-fach-genres").querySelectorAll("input[data-kap]")]
+      .map((i) => (Number(i.value) === Number(daten.kapazitaet) ? 0 : Number(i.value) || 0));
+    zeichneRegale(await post("regal_save", { ...daten, fach_genres, fach_kapazitaet, id: Number(daten.regal_id) || null }));
     $("#regal-dialog").close();
     toast("Regal gespeichert");
   });
