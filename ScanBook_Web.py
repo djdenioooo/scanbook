@@ -85,6 +85,7 @@ def api_info(_):
         "bib_name": sb.get_einstellung("bib_name", "Schulbibliothek"),
         "schulname": sb.get_einstellung("schulname"),
         "standard_leihdauer": sb.get_einstellung_int("standard_leihdauer", 14),
+        "einraeumen_bestaetigen": sb.get_einstellung(sb.EINRAEUMEN_BESTAETIGEN) == "1",
     }
 
 
@@ -537,6 +538,12 @@ def api_regal_move(body):
 def api_regale_uebernehmen(_):
     sb.plan_uebernehmen()
     return api_regale(None)
+
+
+def api_einraeumen_bestaetigen(body):
+    """Schalter unter „Erfassen“: neu gescannte Bücher erst nach Bestätigung als eingeräumt merken."""
+    sb.set_einstellung(sb.EINRAEUMEN_BESTAETIGEN, "1" if body.get("an") else "0")
+    return {"an": bool(body.get("an"))}
 
 
 def api_buecher_eingeraeumt(body):
@@ -1299,6 +1306,7 @@ POST_ROUTEN = {
     "regal_move": api_regal_move,
     "regale_uebernehmen": api_regale_uebernehmen,
     "buecher_eingeraeumt": api_buecher_eingeraeumt,
+    "einraeumen_bestaetigen": api_einraeumen_bestaetigen,
     "buecher_festlegen": api_buecher_festlegen,
     "buecher_freigeben": api_buecher_freigeben,
     "fach_scan": api_fach_scan,
@@ -1942,6 +1950,8 @@ td.titel-zelle { min-width: 220px; }
       </form>
       <div class="platz-box hidden" id="code-box"></div>
       <div class="platz-box hidden" id="platz-box"></div>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="einraeumen-bestaetigen"> Erst nach Bestätigung als eingeräumt merken</label>
+      <p class="hint" id="einraeumen-hint" style="margin:4px 0 0">Aus: Neue Bücher gelten sofort als eingeräumt. An: Das Buch bleibt grün (geplant), bis du „Steht drin“ tippst – hier oder im Tab „Regale“.</p>
       <button class="link" id="manual-btn" type="button">Buch ohne Scan von Hand eintragen</button>
       <p class="hint" style="margin:10px 0 0">Eigenes Etikett im Buch? Erst das Etikett scannen, dann die ISBN. Codes erzeugen und Etiketten drucken findest du unter <a href="#verwaltung">Verwaltung</a>.</p>
     </div>
@@ -2618,6 +2628,7 @@ async function ladeInfo() {
   $("#bib-name").textContent = info.bib_name + (info.schulname ? " · " + info.schulname : "");
   $("#version").textContent = "Version " + info.version;
   $("#co-tage").placeholder = info.standard_leihdauer;
+  $("#einraeumen-bestaetigen").checked = info.einraeumen_bestaetigen;
 }
 
 // --- Scannen ---
@@ -2661,7 +2672,9 @@ function zeigePlatz(b) {
   const platz = b.standort_soll || b.standort;
   box.classList.toggle("warn", !platz);
   if (platz) {
+    const geplant = Boolean(b.standort_soll) && info?.einraeumen_bestaetigen;
     box.innerHTML = `📍 „${esc(b.titel)}“ gehört nach <b>${esc(platz)}</b>`
+      + (geplant ? ` <button class="btn small" type="button" id="platz-ok" data-isbn="${esc(b.isbn)}" style="margin-left:8px">✓ Steht drin</button>` : "")
       + (b.umstellen ? `<div class="sub">Dafür ${b.umstellen === 1 ? "muss 1 anderes Buch" : `müssen ${b.umstellen} andere Bücher`} umgestellt werden – siehe Tab „Regale“.</div>` : "");
   } else if (b.kein_platz === "voll") {
     box.textContent = `Für „${b.titel}“ ist in den passenden Regalen kein Platz mehr. Lege im Tab „Regale“ ein Fach oder Regal dazu.`;
@@ -2673,6 +2686,23 @@ function zeigePlatz(b) {
   }
   box.classList.remove("hidden");
 }
+
+$("#platz-box").addEventListener("click", (e) => {
+  const knopf = e.target.closest("#platz-ok");
+  if (!knopf) return;
+  versuche(async () => {
+    await post("buecher_eingeraeumt", { isbns: [knopf.dataset.isbn] });
+    toast("Als eingeräumt gespeichert");
+    knopf.replaceWith(Object.assign(document.createElement("span"), { textContent: " ✓ eingeräumt" }));
+    $("#scan-isbn").focus();
+  });
+});
+$("#einraeumen-bestaetigen").addEventListener("change", (e) => versuche(async () => {
+  const r = await post("einraeumen_bestaetigen", { an: e.target.checked });
+  info.einraeumen_bestaetigen = r.an;
+  toast(r.an ? "Neue Bücher bleiben geplant, bis du sie bestätigst" : "Neue Bücher gelten sofort als eingeräumt");
+  $("#scan-isbn").focus();
+}));
 
 function schliesseNeuesBuch() {
   $("#new-book-card").classList.add("hidden");
