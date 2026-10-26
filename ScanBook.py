@@ -7,6 +7,10 @@ import sys
 import csv
 import json
 import ssl
+import hmac
+import getpass
+import hashlib
+import secrets
 import bisect
 import shutil
 import sqlite3
@@ -20,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.12.1"
+VERSION = "2.13.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -465,6 +469,32 @@ def init_db():
             )
         ''')
 
+        # Zugänge für die Browser-Oberfläche (Passwörter nur als Hash)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS benutzer (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                benutzername TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                name TEXT,
+                rolle TEXT NOT NULL,
+                passwort TEXT NOT NULL,
+                gueltig_bis DATE,
+                gesperrt INTEGER DEFAULT 0,
+                passwort_aendern INTEGER DEFAULT 0,
+                selbst_angelegt INTEGER DEFAULT 0,
+                bestaetigt INTEGER DEFAULT 1,
+                angelegt_am TEXT,
+                letzte_anmeldung TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sitzungen (
+                token TEXT PRIMARY KEY,
+                benutzer_id INTEGER NOT NULL,
+                letzte_aktivitaet REAL,
+                FOREIGN KEY(benutzer_id) REFERENCES benutzer(id)
+            )
+        ''')
+
         # Spalten nachrüsten, die ältere Versionen noch nicht hatten
         buch_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(buecher)")}
         for spalte in ("serie", "band", "beschreibung", "cover_url"):
@@ -552,6 +582,152 @@ def set_einstellung(schluessel, wert):
     with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO einstellungen (schluessel, wert) VALUES (?, ?)", (schluessel, wert))
+
+
+# --- BENUTZER & PASSWÖRTER ---
+# admin = alles; lehrkraft = alles außer Einstellungen/Update, verwaltet nur Bücherei-Zugänge;
+# buecherei = Bücherei-Kraft (Bufdi), Zugang endet automatisch am 31.07.
+ROLLEN = {"admin": "Admin", "lehrkraft": "Lehrkraft", "buecherei": "Bücherei-Kraft"}
+STICHTAG = (7, 31)  # Die Bücherei-Stelle wechselt zum 1. August
+PASSWORT_MIN = 8
+PBKDF2_RUNDEN = 600_000
+NOTFALL_EINSTELLUNG = "notfall_code"
+NOTFALL_ZEICHEN = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # ohne 0/O und 1/I, damit nichts verwechselt wird
+
+
+def passwort_hash(passwort):
+    salz = secrets.token_bytes(16)
+    wert = hashlib.pbkdf2_hmac("sha256", passwort.encode("utf-8"), salz, PBKDF2_RUNDEN)
+    return f"pbkdf2_sha256${PBKDF2_RUNDEN}${salz.hex()}${wert.hex()}"
+
+
+def passwort_pruefen(passwort, gespeichert):
+    try:
+        verfahren, runden, salz, wert = (gespeichert or "").split("$")
+        if verfahren != "pbkdf2_sha256":
+            return False
+        neu = hashlib.pbkdf2_hmac("sha256", passwort.encode("utf-8"), bytes.fromhex(salz), int(runden))
+    except ValueError:
+        return False
+    return hmac.compare_digest(neu.hex(), wert)
+
+
+def passwort_problem(passwort):
+    """Gibt einen Hinweistext zurück, wenn das Passwort nicht reicht, sonst None."""
+    if len(passwort) < PASSWORT_MIN:
+        return f"Das Passwort muss mindestens {PASSWORT_MIN} Zeichen lang sein."
+    return None
+
+
+def naechster_stichtag(tag=None):
+    """Der nächste 31.07. ab heute (heute zählt mit)."""
+    tag = tag or heute()
+    stichtag = date(tag.year, *STICHTAG)
+    return stichtag if tag <= stichtag else date(tag.year + 1, *STICHTAG)
+
+
+def benutzer_aktiv(b):
+    """b = dict einer Zeile aus benutzer. Gesperrte und abgelaufene Zugänge zählen nicht."""
+    if b["gesperrt"]:
+        return False
+    return not b["gueltig_bis"] or b["gueltig_bis"] >= heute().isoformat()
+
+
+def benutzer_laden(conn, bedingung="1", werte=()):
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(f"SELECT * FROM benutzer WHERE {bedingung} ORDER BY rolle, name COLLATE NOCASE", werte).fetchall()
+    return [dict(r) for r in rows]
+
+
+def gibt_es_benutzer():
+    with db_connection() as conn:
+        return conn.execute("SELECT 1 FROM benutzer LIMIT 1").fetchone() is not None
+
+
+def aktive_admins(conn, ausser=None):
+    return [b for b in benutzer_laden(conn, "rolle = 'admin'") if benutzer_aktiv(b) and b["id"] != ausser]
+
+
+def buecherei_zugang_frei():
+    """True, wenn es gerade keinen gültigen Bücherei-Zugang gibt – dann darf sich die neue Kraft selbst anlegen."""
+    with db_connection() as conn:
+        return not any(benutzer_aktiv(b) for b in benutzer_laden(conn, "rolle = 'buecherei'"))
+
+
+def benutzer_anlegen(conn, benutzername, name, rolle, passwort, passwort_aendern=False, selbst=False):
+    benutzername = benutzername.strip()
+    if not re.fullmatch(r"[\w.\-]{2,40}", benutzername):
+        raise ValueError("Benutzername: 2 bis 40 Zeichen, nur Buchstaben, Zahlen, Punkt, Minus und Unterstrich.")
+    if rolle not in ROLLEN:
+        raise ValueError("Unbekannte Rolle.")
+    if problem := passwort_problem(passwort):
+        raise ValueError(problem)
+    if conn.execute("SELECT 1 FROM benutzer WHERE benutzername = ?", (benutzername,)).fetchone():
+        raise ValueError(f"Den Benutzernamen „{benutzername}“ gibt es schon.")
+    gueltig_bis = naechster_stichtag().isoformat() if rolle == "buecherei" else None
+    cur = conn.execute(
+        "INSERT INTO benutzer (benutzername, name, rolle, passwort, gueltig_bis, passwort_aendern, selbst_angelegt, bestaetigt, angelegt_am) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (benutzername, name.strip() or benutzername, rolle, passwort_hash(passwort), gueltig_bis,
+         int(passwort_aendern), int(selbst), int(not selbst), datetime.now().isoformat(timespec="seconds")))
+    return cur.lastrowid
+
+
+def passwort_setzen(conn, benutzer_id, passwort, muss_aendern=False):
+    if problem := passwort_problem(passwort):
+        raise ValueError(problem)
+    conn.execute("UPDATE benutzer SET passwort = ?, passwort_aendern = ? WHERE id = ?",
+                 (passwort_hash(passwort), int(muss_aendern), benutzer_id))
+    conn.execute("DELETE FROM sitzungen WHERE benutzer_id = ?", (benutzer_id,))
+
+
+def notfall_code_neu():
+    """Erzeugt einen neuen Notfall-Code (zum Ausdrucken) und speichert nur seinen Hash."""
+    roh = "".join(secrets.choice(NOTFALL_ZEICHEN) for _ in range(16))
+    set_einstellung(NOTFALL_EINSTELLUNG, passwort_hash(roh))
+    return "-".join(roh[i:i + 4] for i in range(0, 16, 4))
+
+
+def notfall_code_pruefen(code):
+    roh = re.sub(r"[^A-Z0-9]", "", code.upper())
+    gespeichert = get_einstellung(NOTFALL_EINSTELLUNG)
+    return bool(roh and gespeichert) and passwort_pruefen(roh, gespeichert)
+
+
+def admin_zuruecksetzen():
+    """python ScanBook.py --admin-reset: neues Admin-Passwort direkt am PC setzen (oder Admin neu anlegen)."""
+    init_db()
+    print("\n🔑 ScanBook – Admin-Zugang wiederherstellen")
+    with db_connection() as conn:
+        admins = benutzer_laden(conn, "rolle = 'admin'")
+    if admins:
+        print("Vorhandene Admins:")
+        for b in admins:
+            print(f"   {b['benutzername']}  ({b['name']})")
+        benutzername = input("Benutzername (leer = ersten nehmen, neuer Name = neuen Admin anlegen): ").strip() or admins[0]["benutzername"]
+    else:
+        benutzername = input("Es gibt noch keinen Admin. Benutzername für den neuen Admin: ").strip()
+    while True:
+        passwort = getpass.getpass("Neues Passwort (wird nicht angezeigt): ")
+        if problem := passwort_problem(passwort):
+            print(f"❌ {problem}")
+        elif getpass.getpass("Passwort wiederholen: ") != passwort:
+            print("❌ Die Passwörter stimmen nicht überein.")
+        else:
+            break
+    with db_connection() as conn:
+        vorhanden = benutzer_laden(conn, "benutzername = ? AND rolle = 'admin'", (benutzername,))
+        if vorhanden:
+            passwort_setzen(conn, vorhanden[0]["id"], passwort)
+            conn.execute("UPDATE benutzer SET gesperrt = 0 WHERE id = ?", (vorhanden[0]["id"],))
+            print(f"✅ Neues Passwort für „{benutzername}“ gespeichert.")
+        else:
+            try:
+                benutzer_anlegen(conn, benutzername, benutzername, "admin", passwort)
+            except ValueError as e:
+                raise SystemExit(f"❌ {e}")
+            print(f"✅ Admin „{benutzername}“ angelegt.")
+    print(f"\n🆘 Neuer Notfall-Code (bitte ausdrucken oder aufschreiben, der alte gilt nicht mehr):\n   {notfall_code_neu()}\n")
 
 
 # --- STAMMDATEN VERWALTEN (MENÜ) ---
@@ -2874,6 +3050,9 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if "--admin-reset" in sys.argv:
+            admin_zuruecksetzen()
+        else:
+            main()
     except (KeyboardInterrupt, EOFError):
         print("\n\nProgramm beendet. Auf Wiedersehen!")

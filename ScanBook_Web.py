@@ -12,9 +12,13 @@ import csv
 import sys
 import time
 import json
+import hashlib
+import secrets
+import sqlite3
 import threading
 import webbrowser
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -614,6 +618,304 @@ def api_update_install(_):
     return {"version": version, "backups": backups}
 
 
+# --- ANMELDUNG & BENUTZER ---
+SITZUNG_COOKIE = "scanbook_sitzung"
+SITZUNG_MINUTEN = 60          # ohne Klick so lange angemeldet bleiben
+MAX_FEHLVERSUCHE = 5
+SPERRE_MINUTEN = 5
+LOKALE_ADRESSEN = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+fehlversuche = {}             # benutzername (klein) bzw. "#notfall" -> (anzahl, gesperrt_bis)
+konto_sperre = threading.Lock()
+
+
+# Sitzungen bewusst ohne sb.db_connection(): die zählt jede Änderung und würde sonst
+# bei jedem Klick den zwischengespeicherten Regalplan verwerfen.
+def sitzung_db():
+    return sqlite3.connect(sb.DB_NAME)
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def sitzung_neu(benutzer_id):
+    token = secrets.token_urlsafe(32)
+    with sitzung_db() as conn:
+        conn.execute("INSERT INTO sitzungen (token, benutzer_id, letzte_aktivitaet) VALUES (?, ?, ?)",
+                     (token_hash(token), benutzer_id, time.time()))
+    return token
+
+
+def sitzung_benutzer(token):
+    """Gibt den angemeldeten Benutzer (dict) zurück oder None, wenn die Sitzung abgelaufen ist."""
+    if not token:
+        return None
+    jetzt, schluessel = time.time(), token_hash(token)
+    conn = sitzung_db()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT b.*, s.letzte_aktivitaet FROM sitzungen s JOIN benutzer b ON b.id = s.benutzer_id "
+                           "WHERE s.token = ?", (schluessel,)).fetchone()
+        if not row:
+            return None
+        b = dict(row)
+        if jetzt - (b["letzte_aktivitaet"] or 0) > SITZUNG_MINUTEN * 60 or not sb.benutzer_aktiv(b):
+            conn.execute("DELETE FROM sitzungen WHERE token = ?", (schluessel,))
+            conn.commit()
+            return None
+        if jetzt - b["letzte_aktivitaet"] > 60:  # nicht bei jedem Klick schreiben
+            conn.execute("UPDATE sitzungen SET letzte_aktivitaet = ? WHERE token = ?", (jetzt, schluessel))
+            conn.commit()
+        return b
+    finally:
+        conn.close()
+
+
+def sitzung_beenden(token):
+    if token:
+        with sitzung_db() as conn:
+            conn.execute("DELETE FROM sitzungen WHERE token = ?", (token_hash(token),))
+
+
+def alte_sitzungen_loeschen():
+    with sitzung_db() as conn:
+        conn.execute("DELETE FROM sitzungen WHERE letzte_aktivitaet < ?", (time.time() - SITZUNG_MINUTEN * 60,))
+
+
+def fehlversuch_pruefen(schluessel):
+    anzahl, bis = fehlversuche.get(schluessel, (0, 0))
+    if bis > time.time():
+        minuten = max(1, round((bis - time.time()) / 60))
+        raise ApiFehler(f"Zu viele falsche Versuche. Bitte in {minuten} Minute{'n' if minuten > 1 else ''} noch einmal probieren.", 429)
+
+
+def fehlversuch_merken(schluessel):
+    anzahl = fehlversuche.get(schluessel, (0, 0))[0] + 1
+    if anzahl >= MAX_FEHLVERSUCHE:
+        fehlversuche[schluessel] = (0, time.time() + SPERRE_MINUTEN * 60)
+    else:
+        fehlversuche[schluessel] = (anzahl, 0)
+
+
+def benutzer_daten(b, ich=None):
+    abgelaufen = bool(b["gueltig_bis"]) and b["gueltig_bis"] < sb.heute().isoformat()
+    daten = {
+        "id": b["id"], "benutzername": b["benutzername"], "name": b["name"], "rolle": b["rolle"],
+        "rolle_text": sb.ROLLEN.get(b["rolle"], b["rolle"]), "gueltig_bis": b["gueltig_bis"],
+        "gesperrt": bool(b["gesperrt"]), "abgelaufen": abgelaufen, "passwort_aendern": bool(b["passwort_aendern"]),
+        "selbst_angelegt": bool(b["selbst_angelegt"]), "bestaetigt": bool(b["bestaetigt"]),
+        "angelegt_am": b["angelegt_am"], "letzte_anmeldung": b["letzte_anmeldung"],
+    }
+    if ich:
+        daten["ich"] = b["id"] == ich["id"]
+        daten["darf_bearbeiten"] = darf_verwalten(ich, b)
+    return daten
+
+
+def darf_verwalten(ich, ziel):
+    """Admins verwalten alle Zugänge, Lehrkräfte nur die der Bücherei-Kräfte."""
+    return ich["rolle"] == "admin" or (ich["rolle"] == "lehrkraft" and ziel["rolle"] == "buecherei")
+
+
+def angemeldet(h, benutzer_id):
+    with sb.db_connection() as conn:
+        conn.execute("UPDATE benutzer SET letzte_anmeldung = ? WHERE id = ?",
+                     (datetime.now().isoformat(timespec="seconds"), benutzer_id))
+    h.cookie_setzen(sitzung_neu(benutzer_id))
+
+
+def neues_passwort(body, feld="passwort"):
+    passwort = str(body.get(feld) or "")
+    if problem := sb.passwort_problem(passwort):
+        raise ApiFehler(problem)
+    return passwort
+
+
+def nur_lokal(h, was):
+    if not h.ist_lokal():
+        raise ApiFehler(f"{was} geht nur direkt am Bücherei-PC.", 403)
+
+
+def api_anmeldung(h, _):
+    lokal = h.ist_lokal()
+    return {
+        "eingerichtet": sb.gibt_es_benutzer(),
+        "benutzer": benutzer_daten(h.benutzer) if h.benutzer else None,
+        "lokal": lokal,
+        "bufdi_frei": lokal and sb.buecherei_zugang_frei(),
+        "stichtag": sb.naechster_stichtag().isoformat(),
+        "bib_name": sb.get_einstellung("bib_name", "Schulbibliothek"),
+        "version": sb.VERSION,
+    }
+
+
+def api_login(h, body):
+    benutzername = text(body, "benutzername")
+    passwort = str(body.get("passwort") or "")
+    schluessel = benutzername.lower()
+    fehlversuch_pruefen(schluessel)
+    with sb.db_connection() as conn:
+        treffer = sb.benutzer_laden(conn, "benutzername = ?", (benutzername,))
+    if not treffer or not sb.passwort_pruefen(passwort, treffer[0]["passwort"]):
+        if not treffer:
+            sb.passwort_hash(passwort)  # gleich lange rechnen, damit man Benutzernamen nicht erraten kann
+        fehlversuch_merken(schluessel)
+        raise ApiFehler("Benutzername oder Passwort stimmt nicht.", 401)
+    b = treffer[0]
+    fehlversuche.pop(schluessel, None)
+    if b["gesperrt"]:
+        raise ApiFehler("Dieser Zugang ist gesperrt. Bitte bei der Lehrkraft oder beim Admin melden.", 403)
+    if not sb.benutzer_aktiv(b):
+        hinweis = " Neue Bücherei-Kraft? Dann leg dir unten einen eigenen Zugang an." if b["rolle"] == "buecherei" else ""
+        raise ApiFehler(f"Dieser Zugang ist am {sb.de_datum(b['gueltig_bis'])} abgelaufen.{hinweis}", 403)
+    angemeldet(h, b["id"])
+    return {"ok": True}
+
+
+def api_logout(h, _):
+    sitzung_beenden(h.token)
+    h.cookie_setzen("", loeschen=True)
+    return {"ok": True}
+
+
+def api_einrichten(h, body):
+    """Allererster Start: Admin-Zugang anlegen. Geht nur, solange es noch gar keinen Benutzer gibt."""
+    nur_lokal(h, "Das Einrichten")
+    with konto_sperre:
+        if sb.gibt_es_benutzer():
+            raise ApiFehler("ScanBook ist schon eingerichtet.", 403)
+        try:
+            with sb.db_connection() as conn:
+                neu = sb.benutzer_anlegen(conn, text(body, "benutzername"), text(body, "name"), "admin", neues_passwort(body))
+        except ValueError as e:
+            raise ApiFehler(str(e))
+    angemeldet(h, neu)
+    return {"notfall_code": sb.notfall_code_neu()}
+
+
+def api_bufdi_anlegen(h, body):
+    """Neue Bücherei-Kraft legt sich selbst an – nur am Bücherei-PC und nur, wenn kein gültiger Bücherei-Zugang da ist."""
+    nur_lokal(h, "Einen eigenen Zugang anlegen")
+    with konto_sperre:
+        if not sb.buecherei_zugang_frei():
+            raise ApiFehler("Es gibt schon einen gültigen Bücherei-Zugang. Bitte bei der Lehrkraft oder beim Admin melden.", 403)
+        if not text(body, "name"):
+            raise ApiFehler("Bitte deinen Namen eingeben.")
+        try:
+            with sb.db_connection() as conn:
+                neu = sb.benutzer_anlegen(conn, text(body, "benutzername"), text(body, "name"), "buecherei",
+                                          neues_passwort(body), selbst=True)
+        except ValueError as e:
+            raise ApiFehler(str(e))
+    print(f"👋 Neue Bücherei-Kraft hat sich angemeldet: {text(body, 'name')}")
+    angemeldet(h, neu)
+    return {"gueltig_bis": sb.naechster_stichtag().isoformat()}
+
+
+def api_notfall(h, body):
+    """Admin-Passwort vergessen: mit dem ausgedruckten Notfall-Code ein neues setzen."""
+    nur_lokal(h, "Der Notfall-Zugang")
+    fehlversuch_pruefen("#notfall")
+    if not sb.notfall_code_pruefen(text(body, "code")):
+        fehlversuch_merken("#notfall")
+        raise ApiFehler("Der Notfall-Code stimmt nicht.", 401)
+    passwort = neues_passwort(body)
+    fehlversuche.pop("#notfall", None)
+    with sb.db_connection() as conn:
+        admins = sorted(sb.benutzer_laden(conn, "rolle = 'admin'"), key=lambda b: b["id"])  # der zuerst angelegte Admin
+        if not admins:
+            raise ApiFehler("Es gibt keinen Admin. Bitte am PC „python ScanBook.py --admin-reset“ ausführen.")
+        admin = admins[0]
+        sb.passwort_setzen(conn, admin["id"], passwort)
+        conn.execute("UPDATE benutzer SET gesperrt = 0 WHERE id = ?", (admin["id"],))
+    fehlversuche.pop(admin["benutzername"].lower(), None)
+    angemeldet(h, admin["id"])
+    return {"benutzername": admin["benutzername"], "notfall_code": sb.notfall_code_neu()}
+
+
+def api_passwort_aendern(h, body):
+    if not sb.passwort_pruefen(str(body.get("alt") or ""), h.benutzer["passwort"]):
+        raise ApiFehler("Das bisherige Passwort stimmt nicht.")
+    passwort = neues_passwort(body, "neu")
+    with sb.db_connection() as conn:
+        sb.passwort_setzen(conn, h.benutzer["id"], passwort)
+    h.cookie_setzen(sitzung_neu(h.benutzer["id"]))  # alte Sitzungen sind beim Passwortwechsel beendet
+    return {"ok": True}
+
+
+def nur_verwalter(h):
+    if h.benutzer["rolle"] not in ("admin", "lehrkraft"):
+        raise ApiFehler("Das dürfen nur Lehrkräfte und Admins.", 403)
+
+
+def api_benutzer(h, _):
+    nur_verwalter(h)
+    with sb.db_connection() as conn:
+        liste = sb.benutzer_laden(conn)
+    return {"benutzer": [benutzer_daten(b, h.benutzer) for b in liste], "stichtag": sb.naechster_stichtag().isoformat()}
+
+
+def api_benutzer_anlegen(h, body):
+    nur_verwalter(h)
+    rolle = text(body, "rolle")
+    if not darf_verwalten(h.benutzer, {"rolle": rolle}):
+        raise ApiFehler("Lehrkräfte können nur Zugänge für Bücherei-Kräfte anlegen.", 403)
+    try:
+        with sb.db_connection() as conn:
+            sb.benutzer_anlegen(conn, text(body, "benutzername"), text(body, "name"), rolle,
+                                neues_passwort(body), passwort_aendern=True)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return api_benutzer(h, None)
+
+
+def api_benutzer_aendern(h, body):
+    nur_verwalter(h)
+    aktion = text(body, "aktion")
+    with sb.db_connection() as conn:
+        treffer = sb.benutzer_laden(conn, "id = ?", (body.get("id"),))
+        if not treffer:
+            raise ApiFehler("Diesen Zugang gibt es nicht mehr.", 404)
+        ziel = treffer[0]
+        if not darf_verwalten(h.benutzer, ziel):
+            raise ApiFehler("Lehrkräfte können nur Zugänge von Bücherei-Kräften ändern.", 403)
+        if aktion in ("sperren", "loeschen"):
+            if ziel["id"] == h.benutzer["id"]:
+                raise ApiFehler("Den eigenen Zugang kannst du nicht sperren oder löschen.")
+            if ziel["rolle"] == "admin" and not sb.aktive_admins(conn, ausser=ziel["id"]):
+                raise ApiFehler("Es muss immer mindestens einen Admin geben.")
+        if aktion == "sperren":
+            conn.execute("UPDATE benutzer SET gesperrt = 1, bestaetigt = 1 WHERE id = ?", (ziel["id"],))
+            conn.execute("DELETE FROM sitzungen WHERE benutzer_id = ?", (ziel["id"],))
+        elif aktion == "entsperren":
+            conn.execute("UPDATE benutzer SET gesperrt = 0 WHERE id = ?", (ziel["id"],))
+        elif aktion == "bestaetigen":
+            conn.execute("UPDATE benutzer SET bestaetigt = 1 WHERE id = ?", (ziel["id"],))
+        elif aktion == "verlaengern":
+            if ziel["rolle"] != "buecherei":
+                raise ApiFehler("Nur Bücherei-Zugänge haben ein Ablaufdatum.")
+            bisher = date.fromisoformat(ziel["gueltig_bis"]) if ziel["gueltig_bis"] else sb.heute()
+            ab = max(bisher + timedelta(days=1), sb.heute())
+            conn.execute("UPDATE benutzer SET gueltig_bis = ? WHERE id = ?", (sb.naechster_stichtag(ab).isoformat(), ziel["id"]))
+        elif aktion == "passwort":
+            try:
+                sb.passwort_setzen(conn, ziel["id"], neues_passwort(body), muss_aendern=True)
+            except ValueError as e:
+                raise ApiFehler(str(e))
+            conn.execute("UPDATE benutzer SET gesperrt = 0 WHERE id = ?", (ziel["id"],))
+            fehlversuche.pop(ziel["benutzername"].lower(), None)
+        elif aktion == "loeschen":
+            conn.execute("DELETE FROM sitzungen WHERE benutzer_id = ?", (ziel["id"],))
+            conn.execute("DELETE FROM benutzer WHERE id = ?", (ziel["id"],))
+        else:
+            raise ApiFehler("Unbekannte Aktion.")
+    return api_benutzer(h, None)
+
+
+def api_notfall_neu(h, _):
+    return {"notfall_code": sb.notfall_code_neu()}
+
+
 # --- BARCODES (Code 128, ohne Zusatzpakete) ---
 # Breiten von Strich/Lücke/Strich/Lücke/Strich/Lücke für die Werte 0–106 (104 = Start B, 106 = Stopp)
 CODE128 = (
@@ -1006,10 +1308,30 @@ POST_ROUTEN = {
 
 EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste")
 
+# Diese Aufrufe bekommen den Handler (angemeldeter Benutzer, Cookie, Adresse) mit
+KONTO_GET = {"anmeldung": api_anmeldung, "benutzer": api_benutzer}
+KONTO_POST = {
+    "login": api_login,
+    "logout": api_logout,
+    "einrichten": api_einrichten,
+    "bufdi_anlegen": api_bufdi_anlegen,
+    "notfall": api_notfall,
+    "passwort_aendern": api_passwort_aendern,
+    "benutzer_anlegen": api_benutzer_anlegen,
+    "benutzer_aendern": api_benutzer_aendern,
+    "notfall_neu": api_notfall_neu,
+}
+OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
+VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
+NUR_ADMIN_POST = {"settings", "backup_ordner", "update_install", "notfall_neu"}
+
 
 # --- WEBSERVER ---
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScanBook"
+    neues_cookie = None
+    token = ""
+    benutzer = None
 
     def log_message(self, *args):
         pass  # Terminal nicht mit Zugriffen vollschreiben
@@ -1022,6 +1344,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for name, wert in (extra_header or {}).items():
             self.send_header(name, wert)
+        if self.neues_cookie:
+            self.send_header("Set-Cookie", self.neues_cookie)
         self.end_headers()
         self.wfile.write(daten)
 
@@ -1033,6 +1357,33 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
         if host not in ERLAUBTE_HOSTS:
             self._json(403, {"fehler": "Zugriff verweigert."})
+            return False
+        return True
+
+    def ist_lokal(self):
+        return self.client_address[0] in LOKALE_ADRESSEN
+
+    def cookie_setzen(self, token, loeschen=False):
+        alter = 0 if loeschen else SITZUNG_MINUTEN * 60 * 12  # die Sitzung selbst endet nach SITZUNG_MINUTEN ohne Klick
+        self.neues_cookie = f"{SITZUNG_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={alter}"
+
+    def _anmelden(self, name):
+        """Liest die Sitzung aus dem Cookie. False = Anfrage wurde schon mit einem Fehler beantwortet."""
+        self.neues_cookie = None
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie") or "")
+        except Exception:
+            pass
+        self.token = cookie[SITZUNG_COOKIE].value if SITZUNG_COOKIE in cookie else ""
+        self.benutzer = sitzung_benutzer(self.token)
+        if name in OHNE_ANMELDUNG:
+            return True
+        if not self.benutzer:
+            self._json(401, {"fehler": "Bitte anmelden.", "anmelden": True})
+            return False
+        if self.benutzer["passwort_aendern"] and name not in VOR_PASSWORTWECHSEL:
+            self._json(403, {"fehler": "Bitte zuerst ein eigenes Passwort festlegen.", "passwort_aendern": True})
             return False
         return True
 
@@ -1050,9 +1401,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urlparse(self.path)
         params = {k: v[0] for k, v in parse_qs(url.query).items()}
+        name = url.path[5:] if url.path.startswith("/api/") else url.path
 
         if url.path == "/":
+            self.neues_cookie = None
             self._senden(200, HTML, "text/html; charset=utf-8")
+            return
+        if not self._anmelden(name):
+            return
+        if name in KONTO_GET:
+            self._api_ausfuehren(lambda p: KONTO_GET[name](self, p), params)
         elif url.path.startswith("/api/") and url.path[5:] in GET_ROUTEN:
             self._api_ausfuehren(GET_ROUTEN[url.path[5:]], params)
         elif url.path.startswith("/druck/") and url.path[7:] in DRUCK_ROUTEN:
@@ -1080,8 +1438,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"fehler": "Zugriff verweigert."})
             return
         name = urlparse(self.path).path[5:]
-        if not self.path.startswith("/api/") or name not in POST_ROUTEN:
+        if not self.path.startswith("/api/") or (name not in POST_ROUTEN and name not in KONTO_POST):
+            self.neues_cookie = None
             self._json(404, {"fehler": "Nicht gefunden."})
+            return
+        if not self._anmelden(name):
+            return
+        if name in NUR_ADMIN_POST and self.benutzer["rolle"] != "admin":
+            self._json(403, {"fehler": "Das darf nur ein Admin."})
             return
         try:
             laenge = int(self.headers.get("Content-Length") or 0)
@@ -1091,7 +1455,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(400, {"fehler": "Ungültige Anfrage."})
             return
-        self._api_ausfuehren(POST_ROUTEN[name], body)
+        if name in KONTO_POST:
+            self._api_ausfuehren(lambda b: KONTO_POST[name](self, b), body)
+        else:
+            self._api_ausfuehren(POST_ROUTEN[name], body)
 
 
 server_ref = {}
@@ -1113,6 +1480,7 @@ def main():
     sb.auto_backup()
     sb.init_db()
     sb.alte_ausleihen_loeschen()
+    alte_sitzungen_loeschen()
 
     server, port = starte_server()
     server_ref["server"] = server
@@ -1310,6 +1678,40 @@ dialog[open] { animation: sheet .28s cubic-bezier(.2, .9, .3, 1); }
 dialog::backdrop { background: rgba(0, 0, 0, .35); }
 dialog .dlg-body { padding: 24px; }
 dialog h2 { margin: 0 0 4px; font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+/* Anmeldung */
+body.abgemeldet > header, body.abgemeldet > main { visibility: hidden; }
+.anmelde-schirm { position: fixed; inset: 0; z-index: 50; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 24px 16px; overflow-y: auto; }
+.anmelde-karte { width: 100%; max-width: 410px; margin: auto; background: var(--surface); border-radius: 18px; padding: 28px 26px 24px; }
+.anmelde-kopf { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+.anmelde-kopf .logo { width: 46px; height: 46px; border-radius: 11px; flex: none; }
+.anmelde-kopf b { display: block; font-size: 20px; letter-spacing: -.02em; }
+.anmelde-kopf span { color: var(--muted); font-size: 13px; }
+.anmelde-karte h2 { margin: 0 0 6px; font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+.anmelde-karte form > div { margin-bottom: 12px; }
+.anmelde-karte .btn[type="submit"] { width: 100%; padding-top: 11px; padding-bottom: 11px; }
+.anmelde-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-top: 6px; }
+.anmelde-links .link { margin-top: 8px; }
+.notfall-code { font: 600 22px/1.3 ui-monospace, Menlo, Consolas, monospace; letter-spacing: .06em; text-align: center; background: var(--fill); padding: 14px 10px; border-radius: 12px; margin: 12px 0 14px; user-select: all; overflow-wrap: anywhere; }
+.konto { margin: auto 8px 30px; padding-top: 14px; border-top: .5px solid rgba(255, 255, 255, .14); color: var(--side-text); font-size: 13px; }
+.konto b { display: block; color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.konto .rolle { color: var(--side-muted); font-size: 12px; }
+.konto .row { gap: 6px; margin-top: 8px; }
+.konto button { border: 0; background: var(--side-hover); color: var(--side-text); font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; cursor: pointer; }
+.konto button:hover { background: var(--side-active); }
+.konto .kurz { display: none; }
+@media (max-width: 480px) { .brand .bib { display: none; } }
+@media (max-width: 860px) {
+  .header-inner { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
+  .konto { margin: 0; padding: 0; border: 0; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .konto > div:first-child, .konto .lang { display: none; }
+  .konto .kurz { display: inline; }
+  .konto .row { margin: 0; flex-wrap: nowrap; }
+}
+body:not([data-rolle="admin"]) .nur-admin { display: none !important; }
+body[data-rolle="buecherei"] .nur-verwalter { display: none !important; }
+.benutzer-neu { background: var(--warn-soft); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 14px; }
+.benutzer-neu .actions { margin-top: 8px; }
+td .aktionen { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 #toasts { position: fixed; top: 18px; right: 20px; left: 20px; display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 100; pointer-events: none; }
 .toast {
   pointer-events: auto; max-width: 440px; padding: 11px 18px; border-radius: 999px; font-size: 14px; font-weight: 500;
@@ -1490,7 +1892,7 @@ td.titel-zelle { min-width: 220px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
-<body>
+<body class="abgemeldet">
 <header>
   <div class="header-inner">
     <div class="brand">
@@ -1512,6 +1914,10 @@ td.titel-zelle { min-width: 220px; }
       <button data-tab="regale"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M7 5.5v2M10 5.5v2M7 11.5v2M14 17.5v2M17 17.5v2"/></svg><span>Regale</span></button>
       <button data-tab="verwaltung"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg><span>Verwaltung</span></button>
     </nav>
+    <div class="konto" id="konto">
+      <div><b id="konto-name"></b><span class="rolle" id="konto-rolle"></span></div>
+      <div class="row"><button type="button" id="konto-pw"><span class="lang">Passwort ändern</span><span class="kurz">Passwort</span></button><button type="button" id="konto-ab">Abmelden</button></div>
+    </div>
   </div>
 </header>
 
@@ -1720,6 +2126,31 @@ td.titel-zelle { min-width: 220px; }
 
   <!-- VERWALTUNG -->
   <section id="tab-verwaltung">
+    <div class="card nur-verwalter" id="benutzer-karte">
+      <h2>Benutzer &amp; Zugänge</h2>
+      <p class="hint">Admins und Lehrkräfte bleiben dauerhaft. Zugänge der Bücherei-Kraft enden automatisch am 31.07. Gibt es danach keinen gültigen Bücherei-Zugang mehr, kann sich die neue Kraft direkt am Bücherei-PC selbst einen anlegen.</p>
+      <div id="benutzer-neu"></div>
+      <div class="table-wrap" style="margin-bottom:0"><table>
+        <thead><tr><th>Name</th><th>Rolle</th><th>Gültig bis</th><th>Status</th><th></th></tr></thead>
+        <tbody id="benutzer-liste"></tbody>
+      </table></div>
+      <h3 style="margin-top:22px">Neuen Zugang anlegen</h3>
+      <p class="hint">Mit einem Startpasswort, das du der Person sagst. Beim ersten Anmelden legt sie ein eigenes Passwort fest.</p>
+      <form id="benutzer-form">
+        <div class="form-grid">
+          <div><label for="bn-name">Name</label><input id="bn-name" name="name" required autocomplete="off"></div>
+          <div><label for="bn-benutzername">Benutzername</label><input id="bn-benutzername" name="benutzername" required autocomplete="off" autocapitalize="none"></div>
+          <div><label for="bn-rolle">Rolle</label><select id="bn-rolle" name="rolle"></select></div>
+          <div><label for="bn-passwort">Startpasswort (mind. 8 Zeichen)</label><input id="bn-passwort" name="passwort" required minlength="8" autocomplete="off"></div>
+        </div>
+        <div class="actions"><button class="btn" type="submit">Zugang anlegen</button></div>
+      </form>
+      <div class="nur-admin">
+        <h3 style="margin-top:22px">🆘 Notfall-Code</h3>
+        <p class="hint">Mit dem Notfall-Code lässt sich am Bücherei-PC ein neues Admin-Passwort setzen, falls es vergessen wurde. Ausgedruckt z. B. im Sekretariat aufbewahren. Ein neuer Code macht den alten ungültig. Am PC geht es außerdem immer mit <code>python ScanBook.py --admin-reset</code>.</p>
+        <button class="btn secondary" type="button" id="notfall-neu">Neuen Notfall-Code erzeugen</button>
+      </div>
+    </div>
     <div class="tiles" id="stat-tiles"></div>
     <div class="grid-2" style="margin-bottom:22px">
       <div class="card">
@@ -1736,8 +2167,8 @@ td.titel-zelle { min-width: 220px; }
         <h3 style="margin-top:22px">💾 Datensicherung</h3>
         <p class="hint" id="backup-info">Einmal täglich wird automatisch gesichert. Hier kannst du zusätzlich ein Backup erstellen.</p>
         <p class="hint hidden" id="backup-warnung" style="color:var(--danger)"></p>
-        <label for="backup-ordner">Zusätzlich sichern nach (z. B. USB-Stick, OneDrive oder Netzlaufwerk)</label>
-        <div class="row">
+        <label class="nur-admin" for="backup-ordner">Zusätzlich sichern nach (z. B. USB-Stick, OneDrive oder Netzlaufwerk)</label>
+        <div class="row nur-admin">
           <input id="backup-ordner" class="grow" placeholder="z. B. E:\ScanBook-Backups oder C:\Users\…\OneDrive\ScanBook" autocomplete="off">
           <button class="btn secondary" type="button" id="backup-ordner-btn">Speichern</button>
         </div>
@@ -1754,7 +2185,7 @@ td.titel-zelle { min-width: 220px; }
         <button class="btn secondary" type="button" id="etiketten-drucken">Neue Etiketten drucken</button>
       </div>
     </div>
-    <div class="card">
+    <div class="card nur-admin">
       <h2>Stammdaten &amp; Einstellungen</h2>
       <p class="hint">Abgeschlossene Ausleihen werden nach der Löschfrist beim Programmstart automatisch gelöscht (Datenschutz).</p>
       <form id="settings-form">
@@ -1762,7 +2193,7 @@ td.titel-zelle { min-width: 220px; }
         <div class="actions"><button class="btn" type="submit">Speichern</button></div>
       </form>
     </div>
-    <div class="card" id="update-karte">
+    <div class="card nur-admin" id="update-karte">
       <h2>Programm-Update</h2>
       <p class="hint" id="update-text">Prüft auf GitHub, ob es eine neuere Version von ScanBook gibt. Deine Daten bleiben beim Update erhalten.</p>
       <div class="actions" style="margin-top:0">
@@ -1915,6 +2346,83 @@ td.titel-zelle { min-width: 220px; }
 
 <datalist id="klassen-liste"></datalist>
 <datalist id="serien-liste"></datalist>
+<!-- ANMELDUNG -->
+<div class="anmelde-schirm hidden" id="anmeldung">
+  <div class="anmelde-karte">
+    <div class="anmelde-kopf"><span id="anm-logo"></span><div><b>ScanBook</b><span id="anm-bib"></span></div></div>
+
+    <form class="ansicht" data-ansicht="login" id="anm-login">
+      <h2>Anmelden</h2>
+      <div><label for="al-name">Benutzername</label><input id="al-name" name="benutzername" required autocomplete="username" autocapitalize="none"></div>
+      <div><label for="al-pw">Passwort</label><input id="al-pw" name="passwort" type="password" required autocomplete="current-password"></div>
+      <button class="btn" type="submit">Anmelden</button>
+      <div class="anmelde-links">
+        <button class="link hidden" type="button" data-zu="bufdi" id="anm-bufdi-link">Ich bin die neue Bücherei-Kraft</button>
+        <button class="link hidden" type="button" data-zu="notfall" id="anm-notfall-link">Admin-Passwort vergessen?</button>
+      </div>
+    </form>
+
+    <form class="ansicht hidden" data-ansicht="einrichten" id="anm-einrichten">
+      <h2>ScanBook einrichten</h2>
+      <p class="hint">Lege zuerst den Admin-Zugang an. Der Admin kann danach Zugänge für Lehrkräfte und die Bücherei-Kraft anlegen.</p>
+      <div><label for="ae-name">Dein Name</label><input id="ae-name" name="name" required autocomplete="name"></div>
+      <div><label for="ae-benutzer">Benutzername</label><input id="ae-benutzer" name="benutzername" required autocomplete="username" autocapitalize="none"></div>
+      <div><label for="ae-pw">Passwort (mind. 8 Zeichen)</label><input id="ae-pw" name="passwort" type="password" required minlength="8" autocomplete="new-password"></div>
+      <div><label for="ae-pw2">Passwort wiederholen</label><input id="ae-pw2" name="passwort2" type="password" required autocomplete="new-password"></div>
+      <button class="btn" type="submit">Admin anlegen</button>
+    </form>
+
+    <form class="ansicht hidden" data-ansicht="bufdi" id="anm-bufdi">
+      <h2>Willkommen in der Bücherei!</h2>
+      <p class="hint" id="anm-bufdi-text"></p>
+      <div><label for="ab-name">Dein Name</label><input id="ab-name" name="name" required autocomplete="name"></div>
+      <div><label for="ab-benutzer">Benutzername</label><input id="ab-benutzer" name="benutzername" required autocomplete="username" autocapitalize="none"></div>
+      <div><label for="ab-pw">Passwort (mind. 8 Zeichen)</label><input id="ab-pw" name="passwort" type="password" required minlength="8" autocomplete="new-password"></div>
+      <div><label for="ab-pw2">Passwort wiederholen</label><input id="ab-pw2" name="passwort2" type="password" required autocomplete="new-password"></div>
+      <button class="btn" type="submit">Zugang anlegen</button>
+      <div class="anmelde-links"><button class="link" type="button" data-zu="login">Zurück zur Anmeldung</button></div>
+    </form>
+
+    <form class="ansicht hidden" data-ansicht="notfall" id="anm-notfall">
+      <h2>Admin-Passwort vergessen</h2>
+      <p class="hint">Gib den ausgedruckten Notfall-Code ein und lege ein neues Admin-Passwort fest. Ohne Code geht es am PC mit <code>python ScanBook.py --admin-reset</code>.</p>
+      <div><label for="an-code">Notfall-Code</label><input id="an-code" name="code" required autocomplete="off" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX-XXXX"></div>
+      <div><label for="an-pw">Neues Admin-Passwort (mind. 8 Zeichen)</label><input id="an-pw" name="passwort" type="password" required minlength="8" autocomplete="new-password"></div>
+      <div><label for="an-pw2">Passwort wiederholen</label><input id="an-pw2" name="passwort2" type="password" required autocomplete="new-password"></div>
+      <button class="btn" type="submit">Neues Passwort setzen</button>
+      <div class="anmelde-links"><button class="link" type="button" data-zu="login">Zurück zur Anmeldung</button></div>
+    </form>
+
+    <div class="ansicht hidden" data-ansicht="code">
+      <h2>🆘 Dein Notfall-Code</h2>
+      <p class="hint" id="anm-code-text"></p>
+      <div class="notfall-code" id="anm-code"></div>
+      <p class="hint">Bitte ausdrucken oder aufschreiben und sicher aufbewahren, z. B. im Sekretariat. Der Code wird nur dieses eine Mal angezeigt.</p>
+      <div class="actions">
+        <button class="btn secondary" type="button" id="anm-code-drucken">Drucken</button>
+        <button class="btn" type="button" id="anm-code-weiter" style="margin-left:auto">Notiert, weiter</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PASSWORT ÄNDERN -->
+<dialog id="pw-dialog">
+  <form id="pw-form" class="dlg-body">
+    <h2>Passwort ändern</h2>
+    <p class="hint" id="pw-hint"></p>
+    <div class="form-grid">
+      <div class="full"><label for="pw-alt" id="pw-alt-label">Bisheriges Passwort</label><input id="pw-alt" name="alt" type="password" required autocomplete="current-password"></div>
+      <div><label for="pw-neu">Neues Passwort (mind. 8 Zeichen)</label><input id="pw-neu" name="neu" type="password" required minlength="8" autocomplete="new-password"></div>
+      <div><label for="pw-neu2">Wiederholen</label><input id="pw-neu2" name="neu2" type="password" required autocomplete="new-password"></div>
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">Speichern</button>
+      <button class="btn secondary" type="button" id="pw-abbrechen" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
 <div id="toasts"></div>
 
 <script>
@@ -1947,9 +2455,13 @@ function toast(text, fehler = false) {
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), fehler ? 6000 : 3500);
 }
+function anmeldungNoetig(daten) {
+  if (daten.anmelden) zeigeAnmeldung();
+  else if (daten.passwort_aendern) zeigePasswortDialog(true);
+}
 async function antwort(res) {
   const daten = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(daten.fehler || "Unbekannter Fehler");
+  if (!res.ok) { anmeldungNoetig(daten); throw new Error(daten.fehler || "Unbekannter Fehler"); }
   return daten;
 }
 async function get(name, params = {}) {
@@ -2014,7 +2526,7 @@ async function getNeu(name, params = {}) {
   const text = await res.text();
   let daten = {};
   try { daten = JSON.parse(text); } catch { /* leer lassen */ }
-  if (!res.ok) throw new Error(daten.fehler || "Unbekannter Fehler");
+  if (!res.ok) { anmeldungNoetig(daten); throw new Error(daten.fehler || "Unbekannter Fehler"); }
   if (letzteAntwort.get(name) === text) return null;
   letzteAntwort.set(name, text);
   return daten;
@@ -2059,7 +2571,11 @@ const LADER = {
   regale: () => ladeRegale(),
   ausleihe: () => { ladeAusleihen(); ladeNamen(); (ausleihPerson ? $("#co-isbn") : $("#co-name")).focus(); },
   schueler: () => (schuelerAnsicht === "verlauf" ? ladePersonen() : ladeSchueler()),
-  verwaltung: () => { ladeStatistik(); ladeCodesStatus(); ladeEinstellungen(); ladeBackups(); },
+  verwaltung: () => {
+    if (ich?.rolle !== "buecherei") ladeBenutzer();
+    ladeStatistik(); ladeCodesStatus(); ladeBackups();
+    if (ich?.rolle === "admin") ladeEinstellungen();
+  },
 };
 // Alte Lesezeichen weiter unterstützen
 const ALTE_TABS = { personen: "schueler", statistik: "verwaltung", einstellungen: "verwaltung" };
@@ -3416,11 +3932,210 @@ $("#settings-form").addEventListener("submit", (e) => {
   });
 });
 
+// --- Anmeldung ---
+let ich = null, gestartet = false;
+$("#anm-logo").replaceWith($(".brand .logo").cloneNode(true));
+function anmeldeAnsicht(name) {
+  document.querySelectorAll("#anmeldung .ansicht").forEach((el) => el.classList.toggle("hidden", el.dataset.ansicht !== name));
+  setTimeout(() => $(`#anmeldung [data-ansicht="${name}"] input`)?.focus(), 30);
+}
+async function zeigeAnmeldung(ansicht) {
+  if (!$("#anmeldung").classList.contains("hidden") && !ansicht) return;
+  document.querySelectorAll("dialog[open]").forEach((d) => d.close());
+  document.body.classList.add("abgemeldet");
+  $("#anmeldung").classList.remove("hidden");
+  const d = await get("anmeldung");
+  $("#anm-bib").textContent = d.bib_name;
+  $("#anm-bufdi-link").classList.toggle("hidden", !d.bufdi_frei);
+  $("#anm-notfall-link").classList.toggle("hidden", !d.lokal);
+  $("#anm-bufdi-text").textContent = `Leg dir hier deinen eigenen Zugang an. Er gilt bis zum ${deDatum(d.stichtag)}, dann übernimmt deine Nachfolge die Bücherei.`;
+  anmeldeAnsicht(d.eingerichtet ? (ansicht || "login") : "einrichten");
+}
+function angemeldetAls(b) {
+  ich = b;
+  document.body.dataset.rolle = b.rolle;
+  $("#konto-name").textContent = b.name;
+  $("#konto-rolle").textContent = b.rolle_text + (b.gueltig_bis ? ` · bis ${deDatum(b.gueltig_bis)}` : "");
+  $("#anmeldung").classList.add("hidden");
+  document.body.classList.remove("abgemeldet");
+  document.querySelectorAll("#anmeldung form").forEach((f) => f.reset());
+  if (b.passwort_aendern) { zeigePasswortDialog(true); return; }
+  if (!gestartet) {
+    gestartet = true;
+    ladeInfo().catch((e) => toast(e.message, true));
+    katalogHolen().catch(() => {});
+    zeigeTab(location.hash.slice(1));
+    if (b.rolle === "admin") get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund
+  } else {
+    zeigeTab(location.hash.slice(1));
+  }
+}
+async function anmeldungPruefen() {
+  const d = await get("anmeldung");
+  if (d.benutzer) angemeldetAls(d.benutzer); else zeigeAnmeldung();
+}
+function gleichePasswoerter(form, a = "passwort", b = "passwort2") {
+  if (form.elements[a].value === form.elements[b].value) return true;
+  toast("Die Passwörter stimmen nicht überein.", true);
+  form.elements[b].focus();
+  return false;
+}
+let nachCode = null;
+function zeigeNotfallCode(code, text, weiter) {
+  $("#anm-code").textContent = code;
+  $("#anm-code-text").textContent = text;
+  nachCode = weiter;
+  document.body.classList.add("abgemeldet");
+  $("#anmeldung").classList.remove("hidden");
+  anmeldeAnsicht("code");
+}
+$("#anm-code-weiter").addEventListener("click", () => { $("#anm-code").textContent = ""; (nachCode || anmeldungPruefen)(); });
+$("#anm-code-drucken").addEventListener("click", () => {
+  const w = window.open("", "_blank");
+  if (!w) return;
+  w.document.write(`<!doctype html><meta charset="utf-8"><title>ScanBook Notfall-Code</title>
+    <body style="font-family:sans-serif;padding:40px"><h1>ScanBook – Notfall-Code</h1>
+    <p>Damit lässt sich am Bücherei-PC unter „Admin-Passwort vergessen?“ ein neues Admin-Passwort setzen.</p>
+    <p style="font:700 28px monospace;letter-spacing:.06em;border:2px solid #000;padding:16px;display:inline-block">${esc($("#anm-code").textContent)}</p>
+    <p>Erstellt am ${new Date().toLocaleDateString("de-DE")}. Ein neuer Code macht diesen ungültig. Sicher aufbewahren.</p>`);
+  w.document.close();
+  w.print();
+});
+document.querySelectorAll("#anmeldung [data-zu]").forEach((b) => b.addEventListener("click", () => anmeldeAnsicht(b.dataset.zu)));
+$("#anm-login").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => { await post("login", formDaten(e.target)); await anmeldungPruefen(); });
+});
+$("#anm-einrichten").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!gleichePasswoerter(e.target)) return;
+  versuche(async () => {
+    const r = await post("einrichten", formDaten(e.target));
+    zeigeNotfallCode(r.notfall_code, "Damit kannst du ein neues Admin-Passwort setzen, falls du deins vergisst.");
+  });
+});
+$("#anm-bufdi").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!gleichePasswoerter(e.target)) return;
+  versuche(async () => {
+    const r = await post("bufdi_anlegen", formDaten(e.target));
+    toast(`Willkommen! Dein Zugang gilt bis ${deDatum(r.gueltig_bis)}.`);
+    await anmeldungPruefen();
+  });
+});
+$("#anm-notfall").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!gleichePasswoerter(e.target)) return;
+  versuche(async () => {
+    const r = await post("notfall", formDaten(e.target));
+    zeigeNotfallCode(r.notfall_code, `Neues Passwort für „${r.benutzername}“ gespeichert. Der alte Notfall-Code gilt nicht mehr, hier ist der neue:`);
+  });
+});
+$("#konto-ab").addEventListener("click", () => versuche(async () => { await post("logout"); location.reload(); }));
+
+// --- Passwort ändern ---
+let pwPflicht = false;
+function zeigePasswortDialog(pflicht = false) {
+  pwPflicht = pflicht;
+  const dlg = $("#pw-dialog");
+  $("#pw-form").reset();
+  $("#pw-hint").textContent = pflicht ? "Dein Zugang wurde mit einem Startpasswort angelegt. Bitte leg jetzt ein eigenes Passwort fest, das nur du kennst." : "";
+  $("#pw-alt-label").textContent = pflicht ? "Startpasswort" : "Bisheriges Passwort";
+  $("#pw-abbrechen").classList.toggle("hidden", pflicht);
+  if (!dlg.open) dlg.showModal();
+}
+$("#pw-dialog").addEventListener("cancel", (e) => { if (pwPflicht) e.preventDefault(); });
+$("#pw-abbrechen").addEventListener("click", () => $("#pw-dialog").close());
+$("#konto-pw").addEventListener("click", () => zeigePasswortDialog(false));
+$("#pw-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!gleichePasswoerter(e.target, "neu", "neu2")) return;
+  versuche(async () => {
+    await post("passwort_aendern", formDaten(e.target));
+    pwPflicht = false;
+    $("#pw-dialog").close();
+    toast("Neues Passwort gespeichert");
+    await anmeldungPruefen();
+  });
+});
+
+// --- Benutzer verwalten ---
+let benutzerListe = [];
+function benutzerStatus(b) {
+  if (b.gesperrt) return '<span class="badge danger">Gesperrt</span>';
+  if (b.abgelaufen) return '<span class="badge warn">Abgelaufen</span>';
+  if (b.passwort_aendern) return '<span class="badge warn">Startpasswort</span>';
+  return '<span class="badge ok">Aktiv</span>';
+}
+function zeitText(iso) {
+  return iso ? new Date(iso).toLocaleString("de-DE", { dateStyle: "medium", timeStyle: "short" }) : "";
+}
+function zeigeBenutzer(d) {
+  benutzerListe = d.benutzer;
+  const neu = d.benutzer.filter((b) => b.selbst_angelegt && !b.bestaetigt && !b.gesperrt && !b.abgelaufen);
+  $("#benutzer-neu").innerHTML = neu.map((b) => `<div class="benutzer-neu">👋 <b>Neue Bücherei-Kraft:</b> ${esc(b.name)} (${esc(b.benutzername)})
+    hat sich am ${esc(zeitText(b.angelegt_am))} selbst einen Zugang angelegt. Falls das nicht die richtige Person ist, bitte sperren.
+    <div class="actions"><button class="btn small" type="button" data-aktion="bestaetigen" data-id="${b.id}">Passt so</button>
+    <button class="btn small danger" type="button" data-aktion="sperren" data-id="${b.id}">Sperren</button></div></div>`).join("");
+  $("#benutzer-liste").innerHTML = d.benutzer.map((b) => {
+    const knoepfe = !b.darf_bearbeiten ? "" : [
+      `<button class="btn small secondary" type="button" data-aktion="passwort" data-id="${b.id}">Passwort zurücksetzen</button>`,
+      b.rolle === "buecherei" ? `<button class="btn small secondary" type="button" data-aktion="verlaengern" data-id="${b.id}">+1 Jahr</button>` : "",
+      b.ich ? "" : b.gesperrt
+        ? `<button class="btn small secondary" type="button" data-aktion="entsperren" data-id="${b.id}">Entsperren</button>`
+        : `<button class="btn small secondary" type="button" data-aktion="sperren" data-id="${b.id}">Sperren</button>`,
+      b.ich ? "" : `<button class="btn small danger" type="button" data-aktion="loeschen" data-id="${b.id}">Löschen</button>`,
+    ].join("");
+    return `<tr><td><b>${esc(b.name)}</b>${b.ich ? " (du)" : ""}<div class="sub">${esc(b.benutzername)}${b.letzte_anmeldung ? " · zuletzt " + esc(zeitText(b.letzte_anmeldung)) : ""}</div></td>
+      <td>${esc(b.rolle_text)}</td><td class="num">${b.gueltig_bis ? deDatum(b.gueltig_bis) : "dauerhaft"}</td>
+      <td>${benutzerStatus(b)}</td><td><div class="aktionen">${knoepfe}</div></td></tr>`;
+  }).join("") || '<tr><td colspan="5" class="empty">Noch keine Zugänge.</td></tr>';
+  const rollen = ich.rolle === "admin" ? [["buecherei", "Bücherei-Kraft (bis " + deDatum(d.stichtag) + ")"], ["lehrkraft", "Lehrkraft (dauerhaft)"], ["admin", "Admin (dauerhaft)"]]
+    : [["buecherei", "Bücherei-Kraft (bis " + deDatum(d.stichtag) + ")"]];
+  const gewaehlt = $("#bn-rolle").value;
+  $("#bn-rolle").innerHTML = rollen.map(([w, t]) => `<option value="${w}"${w === gewaehlt ? " selected" : ""}>${esc(t)}</option>`).join("");
+}
+async function ladeBenutzer() {
+  await versuche(async () => zeigeBenutzer(await get("benutzer")));
+}
+$("#benutzer-karte").addEventListener("click", (e) => {
+  const knopf = e.target.closest("button[data-aktion]");
+  if (!knopf) return;
+  const b = benutzerListe.find((x) => x.id === Number(knopf.dataset.id));
+  const body = { id: b.id, aktion: knopf.dataset.aktion };
+  if (body.aktion === "passwort") {
+    const pw = prompt(`Neues Startpasswort für ${b.name} (mind. 8 Zeichen). Beim nächsten Anmelden muss ein eigenes Passwort festgelegt werden:`);
+    if (!pw) return;
+    body.passwort = pw;
+  }
+  if (body.aktion === "loeschen" && !confirm(`Zugang von ${b.name} wirklich löschen?`)) return;
+  versuche(async () => {
+    zeigeBenutzer(await post("benutzer_aendern", body));
+    toast({ passwort: "Startpasswort gesetzt", sperren: "Zugang gesperrt", entsperren: "Zugang entsperrt", verlaengern: "Zugang verlängert",
+      loeschen: "Zugang gelöscht", bestaetigen: "Danke, ist vermerkt" }[body.aktion]);
+  });
+});
+$("#benutzer-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    zeigeBenutzer(await post("benutzer_anlegen", formDaten(e.target)));
+    toast("Zugang angelegt");
+    e.target.reset();
+  });
+});
+$("#notfall-neu").addEventListener("click", () => {
+  if (!confirm("Neuen Notfall-Code erzeugen? Der bisherige Code gilt dann nicht mehr.")) return;
+  versuche(async () => {
+    const r = await post("notfall_neu");
+    zeigeNotfallCode(r.notfall_code, "Der bisherige Notfall-Code gilt ab jetzt nicht mehr.", () => {
+      $("#anmeldung").classList.add("hidden");
+      document.body.classList.remove("abgemeldet");
+    });
+  });
+});
+
 // --- Start ---
-ladeInfo().catch((e) => toast(e.message, true));
-katalogHolen().catch(() => {});
-zeigeTab(location.hash.slice(1));
-get("update_check").then(zeigeUpdate).catch(() => {});  // still im Hintergrund, Fehler nicht anzeigen
+anmeldungPruefen().catch((e) => toast(e.message, true));
 </script>
 </body>
 </html>

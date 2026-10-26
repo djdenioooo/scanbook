@@ -118,6 +118,26 @@ Jedes Exemplar kann eine eigene Nummer bekommen, die als Etikett im Buch klebt. 
 
 Die Vorsilben für Ausweisnummern (`S`) und Mediencodes (`M`) lassen sich unter „Verwaltung“ ändern. Barcodes werden als Code 128 erzeugt, den jeder übliche Barcode-Scanner liest.
 
+## Anmeldung und Benutzer
+
+Die Browser-Oberfläche ist mit Benutzername und Passwort geschützt. Beim allerersten Start legt man den **Admin** an und bekommt einen **Notfall-Code** angezeigt, den man ausdrucken und sicher aufbewahren sollte (z. B. im Sekretariat).
+
+| Rolle | Gültig | Darf |
+| --- | --- | --- |
+| Admin | dauerhaft | alles, auch Einstellungen, Updates und alle Zugänge verwalten |
+| Lehrkraft | dauerhaft | Ausleihe, Katalog, Regale, Schüler; Zugänge der Bücherei-Kraft anlegen, sperren, verlängern |
+| Bücherei-Kraft | bis 31.07. | Ausleihe, Katalog, Regale, Schüler |
+
+**Jahreswechsel:** Der Zugang der Bücherei-Kraft endet automatisch am 31.07. Gibt es danach keinen gültigen Bücherei-Zugang mehr, erscheint auf der Anmeldeseite „Ich bin die neue Bücherei-Kraft“. Damit legt sich die neue Kraft ohne Hilfe einen eigenen Zugang an (nur direkt am Bücherei-PC). Admin und Lehrkraft sehen das danach in der Verwaltung und können den Zugang bei Bedarf sperren.
+
+**Passwort vergessen:** Admin oder Lehrkraft setzen unter Verwaltung → Benutzer & Zugänge ein Startpasswort. Ist das Admin-Passwort weg, hilft am Bücherei-PC „Admin-Passwort vergessen?“ mit dem Notfall-Code oder im Terminal:
+
+```
+python ScanBook.py --admin-reset
+```
+
+Passwörter werden nur als PBKDF2-Hash gespeichert. Nach 5 falschen Versuchen ist die Anmeldung 5 Minuten gesperrt, nach 60 Minuten ohne Klick wird man abgemeldet. Das Terminal-Programm `ScanBook.py` fragt kein Passwort ab, weil es nur direkt am PC läuft.
+
 ## ISBN-Prüfung
 
 Jede ISBN wird anhand ihrer Prüfziffer kontrolliert, damit Scan- und Tippfehler sofort auffallen. ISBN-10 werden automatisch in ISBN-13 umgerechnet, damit dasselbe Buch nicht doppelt im Katalog landet.
