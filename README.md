@@ -88,6 +88,15 @@ ScanBook verteilt die Bücher dann selbst:
 
 Beim ersten Einräumen werden die Bücher gleichmäßig auf die Fächer verteilt, damit überall Platz für neue bleibt. Wenn alles so im Regal steht, auf „Erledigt – so eingeräumt“ klicken. Danach zeigt ScanBook beim Scannen eines neuen Buchs sofort an, in welches Regal und Fach es gehört. Die übrigen Bücher bleiben stehen, wo sie sind; nur wenn ein Fach zu voll wird, schlägt ScanBook vor, einzelne Bücher ins Nachbarfach umzustellen. Der Standort steht auch in der Buchvorschau und in der Katalogliste (Spalte „Standort“, grau = geplant, noch nicht eingeräumt). Im Katalog lässt sich nach Regal filtern, die Suche findet auch Regalnamen, und der Katalog-Export enthält den Standort.
 
+### Bücher selbst umsortieren
+
+Soll ein Buch an einem bestimmten Platz stehen, stellst du es selbst dorthin. Es bekommt ein 📌 und bleibt in diesem Fach, auch wenn es nach der Sortierung woanders hingehören würde; ScanBook sortiert die übrigen Bücher drumherum und rechnet den Platz mit.
+
+- **Einzelnes Buch:** In der Buchvorschau unter „Standort selbst festlegen“ Regal und Fach wählen, dann „Hierhin stellen“.
+- **Mehrere Bücher:** Im Tab „Regale“ auf „Verschieben“ klicken, die Bücher antippen, unten Regal und Fach wählen und „Hierhin stellen“.
+- **Per Scan direkt am Regal:** „Per Scan einräumen“ (oder „Scannen“ neben einem Fach), Fach wählen und die Bücher scannen, die dort stehen sollen (ISBN oder Mediencode). Terminal: Menüpunkt 16, dann 7.
+- **Wieder automatisch:** löst das 📌, dann sortiert ScanBook das Buch wieder selbst ein (Terminal: Punkt 8).
+
 „Als Liste drucken“ (oben im Tab „Regale“) erzeugt eine Druckseite mit allen Regalen: jedes Regal auf einer eigenen Seite, darin Fach für Fach die Bücher mit Titel, Autor, Genre und Anzahl, dazu ein Kästchen zum Abhaken. Bücher, die noch eingeräumt oder umgestellt werden müssen, sind vermerkt. Mit „Drucken“ neben einem Regal druckst du nur dieses eine.
 
 ## Schülerausweise
