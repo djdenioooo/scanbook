@@ -1477,6 +1477,7 @@ def starte_server():
 
 def main():
     sb.alte_datenbank_uebernehmen()
+    sb.update_backup()
     sb.auto_backup()
     sb.init_db()
     sb.alte_ausleihen_loeschen()

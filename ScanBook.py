@@ -40,6 +40,7 @@ EXPORT_DIR = os.path.join(BASE_DIR, "exporte")
 MAX_AUTO_BACKUPS = 14
 BACKUP_ORDNER_EINSTELLUNG = "backup_ordner"  # optionaler zweiter Ordner, z. B. USB-Stick oder OneDrive
 MAX_UPDATE_BACKUPS = 3
+VERSION_EINSTELLUNG = "programm_version"  # zuletzt gestartete Version, für das Backup vor einem Update
 
 # 🌐 GITHUB DETAILS FÜR AUTOMATISCHE UPDATES:
 GITHUB_REPO = "djdenioooo/scanbook"
@@ -2926,9 +2927,30 @@ def backup_kopieren(pfad, praefix):
             shutil.copy2(pfad, os.path.join(ordner, os.path.basename(pfad)))
             if praefix == "auto":
                 alte_dateien_aufraeumen(ordner, "auto_", MAX_AUTO_BACKUPS)
+            elif praefix == "update":
+                alte_dateien_aufraeumen(ordner, "update_", MAX_UPDATE_BACKUPS)
         except OSError as e:
             fehler = f"Kopieren fehlgeschlagen: {e}"
     backup_status["kopie_fehler"] = fehler
+
+
+def update_backup():
+    """Beim ersten Start einer neuen Programmversion die Datenbank sichern, bevor sie umgebaut wird."""
+    if not os.path.exists(DB_NAME):
+        return
+    try:
+        bisher = get_einstellung(VERSION_EINSTELLUNG)
+    except sqlite3.OperationalError:  # sehr alte Datenbank ohne Einstellungen
+        bisher = ""
+    if bisher == VERSION:
+        return
+    pfad = erstelle_backup("update")
+    alte_dateien_aufraeumen(BACKUP_DIR, "update_", MAX_UPDATE_BACKUPS)
+    print(f"💾 Update {bisher or 'alte Version'} → {VERSION}: Datenbank vorher gesichert ({os.path.basename(pfad)}).")
+    try:
+        set_einstellung(VERSION_EINSTELLUNG, VERSION)
+    except sqlite3.OperationalError:
+        pass  # init_db() legt die Tabelle gleich an, dann klappt es beim nächsten Start
 
 
 def auto_backup():
@@ -3021,6 +3043,7 @@ MENUE = [
 
 def main():
     alte_datenbank_uebernehmen()
+    update_backup()
     auto_backup()
     init_db()
     alte_ausleihen_loeschen()

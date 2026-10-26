@@ -71,6 +71,8 @@ Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog d
 
 ScanBook sichert die Datenbank automatisch einmal täglich in den Ordner `backups/` – beim Start und, wenn das Programm über Nacht offen bleibt, auch an den folgenden Tagen. Die automatischen Backups der letzten 14 Tage bleiben erhalten.
 
+Nach jedem Programm-Update sichert ScanBook beim ersten Start außerdem die Datenbank, bevor sie an die neue Version angepasst wird (`backups/update_…db`, die letzten 3 bleiben erhalten). So lässt sich ein Update jederzeit rückgängig machen, ohne Daten zu verlieren.
+
 Unter **Verwaltung → Datensicherung** (Terminal: Menüpunkt 13) kannst du einen zweiten Ordner eintragen, z. B. einen USB-Stick, OneDrive oder ein Netzlaufwerk. Jede Sicherung wird dann zusätzlich dorthin kopiert, damit die Daten auch einen PC-Defekt überstehen. Klappt das Kopieren nicht (Stick nicht eingesteckt), zeigt die Verwaltung einen Hinweis.
 
 Zum Wiederherstellen: ScanBook beenden und die gewünschte Backup-Datei als `buecherei_system.db` in den Programmordner kopieren.
