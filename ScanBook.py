@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -1819,6 +1819,16 @@ AUSWEIS_STELLEN = 4
 MEDIENCODE_STELLEN = 5
 
 
+def code_normalisieren(eingabe):
+    """Scanner, die wie eine US-Tastatur tippen, liefern unter deutschem Windows beim Bindestrich ein „ß“.
+    In einem Barcode kann kein ß stehen, darum wird es wieder zum Bindestrich."""
+    return str(eingabe or "").strip().replace("ß", "-").replace("ẞ", "-")
+
+
+def ungueltige_zeichen(code):
+    return "".join(sorted({z for z in code if not 32 < ord(z) < 127}))
+
+
 def code_gueltig(code):
     """Codes stehen als Barcode (Code 128) auf Etiketten und Ausweisen: nur einfache Zeichen, nicht zu lang."""
     return 0 < len(code) <= 30 and all(32 < ord(z) < 127 for z in code)
@@ -1849,7 +1859,9 @@ def naechster_code(conn, einstellung, stellen):
 
 def neuer_code_pruefen(conn, code, ausser_schueler=None):
     if not code_gueltig(code):
-        raise ValueError("Ein Code darf höchstens 30 Zeichen lang sein und keine Leerzeichen oder Umlaute enthalten.")
+        falsch = ungueltige_zeichen(code)
+        raise ValueError(f"'{code}' enthält Zeichen, die in keinem Barcode vorkommen: {' '.join(falsch)}" if falsch
+                         else "Ein Code darf höchstens 30 Zeichen lang sein.")
     if normalize_isbn(code):
         raise ValueError(f"'{code}' ist eine ISBN und kann nicht als Code verwendet werden.")
     if code_vergeben(conn, code, ausser_schueler):
@@ -1862,7 +1874,8 @@ def schueler_name(vorname, nachname):
 
 def schueler_speichern(schueler_id, vorname, nachname, klasse, ausweis=""):
     """Legt einen Schüler an (schueler_id leer) oder ändert ihn. Leere Ausweisnummer = automatisch vergeben."""
-    vorname, nachname, klasse, ausweis = (str(w or "").strip() for w in (vorname, nachname, klasse, ausweis))
+    vorname, nachname, klasse = (str(w or "").strip() for w in (vorname, nachname, klasse))
+    ausweis = code_normalisieren(ausweis)
     if not vorname or not nachname:
         raise ValueError("Bitte Vor- und Nachname eingeben.")
     with db_connection() as conn:
@@ -1963,7 +1976,7 @@ def exemplar_anlegen(isbn, code=""):
     """Gibt einem Exemplar einen Mediencode: einen eigenen (z. B. ein schon aufgeklebtes Etikett) oder,
     wenn code leer ist, die nächste freie Nummer. Haben schon alle Exemplare einen Code, ist es ein
     weiteres Exemplar und der Bestand steigt um eins. Liefert (code, aufgestockt)."""
-    code = str(code or "").strip()
+    code = code_normalisieren(code)
     eigener = bool(code)
     with db_connection() as conn:
         row = conn.execute("SELECT anzahl_gesamt FROM buecher WHERE isbn = ?", (isbn,)).fetchone()
@@ -2048,7 +2061,7 @@ def buch_loeschen(isbn):
 
 def code_aufloesen(eingabe):
     """Was wurde gescannt? ("exemplar", isbn, code), ("schueler", id, ausweis), ("isbn", isbn, None) oder None."""
-    eingabe = str(eingabe or "").strip()
+    eingabe = code_normalisieren(eingabe)
     if not eingabe:
         return None
     with db_connection() as conn:
