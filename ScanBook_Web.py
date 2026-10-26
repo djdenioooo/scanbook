@@ -220,18 +220,23 @@ def api_settings(_):
 
 # --- SCHREIBENDE AKTIONEN (POST) ---
 def sieht_aus_wie_isbn(eingabe):
-    return bool(re.fullmatch(r"[\d\s-]{9,}[\dXx]", eingabe))
+    # Nur 10 oder 13 Stellen sind eine verscannte ISBN; andere Ziffernfolgen wie 405-70211226 sind Mediencodes
+    ziffern = re.sub(r"[\s-]", "", eingabe)
+    return bool(re.fullmatch(r"\d{9}[\dXx]|\d{13}", ziffern))
 
 
 def api_scan(body):
-    eingabe = text(body, "isbn")
-    neuer_code = text(body, "code")  # vorher gescanntes, noch unbekanntes Etikett, das zugeordnet werden soll
+    eingabe = sb.code_normalisieren(text(body, "isbn"))
+    neuer_code = sb.code_normalisieren(text(body, "code"))  # vorher gescanntes, noch unbekanntes Etikett, das zugeordnet werden soll
     treffer = sb.code_aufloesen(eingabe)
     if treffer and treffer[0] == "exemplar":
         return {"status": "exemplar", "code": treffer[2], "buch": buch_oder_fehler(treffer[1])}
     if treffer and treffer[0] == "schueler":
         raise ApiFehler("Das ist ein Schülerausweis. Ausleihen geht im Tab „Ausleihe“.")
     if not treffer:
+        if not sb.code_gueltig(eingabe) and sb.ungueltige_zeichen(eingabe):
+            raise ApiFehler(f"„{eingabe}“ enthält Zeichen, die in keinem Barcode vorkommen: "
+                            f"{' '.join(sb.ungueltige_zeichen(eingabe))}. Ist der Scanner auf die deutsche Tastatur eingestellt?")
         if neuer_code or sieht_aus_wie_isbn(eingabe) or not sb.code_gueltig(eingabe):
             raise ApiFehler("Ungültige ISBN – die Prüfziffer stimmt nicht.")
         # Unbekanntes Etikett: als eigener Mediencode merken, das nächste gescannte Buch bekommt ihn
@@ -2825,7 +2830,7 @@ $("#return-form").addEventListener("submit", (e) => {
   versuche(async () => {
     try {
       const treffer = await get("loans", { code: isbn });
-      if (treffer.length === 1 && treffer[0].exemplar.toLowerCase() === isbn.toLowerCase()) {
+      if (treffer.length === 1 && treffer[0].exemplar.toLowerCase() === isbn.replace(/[ßẞ]/g, "-").toLowerCase()) {
         return zurueckgeben(treffer[0].id);  // Mediencode: eindeutig, ohne Rückfrage
       }
       if (!treffer.length) {
