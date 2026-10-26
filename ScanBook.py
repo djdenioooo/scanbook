@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.13.1"
+VERSION = "2.13.2"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -1701,6 +1701,17 @@ def umstellungen(plan):
 
 def noch_einzuraeumen(plan):
     return [b for b in plan["buecher"].values() if not b["ist"] and b["soll"]]
+
+
+def buecher_eingeraeumt(isbns):
+    """Diese Bücher stehen jetzt an ihrem geplanten Platz (einzeln bestätigt). Liefert die Anzahl."""
+    plan = regal_plan()
+    plaetze = [(plan["buecher"][isbn]["soll"], isbn) for isbn in isbns
+               if isbn in plan["buecher"] and plan["buecher"][isbn]["soll"]]
+    with db_connection() as conn:
+        for (regal_id, fach), isbn in plaetze:
+            conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (regal_id, fach, isbn))
+    return len(plaetze)
 
 
 def plan_uebernehmen():
