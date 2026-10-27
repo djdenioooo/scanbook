@@ -99,6 +99,9 @@ def api_books(params):
         werte = (muster,) * 6
     with sb.db_connection() as conn:
         rows = conn.execute(sql + " ORDER BY autor_nachname, titel", werte).fetchall()
+        codes = {}
+        for isbn, code in conn.execute("SELECT isbn, code FROM exemplare WHERE isbn IS NOT NULL"):
+            codes.setdefault(isbn, []).append(code)
     plan = sb.regal_plan()
     orte = sb.standorte(plan)
     regal_nr = {r["id"]: i for i, r in enumerate(plan["regale"])}
@@ -110,7 +113,7 @@ def api_books(params):
             "autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
             "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10],
             "standort": ort, "geplant": geplant, "regal": regal_name.get(regal_id, ""), "regal_nr": regal_nr.get(regal_id, -1),
-            "cover_url": r[11] or "",
+            "cover_url": r[11] or "", "codes": " ".join(codes.get(r[6], [])),
         })
     return buecher
 
@@ -1994,7 +1997,7 @@ td.titel-zelle { min-width: 220px; }
   <section id="tab-katalog">
     <div class="card">
       <div class="row">
-        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag, Regal oder ISBN …" autocomplete="off">
+        <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag, Regal, ISBN oder Mediencode …" autocomplete="off">
         <span class="sub" id="katalog-anzahl" style="color:var(--muted)"></span>
       </div>
       <div class="toolbar">
@@ -2003,6 +2006,7 @@ td.titel-zelle { min-width: 220px; }
         <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
         <div class="segment" id="katalog-ansicht" style="margin:0"><button type="button" data-ansicht="cover">Cover</button><button type="button" data-ansicht="liste">Liste</button></div>
       </div>
+      <div class="nachladen hidden" id="katalog-versteckt"></div>
       <div class="nachladen hidden" id="nachladen-box">
         <div class="grow"><span id="nachladen-text"></span><div class="balken hidden" id="nachladen-balken"><div></div></div></div>
         <button class="btn small" type="button" id="nachladen-btn">Alle Bücher nachladen</button>
@@ -2519,10 +2523,20 @@ function speicherSchreiben(name, wert) {
   try { localStorage.setItem(name, wert); } catch { /* egal */ }
 }
 // Cover: gespeicherte Adresse, sonst Open Library und DNB nach ISBN fragen
+function coverQuellen(b) {
+  return [b.cover_url, b.isbn && `https://covers.openlibrary.org/b/isbn/${b.isbn}-M.jpg?default=false`,
+    b.isbn && `https://portal.dnb.de/opac/mvb/cover?isbn=${b.isbn}`].filter(Boolean);
+}
+// Katalog-Kachel: klappt ein Cover nicht, die nächste Quelle versuchen – wie in der Vorschau
+function coverWeiter(img) {
+  const rest = img.dataset.quellen ? img.dataset.quellen.split(" ") : [];
+  if (!rest.length) { img.remove(); return; }
+  img.dataset.quellen = rest.slice(1).join(" ");
+  img.src = rest[0];
+}
 function zeigeCover(box, b) {
   const img = box.querySelector("img"), leer = box.querySelector(".cover-leer");
-  const quellen = [b.cover_url, b.isbn && `https://covers.openlibrary.org/b/isbn/${b.isbn}-M.jpg?default=false`,
-    b.isbn && `https://portal.dnb.de/opac/mvb/cover?isbn=${b.isbn}`].filter(Boolean);
+  const quellen = coverQuellen(b);
   let i = 0;
   const weiter = () => {
     if (i < quellen.length) { img.src = quellen[i++]; return; }
@@ -2869,7 +2883,8 @@ function coverFarbe(text) {
 }
 function coverHtml(b, titel, autor, band = "") {
   const genre = LEERWERTE.includes(b.genre) ? "" : b.genre;
-  const bild = b.cover_url ? `<img src="${esc(b.cover_url)}" alt="" loading="lazy" onerror="this.remove()" onload="if (this.naturalWidth < 20) this.remove()">` : "";
+  const [erste, ...weitere] = coverQuellen(b);
+  const bild = erste ? `<img src="${esc(erste)}" data-quellen="${esc(weitere.join(" "))}" alt="" loading="lazy" onerror="coverWeiter(this)" onload="if (this.naturalWidth < 20) coverWeiter(this)">` : "";
   return `<div class="cover${band ? " mit-band" : ""}" style="${coverFarbe(genre || titel)}"><div class="cover-text"><span class="cover-titel">${esc(titel)}</span><span class="cover-autor">${esc(autor)}</span></div>${bild}${band ? `<span class="cover-band">${esc(band)}</span>` : ""}</div>`;
 }
 function buchKachel(b, alsBand = false) {
@@ -2898,18 +2913,50 @@ function serienKacheln(g, offen) {
 let katalog = [], katalogGeladen = false, katalogFilter = "alle", regalFilter = "alle";
 let katalogAnsicht = speicherLesen("katalogAnsicht", "cover") === "liste" ? "liste" : "cover";
 const katalogZiel = () => $(katalogAnsicht === "cover" ? "#katalog-wand" : "#katalog-body");
-function passtZurSuche(b, worte) {
-  const text = `${b.titel} ${b.autoren} ${b.autor} ${b.genre} ${b.isbn} ${b.verlag} ${b.serie} ${b.standort}`.toLowerCase();
-  return worte.every((w) => text.includes(w) || text.includes(w.replace(/-/g, "")));
+// Suchtext vereinheitlichen: Groß/Klein, Umlaute (ü = ue), Akzente, ß, Bindestriche und Satzzeichen.
+// Daten aus der DNB kommen oft „zerlegt“ (u + Trema statt ü) – ohne normalize() findet „Müller“ sie nicht.
+function suchForm(text, umlautAlsE = true) {
+  return String(text ?? "").normalize("NFD").toLowerCase()
+    .replace(/([aou])\u0308/g, umlautAlsE ? "$1e" : "$1")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ß/g, "ss")
+    .replace(/[-\u2010-\u2015'\u2018\u2019`´.]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ");
 }
+// „Müller“ steht im Suchtext als „mueller“ und „muller“ – so passt jede Schreibweise
+function suchText(b) {
+  if (b._such === undefined) {
+    const roh = [b.titel, b.autoren, b.autor, b.genre, b.isbn, b.verlag, b.serie, b.band && `band ${b.band}`, b.standort, b.codes].join(" ");
+    const mitE = suchForm(roh);
+    const ohneE = suchForm(roh, false);
+    b._such = mitE === ohneE ? mitE : `${mitE} | ${ohneE}`;
+  }
+  return b._such;
+}
+function suchWorte(suche) {
+  return suchForm(suche).split(" ").filter(Boolean);
+}
+function passtZurSuche(b, worte) {
+  const text = suchText(b);
+  return worte.every((w) => text.includes(w));
+}
+const passtZumFilter = (b) =>
+  (katalogFilter === "alle" || (katalogFilter === "da" ? b.verfuegbar > 0 : b.verfuegbar === 0)) &&
+  (regalFilter === "alle" || (regalFilter === "ohne" ? !b.regal : "r:" + b.regal === regalFilter));
 function zeichneKatalog(behalten = false) {
   const suche = $("#katalog-suche").value.trim().toLowerCase();
-  const worte = suche.split(/\s+/).filter(Boolean);
+  const worte = suchWorte(suche);
   zeichneRegalFilter();
-  const liste = katalog.filter((b) =>
-    (katalogFilter === "alle" || (katalogFilter === "da" ? b.verfuegbar > 0 : b.verfuegbar === 0)) &&
-    (regalFilter === "alle" || (regalFilter === "ohne" ? !b.regal : "r:" + b.regal === regalFilter)) &&
-    (!worte.length || passtZurSuche(b, worte)));
+  const treffer = worte.length ? katalog.filter((b) => passtZurSuche(b, worte)) : katalog;
+  const liste = treffer.filter(passtZumFilter);
+  // Ein aktiver Filter (z. B. ein Regal oder „Verfügbar“) versteckt sonst still Treffer – darauf hinweisen
+  const versteckt = treffer.length - liste.length;
+  const box = $("#katalog-versteckt");
+  box.classList.toggle("hidden", !(worte.length && versteckt));
+  if (worte.length && versteckt) {
+    box.innerHTML = `<div class="grow">${versteckt} weitere${versteckt === 1 ? "r" : ""} Treffer ${versteckt === 1 ? "wird" : "werden"} durch den Filter ausgeblendet.</div>` +
+      `<button class="btn small secondary" type="button" id="filter-zuruecksetzen">Überall suchen</button>`;
+  }
   $("#katalog-anzahl").textContent = liste.length === katalog.length ? `${katalog.length} Titel` : `${liste.length} von ${katalog.length} Titeln`;
   const weg = katalog.filter((b) => b.verfuegbar === 0).length;
   $("#katalog-filter").innerHTML = [["alle", "Alle"], ["da", "Verfügbar"], ["weg", `Alle ausgeliehen${weg ? ` · ${weg}` : ""}`]]
@@ -2984,6 +3031,12 @@ async function ladeKatalog() {
   zeigeNachladen(await get("refresh_status").catch(() => null));
 }
 $("#katalog-suche").addEventListener("input", debounce(() => zeichneKatalog(), 120));
+$("#katalog-versteckt").addEventListener("click", (e) => {
+  if (!e.target.closest("#filter-zuruecksetzen")) return;
+  katalogFilter = "alle";
+  regalFilter = "alle";
+  zeichneKatalog();
+});
 $("#katalog-filter").addEventListener("click", (e) => {
   if (!e.target.dataset.filter) return;
   katalogFilter = e.target.dataset.filter;

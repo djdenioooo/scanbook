@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.14.0"
+VERSION = "2.14.1"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -505,6 +505,9 @@ def init_db():
         if "nachgeladen" not in buch_spalten:
             # 0 = Beschreibung, Cover und Serie wurden noch nicht online gesucht
             cursor.execute("ALTER TABLE buecher ADD COLUMN nachgeladen INTEGER DEFAULT 0")
+        if "nachlade_versuche" not in buch_spalten:
+            # Wie oft das Nachladen wegen nicht erreichbarer Quellen ohne Ergebnis blieb
+            cursor.execute("ALTER TABLE buecher ADD COLUMN nachlade_versuche INTEGER DEFAULT 0")
         # Standort, an dem das Buch tatsächlich steht (leer = noch nicht eingeräumt)
         for spalte in ("regal_id", "fach"):
             if spalte not in buch_spalten:
@@ -1317,7 +1320,8 @@ def daten_nachladen(isbn):
     """Sucht online nach fehlenden Angaben (Beschreibung, Cover, Serie, leere Felder) und ergänzt nur,
     was noch leer ist – von Hand eingetragene Angaben bleiben unverändert.
     Liefert die Liste der ergänzten Felder oder None, wenn das Buch online nicht gefunden wurde.
-    War eine Quelle nicht erreichbar, wird das Buch beim nächsten "Alle nachladen" noch einmal versucht."""
+    Wurde das Buch nirgends gefunden, weil Quellen nicht erreichbar waren, wird es beim nächsten
+    "Alle nachladen" noch einmal versucht – höchstens NACHLADE_VERSUCHE Mal, damit der Hinweis nicht ewig bleibt."""
     buch = lade_buch(isbn)
     if not buch:
         return None
@@ -1331,10 +1335,17 @@ def daten_nachladen(isbn):
             ergaenzt.append("genre")
         if ergaenzt:
             buch_aktualisieren(isbn, {f: buch[f] for f in [f for f, _ in BUCH_FELDER + SERIEN_FELDER] + ZUSATZ_FELDER})
-    if not fehler:
-        with db_connection() as conn:
+    with db_connection() as conn:
+        if gefunden or not fehler:
+            # Eine Quelle hat geantwortet – dass eine andere gerade nicht erreichbar war, reicht nicht für einen neuen Versuch
             conn.execute("UPDATE buecher SET nachgeladen = 1 WHERE isbn = ?", (isbn,))
+        else:
+            conn.execute("""UPDATE buecher SET nachlade_versuche = COALESCE(nachlade_versuche, 0) + 1,
+                            nachgeladen = (COALESCE(nachlade_versuche, 0) + 1 >= ?) WHERE isbn = ?""", (NACHLADE_VERSUCHE, isbn))
     return ergaenzt if gefunden else None
+
+
+NACHLADE_VERSUCHE = 3
 
 
 def noch_nicht_nachgeladen():
