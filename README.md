@@ -10,7 +10,7 @@ Möglicherweise, wird daraus ein Großprojekt, alles Kostenlos und für jeden zu
 ## Voraussetzungen
 
 - Python 3.8 oder neuer (keine zusätzlichen Pakete nötig)
-- Internetverbindung zum Nachschlagen von Buchdaten (Google Books, ersatzweise Deutsche Nationalbibliothek und Open Library)
+- Internetverbindung zum Nachschlagen von Buchdaten (zuerst Deutsche Nationalbibliothek, dazu gleichzeitig Google Books und Open Library für fehlende Angaben wie das Cover; eine Quelle, die nicht antwortet, wird nach 5 Sekunden aufgegeben und 10 Minuten lang übersprungen)
 - Falls die Buchsuche mit `CERTIFICATE_VERIFY_FAILED` scheitert: `python3 -m pip install certifi` (Windows: `py -m pip install certifi`). ScanBook nutzt das Paket automatisch.
 - Optional: ein Barcode-Scanner, der wie eine Tastatur funktioniert (USB oder Bluetooth)
 
