@@ -1945,12 +1945,17 @@ td.titel-zelle { min-width: 220px; }
   <!-- SCANNEN -->
   <section id="tab-scan">
     <div class="card">
-      <h2>Bücher scannen</h2>
+      <h2 id="scan-titel">Bücher scannen</h2>
       <p class="hint">Neue Bücher werden online nachgeschlagen, bekannte Bücher werden automatisch um ein Exemplar aufgestockt.</p>
       <form id="scan-form" class="row">
         <input id="scan-isbn" class="big grow" placeholder="ISBN oder eigenes Etikett scannen …" autocomplete="off">
         <button class="btn" type="submit">Hinzufügen</button>
       </form>
+      <form id="kategorie-form" class="row hidden" style="margin-top:10px">
+        <input id="kategorie-feld" class="grow" placeholder="Feste Kategorie für alle neuen Bücher, z. B. Manga (leer = aus)" autocomplete="off">
+        <button class="btn secondary" type="submit">Merken</button>
+      </form>
+      <div class="platz-box hidden" id="kategorie-box"></div>
       <div class="platz-box hidden" id="code-box"></div>
       <div class="platz-box hidden" id="platz-box"></div>
       <label class="check" style="margin-top:12px"><input type="checkbox" id="einraeumen-bestaetigen"> Erst nach Bestätigung als eingeräumt merken</label>
@@ -2665,6 +2670,11 @@ function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
     form[f].value = LEERWERTE.includes(wert) ? "" : wert;
     form[f].classList.toggle("missing", fehlend.includes(f));
   }
+  if (festeKategorie) {
+    form.genre.value = mitFesterKategorie(form.genre.value);
+    form.genre.classList.remove("missing");
+    fehlend = fehlend.filter((f) => f !== "genre");
+  }
   for (const f of [...SERIEN_FELDER, "beschreibung", "cover_url"]) form[f].value = daten?.[f] ?? "";
   form.nachgeladen.value = daten ? "1" : "";
   const vorschau = $("#nb-vorschau");
@@ -2717,6 +2727,47 @@ $("#einraeumen-bestaetigen").addEventListener("change", (e) => versuche(async ()
   toast(r.an ? "Neue Bücher bleiben geplant, bis du sie bestätigst" : "Neue Bücher gelten sofort als eingeräumt");
   $("#scan-isbn").focus();
 }));
+
+// Versteckt: Tippen auf „Bücher scannen“ öffnet ein Feld für eine feste Kategorie.
+// Sie kommt bei jedem neuen Buch vorne ins Genre, bis sie wieder ausgeschaltet wird (gemerkt in diesem Browser).
+let festeKategorie = speicherLesen("scanbook-feste-kategorie", "");
+function festeKategorien() {
+  return festeKategorie.split(",").map((g) => g.trim()).filter(Boolean);
+}
+function mitFesterKategorie(genre) {
+  const feste = festeKategorien();
+  const klein = feste.map((g) => g.toLowerCase());
+  const rest = genre.split(",").map((g) => g.trim()).filter((g) => g && !klein.includes(g.toLowerCase()));
+  return [...feste, ...rest].join(", ");
+}
+function zeigeFesteKategorie() {
+  const box = $("#kategorie-box");
+  box.classList.toggle("hidden", !festeKategorie);
+  if (festeKategorie) box.innerHTML = `🔖 Feste Kategorie <b>${esc(festeKategorie)}</b> – kommt bei jedem neuen Buch vorne ins Genre.
+    <button class="btn small secondary" type="button" id="kategorie-aus" style="margin-left:8px">Aus</button>`;
+}
+function setzeFesteKategorie(wert) {
+  festeKategorie = wert;
+  festeKategorie = festeKategorien().join(", ");
+  speicherSchreiben("scanbook-feste-kategorie", festeKategorie);
+  zeigeFesteKategorie();
+  toast(festeKategorie ? `„${festeKategorie}“ kommt jetzt vorne in jedes neue Buch` : "Feste Kategorie aus");
+  $("#scan-isbn").focus();
+}
+$("#scan-titel").addEventListener("click", () => {
+  const form = $("#kategorie-form");
+  form.classList.toggle("hidden");
+  if (!form.classList.contains("hidden")) { $("#kategorie-feld").value = festeKategorie; $("#kategorie-feld").focus(); }
+});
+$("#kategorie-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  e.target.classList.add("hidden");
+  setzeFesteKategorie($("#kategorie-feld").value);
+});
+$("#kategorie-box").addEventListener("click", (e) => {
+  if (e.target.id === "kategorie-aus") setzeFesteKategorie("");
+});
+zeigeFesteKategorie();
 
 function schliesseNeuesBuch() {
   $("#new-book-card").classList.add("hidden");
