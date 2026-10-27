@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.14.1"
+VERSION = "2.15.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -964,7 +964,7 @@ def fetch_from_google(isbn):
         params += f"&key={urllib.parse.quote(GOOGLE_API_KEY)}"
 
     try:
-        data = json.loads(http_get(f"https://www.googleapis.com/books/v1/volumes?{params}"))
+        data = json.loads(http_get(f"https://www.googleapis.com/books/v1/volumes?{params}", QUELLEN_TIMEOUT))
         if data.get("items"):
             info = data["items"][0]["volumeInfo"]
             # Kategorien wie "Fiction / Fantasy / Epic" in Einzelteile zerlegen
@@ -999,7 +999,7 @@ def fetch_from_google(isbn):
 def fetch_from_openlibrary(isbn):
     url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
     try:
-        eintrag = json.loads(http_get(url)).get(f"ISBN:{isbn}")
+        eintrag = json.loads(http_get(url, QUELLEN_TIMEOUT)).get(f"ISBN:{isbn}")
         if eintrag:
             jahr = re.search(r"\d{4}", eintrag.get("publish_date", ""))
             genres, sicher = genre_ermitteln([s["name"] for s in eintrag.get("subjects", [])])
@@ -1134,7 +1134,7 @@ def fetch_from_dnb(isbn):
         "maximumRecords": "1",
     })
     try:
-        wurzel = ET.fromstring(http_get(f"{DNB_SRU_URL}?{params}"))
+        wurzel = ET.fromstring(http_get(f"{DNB_SRU_URL}?{params}", QUELLEN_TIMEOUT))
         record = wurzel.find(".//m:record", MARC_NS)
         if record is not None:
             return parse_dnb_marc(record)
@@ -1148,6 +1148,12 @@ def fetch_from_dnb(isbn):
 # Quellen, die bei der letzten Suche (in diesem Thread) nicht erreichbar waren
 abfrage = threading.local()
 
+# Im Schulnetz sind manche Quellen gesperrt oder sehr langsam: nicht lange warten, und eine Quelle,
+# die nicht geantwortet hat, für eine Weile überspringen statt bei jedem Buch wieder zu warten.
+QUELLEN_TIMEOUT = 5
+QUELLEN_PAUSE = 10 * 60
+_quelle_pausiert_bis = {}
+
 
 def fehler_merken(quelle):
     if not hasattr(abfrage, "fehler"):
@@ -1159,11 +1165,26 @@ def letzte_fehler():
     return getattr(abfrage, "fehler", [])
 
 # Was jede Quelle liefern kann – eine Quelle wird nur gefragt, wenn sie noch etwas Fehlendes ergänzen kann
+# Die DNB wird zuerst gefragt (schnell, kennt deutsche Bücher am besten); die anderen ergänzen danach gleichzeitig.
 QUELLEN = (
-    ("Google Books", fetch_from_google, {"buch", "genre", "serie", "beschreibung", "cover_url"}),
     ("Deutsche Nationalbibliothek", fetch_from_dnb, {"buch", "genre", "serie", "beschreibung"}),
+    ("Google Books", fetch_from_google, {"buch", "genre", "serie", "beschreibung", "cover_url"}),
     ("Open Library", fetch_from_openlibrary, {"buch", "genre", "serie", "cover_url"}),
 )
+
+
+def quelle_fragen(name, quelle, isbn):
+    """Fragt eine Quelle; liefert (Treffer, Fehlerliste). Läuft auch in eigenen Threads,
+    deshalb werden die Fehler zurückgegeben statt nur im Thread gemerkt."""
+    if _quelle_pausiert_bis.get(name, 0) > time.monotonic():
+        return None, [name]  # war eben nicht erreichbar – gilt weiter als nicht erreichbar
+    abfrage.fehler = []
+    treffer = quelle(isbn)
+    if name in abfrage.fehler:
+        _quelle_pausiert_bis[name] = time.monotonic() + QUELLEN_PAUSE
+    else:
+        _quelle_pausiert_bis.pop(name, None)
+    return treffer, abfrage.fehler
 
 
 def fehlende_angaben(daten, genre_sicher):
@@ -1196,12 +1217,37 @@ def buchdaten_ergaenzen(daten, treffer):
 
 
 def fetch_book_data(isbn):
-    abfrage.fehler = []
+    if all(_quelle_pausiert_bis.get(name, 0) > time.monotonic() for name, _, _ in QUELLEN):
+        _quelle_pausiert_bis.clear()  # gar nichts erreichbar – vielleicht ist das Internet wieder da
+    fehler = []
+    erste, *weitere = QUELLEN
+    treffer, f = quelle_fragen(erste[0], erste[1], isbn)
+    fehler += f
+    ergebnisse = [(erste[0], treffer)]
+
+    gesucht = fehlende_angaben(treffer, bool(treffer and treffer['_genre_sicher']))
+    weitere = [q for q in weitere if gesucht & q[2]]
+    if weitere:
+        # Alle übrigen Quellen gleichzeitig fragen: Es dauert höchstens so lange wie die langsamste
+        antworten = [None] * len(weitere)
+
+        def fragen(nr, name, quelle):
+            antworten[nr] = quelle_fragen(name, quelle, isbn)
+
+        threads = [threading.Thread(target=fragen, args=(nr, name, quelle), daemon=True)
+                   for nr, (name, quelle, _) in enumerate(weitere)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(QUELLEN_TIMEOUT * 3)
+        for (name, _, _), antwort in zip(weitere, antworten):
+            treffer, f = antwort or (None, [name])
+            fehler += f
+            ergebnisse.append((name, treffer))
+    abfrage.fehler = fehler
+
     daten, sichere, unsichere = None, [], []
-    for name, quelle, liefert in QUELLEN:
-        if not fehlende_angaben(daten, bool(sichere)) & liefert:
-            continue
-        treffer = quelle(isbn)
+    for name, treffer in ergebnisse:
         if not treffer:
             continue
         if not daten:
