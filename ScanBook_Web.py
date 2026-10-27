@@ -2523,10 +2523,20 @@ function speicherSchreiben(name, wert) {
   try { localStorage.setItem(name, wert); } catch { /* egal */ }
 }
 // Cover: gespeicherte Adresse, sonst Open Library und DNB nach ISBN fragen
+function coverQuellen(b) {
+  return [b.cover_url, b.isbn && `https://covers.openlibrary.org/b/isbn/${b.isbn}-M.jpg?default=false`,
+    b.isbn && `https://portal.dnb.de/opac/mvb/cover?isbn=${b.isbn}`].filter(Boolean);
+}
+// Katalog-Kachel: klappt ein Cover nicht, die nächste Quelle versuchen – wie in der Vorschau
+function coverWeiter(img) {
+  const rest = img.dataset.quellen ? img.dataset.quellen.split(" ") : [];
+  if (!rest.length) { img.remove(); return; }
+  img.dataset.quellen = rest.slice(1).join(" ");
+  img.src = rest[0];
+}
 function zeigeCover(box, b) {
   const img = box.querySelector("img"), leer = box.querySelector(".cover-leer");
-  const quellen = [b.cover_url, b.isbn && `https://covers.openlibrary.org/b/isbn/${b.isbn}-M.jpg?default=false`,
-    b.isbn && `https://portal.dnb.de/opac/mvb/cover?isbn=${b.isbn}`].filter(Boolean);
+  const quellen = coverQuellen(b);
   let i = 0;
   const weiter = () => {
     if (i < quellen.length) { img.src = quellen[i++]; return; }
@@ -2873,7 +2883,8 @@ function coverFarbe(text) {
 }
 function coverHtml(b, titel, autor, band = "") {
   const genre = LEERWERTE.includes(b.genre) ? "" : b.genre;
-  const bild = b.cover_url ? `<img src="${esc(b.cover_url)}" alt="" loading="lazy" onerror="this.remove()" onload="if (this.naturalWidth < 20) this.remove()">` : "";
+  const [erste, ...weitere] = coverQuellen(b);
+  const bild = erste ? `<img src="${esc(erste)}" data-quellen="${esc(weitere.join(" "))}" alt="" loading="lazy" onerror="coverWeiter(this)" onload="if (this.naturalWidth < 20) coverWeiter(this)">` : "";
   return `<div class="cover${band ? " mit-band" : ""}" style="${coverFarbe(genre || titel)}"><div class="cover-text"><span class="cover-titel">${esc(titel)}</span><span class="cover-autor">${esc(autor)}</span></div>${bild}${band ? `<span class="cover-band">${esc(band)}</span>` : ""}</div>`;
 }
 function buchKachel(b, alsBand = false) {
