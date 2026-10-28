@@ -70,8 +70,8 @@ def tage_bis(iso_datum):
 
 def buchdaten_aus(body):
     return sb.neue_buchdaten(*(text(body, feld) for feld, _ in sb.BUCH_FELDER),
-                             *(text(body, feld) for feld, _ in sb.SERIEN_FELDER),
-                             *(text(body, feld) for feld in sb.ZUSATZ_FELDER))
+                             **{feld: text(body, feld) for feld, _ in sb.SERIEN_FELDER},
+                             **{feld: text(body, feld) for feld in sb.ZUSATZ_FELDER})
 
 
 def fehlende_felder(daten):
@@ -111,9 +111,9 @@ def api_books(params):
         ort, regal_id, geplant = orte.get(r[6], ("", None, False))
         buecher.append({
             "autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
-            "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "autoren": r[9], "verlag": r[10],
+            "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "staffel": r[9] or "", "autoren": r[10], "verlag": r[11],
             "standort": ort, "geplant": geplant, "regal": regal_name.get(regal_id, ""), "regal_nr": regal_nr.get(regal_id, -1),
-            "cover_url": r[11] or "", "codes": " ".join(codes.get(r[6], [])),
+            "cover_url": r[12] or "", "codes": " ".join(codes.get(r[6], [])),
         })
     return buecher
 
@@ -132,12 +132,12 @@ def api_book(params):
         baende = []
         if buch["serie"]:
             baende = [
-                {"isbn": r[0], "titel": r[1], "band": r[2] or "", "verfuegbar": r[3], "gesamt": r[4]}
+                {"isbn": r[0], "titel": r[1], "band": r[2] or "", "verfuegbar": r[3], "gesamt": r[4], "staffel": r[5] or ""}
                 for r in conn.execute(
-                    "SELECT isbn, titel, band, anzahl_verfuegbar, anzahl_gesamt FROM buecher WHERE serie = ? COLLATE NOCASE",
+                    "SELECT isbn, titel, band, anzahl_verfuegbar, anzahl_gesamt, staffel FROM buecher WHERE serie = ? COLLATE NOCASE",
                     (buch["serie"],))
             ]
-    buch["serie_baende"] = sorted(baende, key=lambda b: (sb.band_sortierwert(b["band"]), b["titel"]))
+    buch["serie_baende"] = sorted(baende, key=lambda b: (sb.folge_in_serie(b), b["titel"]))
     buch["exemplare"] = sb.exemplare_von(isbn)
     plan = sb.regal_plan()
     b = plan["buecher"].get(isbn) or {}
@@ -488,7 +488,7 @@ def backups_im_hintergrund():
 # --- REGALE ---
 def regal_buch(regale, b):
     return {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "serie": b["serie"], "band": b["band"],
-            "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
+            "staffel": b["staffel"], "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
             "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else "",
             "fest": b["fest"], "nach": sb.standort_text(regale, b["soll"])}
 
@@ -1236,7 +1236,8 @@ def druck_regale(params):
 
     def zeile(b):
         mit_serie = b["serie"] and b["band"] and b["serie"].lower() not in b["titel"].lower()
-        titel = (f'{b["serie"]} {b["band"]}: ' if mit_serie else "") + b["titel"]
+        folge = sb.serie_text(b["serie"], b["band"], b["staffel"]) if b["staffel"] else f'{b["serie"]} {b["band"]}'
+        titel = (f'{folge}: ' if mit_serie else "") + b["titel"]
         hinweis = ("noch einräumen" if not b["ist"] else
                    f'steht noch in {sb.standort_text(plan["regale"], b["ist"])}' if b["ist"] != b["soll"] else "")
         return (f'<tr><td class="haken">☐</td><td>{html.escape(titel)}'
@@ -1762,6 +1763,13 @@ tr.serie-zeile td { background: transparent; }
 tr.serie-zeile .pfeil { display: inline-block; width: 1em; color: var(--muted); transition: transform .15s; }
 tr.serie-zeile.offen .pfeil { transform: rotate(90deg); }
 tr.band-zeile td:nth-child(2) { padding-left: 34px; }
+tr.staffel-zeile td { padding: 8px 12px 4px 34px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.staffel-trenner.ende { height: 0; margin: 0; }
+.staffel-trenner { grid-column: 1 / -1; margin-bottom: -10px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.baende li.staffel-kopf { cursor: default; padding-top: 10px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.baende li.staffel-kopf:hover { background: none; }
+.staffel-wahl { width: 100%; }
+.staffel-neu { margin-top: 8px; }
 .band-nr { display: inline-block; min-width: 2.4em; margin-right: 6px; padding: 1px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; text-align: center; }
 .serie-tag { color: var(--accent); font-size: 13px; }
 .nachladen { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 16px; border-radius: 12px; background: var(--accent-soft); margin-bottom: 14px; font-size: 14px; }
@@ -1986,7 +1994,9 @@ td.titel-zelle { min-width: 220px; }
           <div><label for="nb-verlag">Verlag</label><input id="nb-verlag" name="verlag"></div>
           <div><label for="nb-erscheinungsjahr">Erscheinungsjahr</label><input id="nb-erscheinungsjahr" name="erscheinungsjahr"></div>
           <div class="full"><label for="nb-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="nb-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
-          <div><label for="nb-serie">Serie (leer = keine)</label><input id="nb-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+          <div class="full"><label for="nb-serie">Serie (leer = keine)</label><input id="nb-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+          <div><label for="nb-staffel-wahl">Staffel</label><select id="nb-staffel-wahl" class="staffel-wahl"></select>
+            <input id="nb-staffel" name="staffel" class="staffel-neu hidden" placeholder="Neue Staffel, z. B. 2" autocomplete="off"></div>
           <div><label for="nb-band">Band</label><input id="nb-band" name="band" inputmode="numeric" autocomplete="off"></div>
         </div>
         <div class="actions">
@@ -2251,7 +2261,9 @@ td.titel-zelle { min-width: 220px; }
       <div><label for="ed-verlag">Verlag</label><input id="ed-verlag" name="verlag"></div>
       <div><label for="ed-erscheinungsjahr">Erscheinungsjahr</label><input id="ed-erscheinungsjahr" name="erscheinungsjahr"></div>
       <div class="full"><label for="ed-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="ed-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
-      <div><label for="ed-serie">Serie (leer = keine)</label><input id="ed-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+      <div class="full"><label for="ed-serie">Serie (leer = keine)</label><input id="ed-serie" name="serie" list="serien-liste" autocomplete="off"></div>
+      <div><label for="ed-staffel-wahl">Staffel</label><select id="ed-staffel-wahl" class="staffel-wahl"></select>
+        <input id="ed-staffel" name="staffel" class="staffel-neu hidden" placeholder="Neue Staffel, z. B. 2" autocomplete="off"></div>
       <div><label for="ed-band">Band</label><input id="ed-band" name="band" inputmode="numeric" autocomplete="off"></div>
       <div class="full"><label for="ed-beschreibung">Beschreibung</label><textarea id="ed-beschreibung" name="beschreibung" rows="5"></textarea></div>
     </div>
@@ -2478,7 +2490,7 @@ td.titel-zelle { min-width: 220px; }
 "use strict";
 const $ = (sel) => document.querySelector(sel);
 const FELDER = ["titel", "autoren", "verlag", "erscheinungsjahr", "genre"];
-const SERIEN_FELDER = ["serie", "band"];
+const SERIEN_FELDER = ["serie", "staffel", "band"];
 const LEERWERTE = ["", "Unbekannt", "Unbekannter Titel", "N/A", "Keine Angabe"];
 let info = { standard_leihdauer: 14 };
 
@@ -2565,12 +2577,32 @@ function bandWert(band) {
   const n = parseInt(band, 10);
   return Number.isNaN(n) ? Infinity : n;
 }
+// Erst nach Staffel („Staffel 2“ vor „Staffel 10“, Bände ohne Staffel wie Specials ans Ende), dann nach Band
+const nachStaffel = (a, b) => !a.staffel - !b.staffel || String(a.staffel || "").localeCompare(String(b.staffel || ""), "de", { numeric: true });
 function nachBand(a, b) {
-  return bandWert(a.band) - bandWert(b.band) || String(a.band).localeCompare(String(b.band)) || a.titel.localeCompare(b.titel, "de");
+  return nachStaffel(a, b) || bandWert(a.band) - bandWert(b.band) || String(a.band).localeCompare(String(b.band)) || a.titel.localeCompare(b.titel, "de");
 }
-function serieText(serie, band) {
-  return serie ? (band ? `${serie} · Band ${band}` : serie) : "";
+function staffelText(staffel) {
+  return /^\d+$/.test(staffel) ? `Staffel ${staffel}` : staffel;
 }
+function serieText(serie, band, staffel = "") {
+  return serie ? [serie, staffel && staffelText(staffel), band && `Band ${band}`].filter(Boolean).join(" · ") : "";
+}
+// Bände nach Staffeln: vor jeder Staffel eine Überschrift (nur wenn die Serie Staffeln hat)
+function mitStaffeln(baende, kopf, eintrag) {
+  if (!baende.some((b) => b.staffel)) return baende.map(eintrag).join("");
+  let html = "", letzte = null;
+  for (const b of baende) {
+    if (b.staffel !== letzte) {
+      letzte = b.staffel;
+      const anzahl = baende.filter((x) => x.staffel === letzte).length;
+      html += kopf(`${letzte ? staffelText(letzte) : "Ohne Staffel"} · ${anzahl} ${anzahl === 1 ? "Band" : "Bände"}`);
+    }
+    html += eintrag(b);
+  }
+  return html;
+}
+const staffelAnzahl = (baende) => new Set(baende.map((b) => b.staffel).filter(Boolean)).size;
 function codeHtml(code) {
   return `<span class="code">${esc(code)}</span>`;
 }
@@ -2685,6 +2717,8 @@ function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
     fehlend = fehlend.filter((f) => f !== "genre");
   }
   for (const f of [...SERIEN_FELDER, "beschreibung", "cover_url"]) form[f].value = daten?.[f] ?? "";
+  staffelAuswahl(form);
+  if (!katalogGeladen) katalogHolen().then(() => staffelAuswahl(form)).catch(() => {});
   form.nachgeladen.value = daten ? "1" : "";
   const vorschau = $("#nb-vorschau");
   vorschau.classList.toggle("hidden", !daten);
@@ -2890,7 +2924,7 @@ $("#serien-gruppieren").checked = speicherLesen("serienGruppieren", "1") === "1"
 function buchZeile(b, alsBand = false) {
   const titel = alsBand
     ? `${b.band ? `<span class="band-nr">${esc(b.band)}</span>` : ""}<b>${esc(b.titel)}</b>`
-    : `<b>${esc(b.titel)}</b>${b.serie ? `<div class="serie-tag">📚 ${esc(serieText(b.serie, b.band))}</div>` : ""}`;
+    : `<b>${esc(b.titel)}</b>${b.serie ? `<div class="serie-tag">📚 ${esc(serieText(b.serie, b.band, b.staffel))}</div>` : ""}`;
   const verlag = !alsBand && b.verlag && !LEERWERTE.includes(b.verlag) ? `${esc(b.verlag)} · ` : "";
   return `
       <tr class="clickable${alsBand ? " band-zeile" : ""}" data-isbn="${esc(b.isbn)}">
@@ -2923,13 +2957,13 @@ function serienZeilen(g, offen) {
   const genres = [...new Set(g.baende.map((b) => b.genre).filter((x) => !LEERWERTE.includes(x)))];
   return `
       <tr class="clickable serie-zeile${offen ? " offen" : ""}" data-serie="${esc(g.schluessel)}">
-        <td class="titel-zelle"><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände · ${offen ? "zuklappen" : "aufklappen"}</div></td>
+        <td class="titel-zelle"><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände${staffelAnzahl(g.baende) > 1 ? ` · ${staffelAnzahl(g.baende)} Staffeln` : ""} · ${offen ? "zuklappen" : "aufklappen"}</div></td>
         <td>${esc(autoren.length > 2 ? autoren.slice(0, 2).join(", ") + " u. a." : autoren.join(", "))}</td>
         <td class="num">${jahre.length ? (von === bis ? von : `${von}–${bis}`) : ""}</td>
         <td>${esc(genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
         <td>${serienOrt(g.baende)}</td>
         <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar} von ${gesamt}</span></td>
-      </tr>` + (offen ? g.baende.map((b) => buchZeile(b, true)).join("") : "");
+      </tr>` + (offen ? mitStaffeln(g.baende, (t) => `<tr class="staffel-zeile"><td colspan="6">${esc(t)}</td></tr>`, (b) => buchZeile(b, true)) : "");
 }
 
 // Cover-Ansicht: gemaltes Cover in der Farbe des Genres, darüber das echte, sobald es geladen ist
@@ -2951,7 +2985,7 @@ function buchKachel(b, alsBand = false) {
   const da = b.verfuegbar > 0 ? `${b.verfuegbar} von ${b.gesamt} da` : "alle ausgeliehen";
   return `
       <button class="kachel${alsBand ? " band" : ""}" type="button" data-isbn="${esc(b.isbn)}" title="${esc(b.titel)}">
-        ${coverHtml(b, b.titel, b.autor, b.band ? `Bd. ${b.band}` : "")}
+        ${coverHtml(b, b.titel, b.autor, b.band ? `${!alsBand && /^\d+$/.test(b.staffel) ? `St. ${b.staffel} · ` : ""}Bd. ${b.band}` : "")}
         <div class="kachel-titel">${esc(b.titel)}</div>
         <div class="kachel-sub"><i class="punkt${b.verfuegbar > 0 ? "" : " weg"}"></i>${da}</div>
         ${b.standort ? `<div class="kachel-sub" title="${esc(b.standort)}">📍 ${esc(b.standort)}${b.geplant ? " (geplant)" : ""}</div>` : ""}
@@ -2966,7 +3000,8 @@ function serienKacheln(g, offen) {
         <div class="stapel" style="${coverFarbe(g.serie)}">${coverHtml({ ...erster, genre: "" }, g.serie, erster.autor, `${g.baende.length} Bände`)}</div>
         <div class="kachel-titel">📚 ${esc(g.serie)}</div>
         <div class="kachel-sub"><i class="punkt${verfuegbar > 0 ? "" : " weg"}"></i>${verfuegbar} von ${gesamt} da · ${offen ? "zuklappen" : "aufklappen"}</div>
-      </button>` + (offen ? g.baende.map((b) => buchKachel(b, true)).join("") : "");
+      </button>` + (offen ? mitStaffeln(g.baende, (t) => `<div class="staffel-trenner">${esc(t)}</div>`, (b) => buchKachel(b, true)) +
+        (staffelAnzahl(g.baende) ? `<div class="staffel-trenner ende"></div>` : "") : "");
 }
 
 // Der Katalog wird einmal geladen und dann im Browser durchsucht – das geht ohne Wartezeit
@@ -2986,7 +3021,7 @@ function suchForm(text, umlautAlsE = true) {
 // „Müller“ steht im Suchtext als „mueller“ und „muller“ – so passt jede Schreibweise
 function suchText(b) {
   if (b._such === undefined) {
-    const roh = [b.titel, b.autoren, b.autor, b.genre, b.isbn, b.verlag, b.serie, b.band && `band ${b.band}`, b.standort, b.codes].join(" ");
+    const roh = [b.titel, b.autoren, b.autor, b.genre, b.isbn, b.verlag, b.serie, b.staffel && `staffel ${b.staffel}`, b.band && `band ${b.band}`, b.standort, b.codes].join(" ");
     const mitE = suchForm(roh);
     const ohneE = suchForm(roh, false);
     b._such = mitE === ohneE ? mitE : `${mitE} | ${ohneE}`;
@@ -3073,6 +3108,40 @@ function zeichneRegalFilter() {
 function setzeSerienListe(buecher) {
   const serien = [...new Set(buecher.map((b) => b.serie).filter(Boolean))].sort((a, b) => a.localeCompare(b, "de"));
   $("#serien-liste").innerHTML = serien.map((s) => `<option value="${esc(s)}">`).join("");
+}
+
+// Staffel-Auswahl: zeigt die Staffeln, die es in der eingetragenen Serie schon gibt, plus „Neue Staffel …“
+function staffelnVon(serie) {
+  const name = serie.trim().toLowerCase();
+  return [...new Set(katalog.filter((b) => b.staffel && b.serie.trim().toLowerCase() === name).map((b) => b.staffel))];
+}
+function staffelAuswahl(form) {
+  const wahl = form.querySelector(".staffel-wahl"), feld = form.staffel;
+  const serie = form.serie.value.trim(), aktuell = feld.value.trim();
+  const liste = staffelnVon(serie);
+  if (aktuell && !liste.includes(aktuell)) liste.push(aktuell);
+  liste.sort((a, b) => nachStaffel({ staffel: a }, { staffel: b }));
+  wahl.innerHTML = `<option value="">${serie ? "Keine Staffel" : "Erst eine Serie eintragen"}</option>` +
+    liste.map((s) => `<option value="${esc(s)}">${esc(staffelText(s))}</option>`).join("") +
+    `<option value="__neu">＋ Neue Staffel …</option>`;
+  wahl.disabled = !serie;
+  wahl.value = aktuell;
+  feld.classList.add("hidden");
+}
+for (const form of [$("#new-book-form"), $("#edit-form")]) {
+  const wahl = form.querySelector(".staffel-wahl");
+  wahl.addEventListener("change", () => {
+    const neu = wahl.value === "__neu";
+    form.staffel.value = neu ? "" : wahl.value;
+    form.staffel.classList.toggle("hidden", !neu);
+    if (neu) form.staffel.focus();
+  });
+  form.serie.addEventListener("input", () => {
+    // Eine Staffel gehört zur Serie: passt sie nicht zur neuen Serie, wird sie geleert
+    if (!form.staffel.classList.contains("hidden")) return;
+    if (!staffelnVon(form.serie.value).includes(form.staffel.value)) form.staffel.value = "";
+    staffelAuswahl(form);
+  });
 }
 
 async function katalogHolen() {
@@ -3190,7 +3259,7 @@ async function oeffneVorschau(isbn) {
     const daten = [
       ["Standort", b.standort ? (b.standort_soll ? `${b.standort} (umstellen nach ${b.standort_soll})` : b.standort + (b.platz.fest ? " 📌" : ""))
         : (b.standort_soll ? `${b.standort_soll} (noch nicht eingeräumt)` : "")],
-      ["Serie", serieText(b.serie, b.band)], ["Genre", b.genre], ["Verlag", b.verlag],
+      ["Serie", serieText(b.serie, b.band, b.staffel)], ["Genre", b.genre], ["Verlag", b.verlag],
       ["Erschienen", b.erscheinungsjahr], ["ISBN", isbn],
     ].filter(([, w]) => !leer(w));
     $("#pv-daten").innerHTML = daten.map(([k, w]) => `<dt>${k}</dt><dd>${esc(w)}</dd>`).join("");
@@ -3203,11 +3272,11 @@ async function oeffneVorschau(isbn) {
     const baende = b.serie_baende || [];
     $("#pv-baende-block").classList.toggle("hidden", baende.length < 2);
     $("#pv-baende-titel").textContent = `${b.serie} – ${baende.length} Bände im Katalog`;
-    $("#pv-baende").innerHTML = baende.map((x) => `
+    $("#pv-baende").innerHTML = mitStaffeln(baende, (t) => `<li class="staffel-kopf">${esc(t)}</li>`, (x) => `
       <li data-isbn="${esc(x.isbn)}" class="${x.isbn === isbn ? "aktuell" : ""}">
         <span class="band-nr">${esc(x.band || "–")}</span><span>${esc(x.titel)}</span>
         <span class="badge ${x.verfuegbar > 0 ? "ok" : "danger"}">${x.verfuegbar}/${x.gesamt}</span>
-      </li>`).join("");
+      </li>`);
 
     $("#pv-ausleihen-block").classList.toggle("hidden", !b.ausleihen.length);
     $("#pv-ausleihen").innerHTML = b.ausleihen.map((a) =>
@@ -3331,6 +3400,7 @@ async function oeffneBearbeiten(isbn) {
     const form = $("#edit-form");
     for (const f of FELDER) form[f].value = LEERWERTE.includes(b[f]) ? "" : b[f];
     for (const f of [...SERIEN_FELDER, "beschreibung"]) form[f].value = b[f] || "";
+    staffelAuswahl(form);
     $("#edit-hint").textContent = `ISBN ${isbn} · Bestand: ${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar`;
     $("#edit-dialog").showModal();
   });
@@ -3383,7 +3453,8 @@ function fachAuswahl(regalSel, fachSel, regale, wahl) {
 const gewaehltesFach = (regalSel, fachSel) => ({ regal_id: Number(regalSel.value), fach: Number(fachSel.value) });
 function buchChip(b) {
   const mitSerie = b.serie && b.band && !b.titel.toLowerCase().includes(b.serie.toLowerCase());
-  const titel = (mitSerie ? `${b.serie} ${b.band}: ` : "") + b.titel + (b.anzahl > 1 ? ` (${b.anzahl}×)` : "");
+  const folge = b.staffel ? serieText(b.serie, b.band, b.staffel) : `${b.serie} ${b.band}`;
+  const titel = (mitSerie ? `${folge}: ` : "") + b.titel + (b.anzahl > 1 ? ` (${b.anzahl}×)` : "");
   const klasse = (b.neu ? "neu" : b.von ? "umstellen" : "") + (b.fest ? " fest" : "") + (auswahl.has(b.isbn) ? " gewaehlt" : "");
   const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : "",
     b.fest ? "selbst festgelegt" : ""].filter(Boolean).join(" · ");

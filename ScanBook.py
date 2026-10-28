@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -66,6 +66,7 @@ BUCH_FELDER = [
 # Freiwillige Angaben – leer heißt "gehört zu keiner Serie"
 SERIEN_FELDER = [
     ("serie", "Serie"),
+    ("staffel", "Staffel"),
     ("band", "Band"),
 ]
 
@@ -94,7 +95,7 @@ DEFAULT_EINSTELLUNGEN = {
     "mediencode_praefix": "M",
 }
 
-BUCH_SPALTEN = "autor_formatiert, titel, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar, isbn, serie, band"
+BUCH_SPALTEN = "autor_formatiert, titel, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar, isbn, serie, band, staffel"
 
 
 # --- ALLGEMEINE HELFER ---
@@ -404,6 +405,7 @@ def init_db():
                 anzahl_verfuegbar INTEGER DEFAULT 1,
                 serie TEXT DEFAULT '',
                 band TEXT DEFAULT '',
+                staffel TEXT DEFAULT '',
                 beschreibung TEXT DEFAULT '',
                 cover_url TEXT DEFAULT '',
                 nachgeladen INTEGER DEFAULT 0,
@@ -499,7 +501,7 @@ def init_db():
 
         # Spalten nachrüsten, die ältere Versionen noch nicht hatten
         buch_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(buecher)")}
-        for spalte in ("serie", "band", "beschreibung", "cover_url"):
+        for spalte in ("serie", "band", "staffel", "beschreibung", "cover_url"):
             if spalte not in buch_spalten:
                 cursor.execute(f"ALTER TABLE buecher ADD COLUMN {spalte} TEXT DEFAULT ''")
         if "nachgeladen" not in buch_spalten:
@@ -885,7 +887,8 @@ def genre_ermitteln(begriffe, klassen=(), schlagwoerter=()):
     return genres_zusammenfuehren(roh), False
 
 
-def neue_buchdaten(titel, autoren, verlag, jahr, genre, serie=None, band=None, beschreibung=None, cover_url=None):
+def neue_buchdaten(titel, autoren, verlag, jahr, genre, serie=None, band=None, beschreibung=None, cover_url=None,
+                   staffel=None):
     serie = (serie or "").strip()
     return {
         'titel': titel or 'Unbekannter Titel',
@@ -895,6 +898,7 @@ def neue_buchdaten(titel, autoren, verlag, jahr, genre, serie=None, band=None, b
         'genre': genre or 'Keine Angabe',
         'serie': serie,
         'band': band_normalisieren(band) if serie else '',
+        'staffel': staffel_normalisieren(staffel) if serie else '',
         'beschreibung': (beschreibung or '').strip(),
         'cover_url': (cover_url or '').strip(),
     }
@@ -916,6 +920,15 @@ def band_normalisieren(band):
     if not zahl:
         return band
     return zahl.group(0).lstrip("0") or "0"
+
+
+def staffel_normalisieren(staffel):
+    """'Staffel 2' -> '2'; ein Name wie 'Die neue Prophezeiung' bleibt, wie er ist."""
+    return re.sub(r"^staffel\s*", "", " ".join(str(staffel or "").split()), flags=re.I)
+
+
+def staffel_text(staffel):
+    return f"Staffel {staffel}" if staffel.isdigit() else staffel
 
 
 def band_sortierwert(band):
@@ -1272,17 +1285,17 @@ def fetch_book_data(isbn):
 
 
 # --- BUCHDATEN ANZEIGEN, PRÜFEN & BEARBEITEN ---
-def serie_text(serie, band):
+def serie_text(serie, band, staffel=""):
     if not serie:
         return ""
-    return f"{serie}, Band {band}" if band else serie
+    return ", ".join(filter(None, [serie, staffel_text(staffel or ""), f"Band {band}" if band else ""]))
 
 
 def zeige_buchdaten(daten):
     for feld, label in BUCH_FELDER:
         print(f"   {label + ':':<18} {daten[feld]}")
     if daten.get('serie'):
-        print(f"   {'Serie:':<18} {serie_text(daten['serie'], daten['band'])}")
+        print(f"   {'Serie:':<18} {serie_text(daten['serie'], daten['band'], daten.get('staffel'))}")
     if daten.get('beschreibung'):
         kurz = " ".join(daten['beschreibung'].split())
         print(f"   {'Beschreibung:':<18} {kurz[:150] + ' …' if len(kurz) > 150 else kurz}")
@@ -1300,18 +1313,18 @@ def fehlende_felder_abfragen(daten):
 
 
 def buchdaten_bearbeiten(daten):
-    print("✏️ Neue Werte eingeben ([ENTER] = beibehalten, '-' = Serie/Band leeren):")
+    print("✏️ Neue Werte eingeben ([ENTER] = beibehalten, '-' = Serie/Staffel/Band leeren):")
     for feld, label in BUCH_FELDER + SERIEN_FELDER:
-        if feld == "band" and not daten['serie']:
-            daten['band'] = ""
+        if feld in ("staffel", "band") and not daten['serie']:
+            daten[feld] = ""
             continue
         neu = input(f"   {label} [{daten[feld]}]: ").strip()
-        if neu == "-" and feld in ("serie", "band"):
+        if neu == "-" and feld in ("serie", "staffel", "band"):
             daten[feld] = ""
         elif neu:
-            daten[feld] = band_normalisieren(neu) if feld == "band" else neu
+            daten[feld] = {"band": band_normalisieren, "staffel": staffel_normalisieren}.get(feld, str)(neu)
     if not daten['serie']:
-        daten['band'] = ""
+        daten['band'] = daten['staffel'] = ""
 
 
 def buch_speichern(isbn, daten, anzahl=1, nachgeladen=False):
@@ -1321,12 +1334,12 @@ def buch_speichern(isbn, daten, anzahl=1, nachgeladen=False):
         conn.execute('''
             INSERT INTO buecher
             (isbn, titel, autoren, autor_nachname, autor_formatiert, verlag, erscheinungsjahr, genre,
-             anzahl_gesamt, anzahl_verfuegbar, serie, band, beschreibung, cover_url, nachgeladen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             anzahl_gesamt, anzahl_verfuegbar, serie, band, staffel, beschreibung, cover_url, nachgeladen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             isbn, daten['titel'], daten['autoren'], sort_key, formatiert,
             daten['verlag'], daten['erscheinungsjahr'], daten['genre'], anzahl, anzahl,
-            daten.get('serie', ''), daten.get('band', ''), daten.get('beschreibung', ''),
+            daten.get('serie', ''), daten.get('band', ''), daten.get('staffel', ''), daten.get('beschreibung', ''),
             daten.get('cover_url', ''), int(nachgeladen),
         ))
     print(f"✨ NEU HINZUGEFÜGT: {daten['titel']} ({formatiert}) – {anzahl}x")
@@ -1349,7 +1362,7 @@ def lade_buch(isbn):
         cursor = conn.cursor()
         cursor.execute('''
             SELECT titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar,
-                   serie, band, beschreibung, cover_url, nachgeladen
+                   serie, band, beschreibung, cover_url, nachgeladen, staffel
             FROM buecher WHERE isbn = ?
         ''', (isbn,))
         row = cursor.fetchone()
@@ -1359,6 +1372,7 @@ def lade_buch(isbn):
     daten['anzahl_gesamt'], daten['anzahl_verfuegbar'] = row[5], row[6]
     daten['serie'], daten['band'], daten['beschreibung'], daten['cover_url'] = (w or "" for w in row[7:11])
     daten['nachgeladen'] = bool(row[11])
+    daten['staffel'] = row[12] or ""
     return daten
 
 
@@ -1629,19 +1643,24 @@ def regal_plan():
     return plan
 
 
+def folge_in_serie(b):
+    """Reihenfolge in einer Serie: erst nach Staffel (Bände ohne Staffel, z. B. Specials, ans Ende), dann nach Band."""
+    return not b.get("staffel"), natuerlich(b.get("staffel")), band_sortierwert(b["band"])
+
+
 def regal_plan_berechnen():
     regale = lade_regale()
     with db_connection() as conn:
         rows = conn.execute('''
-            SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach, fest
+            SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach, fest, staffel
             FROM buecher
         ''').fetchall()
     faecher_von = {r["id"]: r["faecher"] for r in regale}
     alle, buecher = [], []
-    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest in rows:
+    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest, staffel in rows:
         b = {
             "isbn": isbn, "titel": titel or "", "autor": autor or "", "nachname": (nachname or "").lower(),
-            "genres": genre_liste(genre), "serie": (serie or "").strip(), "band": band or "", "anzahl": anzahl or 1,
+            "genres": genre_liste(genre), "serie": (serie or "").strip(), "band": band or "", "staffel": staffel or "", "anzahl": anzahl or 1,
             "regal_id": regal_id if regal_id in faecher_von else None, "fach": fach, "soll": None,
         }
         b["ist"] = (b["regal_id"], fach) if b["regal_id"] and fach else None
@@ -1655,7 +1674,7 @@ def regal_plan_berechnen():
 
     # Eine Serie wird unter dem Autor ihres ersten Bandes einsortiert
     serien_autor = {}
-    for b in sorted((b for b in buecher if b["serie"]), key=lambda b: band_sortierwert(b["band"])):
+    for b in sorted((b for b in buecher if b["serie"]), key=lambda b: folge_in_serie(b)):
         serien_autor.setdefault(b["serie"].lower(), b["nachname"])
 
     def sortierung(bereich, b):
@@ -1666,8 +1685,8 @@ def regal_plan_berechnen():
         else:
             genre = (0, kleine[0] if kleine else "￿")  # Bücher ohne Genre ans Ende
         if b["serie"]:
-            return genre, serien_autor[b["serie"].lower()], natuerlich(b["serie"]), band_sortierwert(b["band"]), natuerlich(b["titel"])
-        return genre, b["nachname"], natuerlich(b["titel"]), (0, 0, ""), ""
+            return genre, serien_autor[b["serie"].lower()], natuerlich(b["serie"]), folge_in_serie(b), natuerlich(b["titel"])
+        return genre, b["nachname"], natuerlich(b["titel"]), (False, "", (0, 0, "")), ""
 
     def passt(genres, b):
         eigene = {g.lower() for g in genres}
@@ -1683,7 +1702,7 @@ def regal_plan_berechnen():
     # eingetragenen Genre passt (bei "Krieg, Geschichte" also zu Krieg, sonst zu Geschichte).
     for regal in regale:
         regal["fest"] = [sorted((b for b in alle if b["fest"] and b["regal_id"] == regal["id"] and b["fach"] == f),
-                                key=lambda b: (b["nachname"], natuerlich(b["serie"]), band_sortierwert(b["band"]), natuerlich(b["titel"])))
+                                key=lambda b: (b["nachname"], natuerlich(b["serie"]), folge_in_serie(b), natuerlich(b["titel"])))
                          for f in range(1, regal["faecher"] + 1)]
         regal["schon_belegt"] = {f: sum(max(1, b["anzahl"]) for b in fest) for f, fest in enumerate(regal["fest"], 1)}
         bereiche = {}
@@ -2143,6 +2162,7 @@ def manuelle_eingabe(isbn=None):
         input("   Serie (leer = keine): ").strip(),
     )
     if daten['serie']:
+        daten['staffel'] = staffel_normalisieren(input("   Staffel (leer = keine): ").strip())
         daten['band'] = band_normalisieren(input("   Band-Nummer: ").strip())
     anzahl_input = input("   Anzahl Exemplare [1]: ").strip()
     anzahl = int(anzahl_input) if anzahl_input.isdigit() and int(anzahl_input) > 0 else 1
@@ -2154,15 +2174,16 @@ def manuelle_eingabe(isbn=None):
 # --- KATALOG ANZEIGEN & SUCHEN ---
 def katalog_sortierung(buch):
     """Nach Autor, Bände einer Serie direkt nacheinander in der richtigen Reihenfolge."""
-    autor, titel, serie, band = buch[0], buch[1], buch[7] or "", buch[8] or ""
-    return (autor or "").lower(), serie.lower(), band_sortierwert(band) if serie else (0, 0, ""), titel.lower()
+    autor, titel, serie, band, staffel = buch[0], buch[1], buch[7] or "", buch[8] or "", buch[9] or ""
+    folge = folge_in_serie({"staffel": staffel, "band": band}) if serie else (False, "", (0, 0, ""))
+    return (autor or "").lower(), serie.lower(), folge, titel.lower()
 
 
 def zeige_buchliste(buecher):
-    for autor_formatiert, titel, jahr, genre, gesamt, verfuegbar, isbn, serie, band in sorted(buecher, key=katalog_sortierung):
+    for autor_formatiert, titel, jahr, genre, gesamt, verfuegbar, isbn, serie, band, staffel in sorted(buecher, key=katalog_sortierung):
         print(f"• {autor_formatiert:<25} | {titel} ({jahr}) [Bestand: {verfuegbar}/{gesamt} verfügbar]")
         if serie:
-            print(f"  📚 Serie: {serie_text(serie, band)}")
+            print(f"  📚 Serie: {serie_text(serie, band, staffel)}")
         print(f"  Genre: {genre} | ISBN: {isbn}")
         print("-" * 75)
 
@@ -2907,7 +2928,7 @@ def export_daten(typ):
     with db_connection() as conn:
         if typ == "katalog":
             zeilen = conn.execute('''
-                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, serie, band, anzahl_gesamt, anzahl_verfuegbar
+                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, serie, staffel, band, anzahl_gesamt, anzahl_verfuegbar
                 FROM buecher ORDER BY autor_nachname, titel
             ''').fetchall()
             orte = standorte()
@@ -2916,7 +2937,7 @@ def export_daten(typ):
                 text, _, geplant = orte.get(isbn, ("", None, False))
                 return f"{text} (geplant)" if text and geplant else text
             zeilen = [(*z, ort(z[0])) for z in zeilen]
-            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Band", "Exemplare", "Verfügbar",
+            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Staffel", "Band", "Exemplare", "Verfügbar",
                     "Standort"], zeilen
 
         sql = '''
