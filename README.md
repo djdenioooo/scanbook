@@ -145,6 +145,10 @@ python ScanBook.py --admin-reset
 
 Passwörter werden nur als PBKDF2-Hash gespeichert. Nach 5 falschen Versuchen ist die Anmeldung 5 Minuten gesperrt, nach 60 Minuten ohne Klick wird man abgemeldet. Das Terminal-Programm `ScanBook.py` fragt kein Passwort ab, weil es nur direkt am PC läuft.
 
+**Gast-Ansicht:** Ohne Anmeldung öffnet sich der Katalog nur zum Ansehen: Titel, Cover, Serie, Standort und wie viele Exemplare verfügbar sind. Oben links bzw. über dem Katalog steht „Anmelden“. Ausleihen, Namen von Ausleihern, Schülerdaten, Mediencodes und die Verwaltung gibt es erst nach der Anmeldung. Der Admin kann die Gast-Ansicht unter Verwaltung → Logo & Gast-Ansicht ausschalten.
+
+**Eigenes Logo:** Unter Verwaltung → Logo & Gast-Ansicht lädt der Admin ein eigenes Bild hoch (PNG, JPG, GIF, WebP oder SVG, höchstens 1 MB) oder trägt einen Link zu einem Bild ein. Es erscheint oben links, auf der Anmeldeseite und als Symbol im Browser-Tab. „ScanBook-Logo verwenden“ stellt das ursprüngliche Logo wieder her. Ein hochgeladenes Bild liegt in der Datenbank und ist damit auch im Backup.
+
 ## ISBN-Prüfung
 
 Jede ISBN wird anhand ihrer Prüfziffer kontrolliert, damit Scan- und Tippfehler sofort auffallen. ISBN-10 werden automatisch in ISBN-13 umgerechnet, damit dasselbe Buch nicht doppelt im Katalog landet.

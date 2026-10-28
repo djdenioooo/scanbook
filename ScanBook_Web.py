@@ -6,6 +6,7 @@ Die Oberfläche benutzt dieselbe Datenbank wie das Terminal-Programm ScanBook.py
 """
 import io
 import os
+import base64
 import re
 import html
 import csv
@@ -446,6 +447,102 @@ def api_settings_save(body):
     return api_settings(None)
 
 
+# --- EIGENES LOGO & GAST-ANSICHT ---
+LOGO_DATEN, LOGO_TYP, LOGO_URL = "logo_daten", "logo_typ", "logo_url"
+GAST_KATALOG = "gast_katalog"  # "1" = Katalog ist ohne Anmeldung lesbar
+LOGO_MAX_BYTES = 1024 * 1024
+LOGO_TYPEN = {  # Dateianfang → Bildtyp; andere Dateien werden abgelehnt
+    b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif", b"RIFF": "image/webp",
+}
+
+
+def bild_typ(daten):
+    for anfang, typ in LOGO_TYPEN.items():
+        if daten.startswith(anfang) and (typ != "image/webp" or daten[8:12] == b"WEBP"):
+            return typ
+    kopf = daten[:1000].lstrip().lower()
+    if kopf.startswith(b"<svg") or (kopf.startswith(b"<?xml") and b"<svg" in kopf):
+        return "image/svg+xml"
+    return None
+
+
+def logo_adresse():
+    """Wo die Oberfläche das Logo holt: "" = eingebautes Logo."""
+    if url := sb.get_einstellung(LOGO_URL):
+        return url
+    daten = sb.get_einstellung(LOGO_DATEN)
+    return f"/logo?v={hashlib.sha256(daten.encode()).hexdigest()[:10]}" if daten else ""
+
+
+def gast_erlaubt():
+    return sb.get_einstellung(GAST_KATALOG, "1") == "1"
+
+
+def api_logo_save(body):
+    art = text(body, "art")
+    if art == "standard":
+        for key in (LOGO_DATEN, LOGO_TYP, LOGO_URL):
+            sb.set_einstellung(key, "")
+    elif art == "link":
+        url = text(body, "url")
+        if not re.match(r"^https?://[^\s\"'<>]+$", url, re.I) or len(url) > 2000:
+            raise ApiFehler("Bitte einen vollständigen Link angeben, der mit http:// oder https:// beginnt.")
+        sb.set_einstellung(LOGO_URL, url)
+    elif art == "datei":
+        try:
+            daten = base64.b64decode(text(body, "daten").split(",", 1)[-1], validate=True)
+        except ValueError:
+            raise ApiFehler("Die Datei konnte nicht gelesen werden.")
+        if len(daten) > LOGO_MAX_BYTES:
+            raise ApiFehler("Das Bild ist zu groß (höchstens 1 MB).")
+        typ = bild_typ(daten)
+        if not typ:
+            raise ApiFehler("Bitte ein Bild als PNG, JPG, GIF, WebP oder SVG hochladen.")
+        sb.set_einstellung(LOGO_DATEN, base64.b64encode(daten).decode())
+        sb.set_einstellung(LOGO_TYP, typ)
+        sb.set_einstellung(LOGO_URL, "")
+    else:
+        raise ApiFehler("Ungültige Anfrage.")
+    return {"logo": logo_adresse()}
+
+
+def api_gast_save(body):
+    sb.set_einstellung(GAST_KATALOG, "1" if body.get("an") else "0")
+    return {"gast_katalog": gast_erlaubt()}
+
+
+def gast_books(params):
+    """Katalog für Gäste: ohne Mediencodes."""
+    return [{k: v for k, v in b.items() if k != "codes"} for b in api_books(params)]
+
+
+def gast_book(params):
+    """Buchvorschau für Gäste: keine Namen von Ausleihern, keine Codes, kein Umstellen."""
+    isbn = isbn_pruefen(params.get("isbn"))
+    buch = buch_oder_fehler(isbn)
+    with sb.db_connection() as conn:
+        baende = []
+        if buch["serie"]:
+            baende = [
+                {"isbn": r[0], "titel": r[1], "band": r[2] or "", "verfuegbar": r[3], "gesamt": r[4], "staffel": r[5] or ""}
+                for r in conn.execute(
+                    "SELECT isbn, titel, band, anzahl_verfuegbar, anzahl_gesamt, staffel FROM buecher WHERE serie = ? COLLATE NOCASE",
+                    (buch["serie"],))
+            ]
+    buch["serie_baende"] = sorted(baende, key=lambda b: (sb.folge_in_serie(b), b["titel"]))
+    buch["ausleihen"], buch["exemplare"] = [], []
+    buch["platz"] = {"ist": None, "soll": None, "fest": False, "regale": []}
+    return buch
+
+
+def gast_info(_):
+    return {"version": sb.VERSION, "bib_name": sb.get_einstellung("bib_name", "Schulbibliothek"),
+            "schulname": sb.get_einstellung("schulname"), "standard_leihdauer": 0, "einraeumen_bestaetigen": False}
+
+
+GAST_ROUTEN = {"books": gast_books, "book": gast_book, "info": gast_info}
+
+
 def api_backup(_):
     pfad = sb.erstelle_backup()
     return {"pfad": pfad, "kopie_fehler": sb.backup_status["kopie_fehler"]}
@@ -762,6 +859,8 @@ def api_anmeldung(h, _):
         "stichtag": sb.naechster_stichtag().isoformat(),
         "bib_name": sb.get_einstellung("bib_name", "Schulbibliothek"),
         "version": sb.VERSION,
+        "logo": logo_adresse(),
+        "gast_katalog": gast_erlaubt(),
     }
 
 
@@ -1315,6 +1414,8 @@ POST_ROUTEN = {
     "buecher_freigeben": api_buecher_freigeben,
     "fach_scan": api_fach_scan,
     "update_install": api_update_install,
+    "logo": api_logo_save,
+    "gast": api_gast_save,
     "schueler_save": api_schueler_save,
     "schueler_delete": api_schueler_delete,
     "schueler_import": api_schueler_import,
@@ -1342,7 +1443,7 @@ KONTO_POST = {
 }
 OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
 VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
-NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu"}
+NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu", "logo", "gast"}
 
 
 # --- WEBSERVER ---
@@ -1386,7 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
         alter = 0 if loeschen else SITZUNG_MINUTEN * 60 * 12  # die Sitzung selbst endet nach SITZUNG_MINUTEN ohne Klick
         self.neues_cookie = f"{SITZUNG_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={alter}"
 
-    def _anmelden(self, name):
+    def _anmelden(self, name, gast=False):
         """Liest die Sitzung aus dem Cookie. False = Anfrage wurde schon mit einem Fehler beantwortet."""
         self.neues_cookie = None
         cookie = SimpleCookie()
@@ -1397,6 +1498,8 @@ class Handler(BaseHTTPRequestHandler):
         self.token = cookie[SITZUNG_COOKIE].value if SITZUNG_COOKIE in cookie else ""
         self.benutzer = sitzung_benutzer(self.token)
         if name in OHNE_ANMELDUNG:
+            return True
+        if not self.benutzer and gast and name in GAST_ROUTEN and gast_erlaubt():
             return True
         if not self.benutzer:
             self._json(401, {"fehler": "Bitte anmelden.", "anmelden": True})
@@ -1415,6 +1518,15 @@ class Handler(BaseHTTPRequestHandler):
             print(f"⚠️ Fehler: {e}")
             self._json(500, {"fehler": f"Interner Fehler: {e}"})
 
+    def _logo_senden(self):
+        daten, typ = sb.get_einstellung(LOGO_DATEN), sb.get_einstellung(LOGO_TYP)
+        if not daten or not typ:
+            self._json(404, {"fehler": "Kein eigenes Logo."})
+            return
+        # sandbox: ein SVG-Logo darf keine Skripte ausführen, auch wenn man es direkt öffnet
+        self._senden(200, base64.b64decode(daten), typ,
+                     {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox", "X-Content-Type-Options": "nosniff"})
+
     def do_GET(self):
         if not self._host_erlaubt():
             return
@@ -1426,9 +1538,15 @@ class Handler(BaseHTTPRequestHandler):
             self.neues_cookie = None
             self._senden(200, HTML, "text/html; charset=utf-8")
             return
-        if not self._anmelden(name):
+        if url.path == "/logo":
+            self.neues_cookie = None
+            self._logo_senden()
             return
-        if name in KONTO_GET:
+        if not self._anmelden(name, gast=url.path.startswith("/api/")):
+            return
+        if not self.benutzer and name in GAST_ROUTEN:
+            self._api_ausfuehren(GAST_ROUTEN[name], params)
+        elif name in KONTO_GET:
             self._api_ausfuehren(lambda p: KONTO_GET[name](self, p), params)
         elif url.path.startswith("/api/") and url.path[5:] in GET_ROUTEN:
             self._api_ausfuehren(GET_ROUTEN[url.path[5:]], params)
@@ -1530,7 +1648,7 @@ HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ScanBook</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='112' fill='%23234a70'/><path d='M92 170Q172 140 250 176V386Q172 352 92 378Z' fill='%23fff'/><path d='M420 170Q340 140 262 176V386Q340 352 420 378Z' fill='%23fff'/><rect x='68' y='252' width='376' height='24' rx='12' fill='%23ff5a4e'/></svg>">
+<link rel="icon" id="favicon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='112' fill='%23234a70'/><path d='M92 170Q172 140 250 176V386Q172 352 92 378Z' fill='%23fff'/><path d='M420 170Q340 140 262 176V386Q340 352 420 378Z' fill='%23fff'/><rect x='68' y='252' width='376' height='24' rx='12' fill='%23ff5a4e'/></svg>">
 <style>
 /* Gestaltung nach Apples Human Interface Guidelines: Systemschrift, Systemfarben,
    gruppierte Listen, Seitenleiste (breit) bzw. Tab-Leiste unten (schmal), Hell/Dunkel automatisch */
@@ -1727,6 +1845,17 @@ body.abgemeldet > header, body.abgemeldet > main { visibility: hidden; }
   .konto .kurz { display: inline; }
   .konto .row { margin: 0; flex-wrap: nowrap; }
 }
+img.logo { object-fit: contain; background: #fff; padding: 3px; }
+/* Gast-Ansicht: nur der Katalog, nur lesen */
+#konto-an, .gast-hinweis, .anmelde-links #anm-gast-link { display: none; }
+body.gast nav button:not([data-tab="katalog"]), body.gast .konto .row button:not(#konto-an), body.gast #nachladen-box,
+body.gast #pv-codes-block, body.gast #pv-edit, body.gast #pv-refresh, body.gast #update-hinweis { display: none !important; }
+body.gast #konto-an { display: inline-block; background: var(--accent); color: #fff; font-weight: 600; padding: 6px 16px; }
+body.gast .gast-hinweis { display: block; }
+body.gast-moeglich .anmelde-links #anm-gast-link { display: inline; }
+@media (max-width: 860px) { body.gast nav { display: none; } }  /* nur ein Tab: keine Tab-Leiste */
+.logo-vorschau { display: flex; align-items: center; gap: 14px; margin: 4px 0 12px; }
+.logo-vorschau .logo { width: 56px; height: 56px; border-radius: 12px; flex: none; }
 body:not([data-rolle="admin"]) .nur-admin { display: none !important; }
 body[data-rolle="buecherei"] .nur-verwalter { display: none !important; }
 .benutzer-neu { background: var(--warn-soft); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 14px; }
@@ -1948,7 +2077,7 @@ td.titel-zelle { min-width: 220px; }
     </nav>
     <div class="konto" id="konto">
       <div><b id="konto-name"></b><span class="rolle" id="konto-rolle"></span></div>
-      <div class="row"><button type="button" id="konto-pw"><span class="lang">Passwort ändern</span><span class="kurz">Passwort</span></button><button type="button" id="konto-ab">Abmelden</button></div>
+      <div class="row"><button type="button" id="konto-pw"><span class="lang">Passwort ändern</span><span class="kurz">Passwort</span></button><button type="button" id="konto-ab">Abmelden</button><button type="button" id="konto-an">Anmelden</button></div>
     </div>
   </div>
 </header>
@@ -2015,6 +2144,7 @@ td.titel-zelle { min-width: 220px; }
 
   <!-- KATALOG -->
   <section id="tab-katalog">
+    <p class="hint gast-hinweis">👋 Du siehst den Katalog als Gast. Zum Ausleihen und Verwalten bitte <button class="link" type="button" id="gast-anmelden" style="margin:0">anmelden</button>.</p>
     <div class="card">
       <div class="row">
         <input id="katalog-suche" class="grow" placeholder="Suchen nach Titel, Autor, Serie, Genre, Verlag, Regal, ISBN oder Mediencode …" autocomplete="off">
@@ -2239,6 +2369,22 @@ td.titel-zelle { min-width: 220px; }
         <div class="actions"><button class="btn" type="submit">Speichern</button></div>
       </form>
     </div>
+    <div class="card nur-admin">
+      <h2>Logo &amp; Gast-Ansicht</h2>
+      <div class="logo-vorschau"><span id="logo-vorschau"></span><p class="hint" id="logo-text" style="margin:0"></p></div>
+      <div class="row">
+        <button class="btn secondary" type="button" id="logo-hochladen">Bild hochladen …</button>
+        <input type="file" id="logo-datei" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" class="hidden">
+        <button class="btn secondary" type="button" id="logo-standard">ScanBook-Logo verwenden</button>
+      </div>
+      <form class="row" id="logo-link-form" style="margin-top:10px">
+        <input class="grow" id="logo-link" type="url" placeholder="… oder Link zum Bild, z. B. https://meine-schule.de/logo.png" autocomplete="off">
+        <button class="btn secondary" type="submit">Link übernehmen</button>
+      </form>
+      <p class="hint" style="margin-top:6px">PNG, JPG, GIF, WebP oder SVG, höchstens 1 MB. Ein hochgeladenes Bild ist auch im Backup enthalten, ein Link braucht Internet.</p>
+      <label class="check" style="margin-top:14px"><input type="checkbox" id="gast-katalog"> Katalog ohne Anmeldung zeigen (Gast-Ansicht)</label>
+      <p class="hint" style="margin:4px 0 0">Gäste sehen nur den Katalog mit Standort und wie viele Exemplare da sind. Ausleihen, Schülerdaten, Mediencodes und die Verwaltung bleiben hinter der Anmeldung.</p>
+    </div>
     <div class="card" id="update-karte">
       <h2>Programm-Update</h2>
       <p class="hint" id="update-text">Prüft auf GitHub, ob es eine neuere Version von ScanBook gibt. Deine Daten bleiben beim Update erhalten.</p>
@@ -2420,6 +2566,7 @@ td.titel-zelle { min-width: 220px; }
       <div class="anmelde-links">
         <button class="link hidden" type="button" data-zu="bufdi" id="anm-bufdi-link">Ich bin die neue Bücherei-Kraft</button>
         <button class="link hidden" type="button" data-zu="notfall" id="anm-notfall-link">Admin-Passwort vergessen?</button>
+        <button class="link" type="button" id="anm-gast-link">Ohne Anmeldung den Katalog ansehen</button>
       </div>
     </form>
 
@@ -2665,7 +2812,7 @@ const LADER = {
   verwaltung: () => {
     if (ich?.rolle !== "buecherei") ladeBenutzer();
     ladeStatistik(); ladeCodesStatus(); ladeBackups();
-    if (ich?.rolle === "admin") ladeEinstellungen();
+    if (ich?.rolle === "admin") { ladeEinstellungen(); ladeLogoEinstellung().catch(() => {}); }
   },
 };
 // Alte Lesezeichen weiter unterstützen
@@ -2674,6 +2821,7 @@ const SEITEN_TITEL = { scan: "Bücher erfassen" };
 function zeigeTab(name) {
   if (ALTE_TABS[name]) { if (name === "personen") zeigeSchuelerAnsicht("verlauf", false); name = ALTE_TABS[name]; }
   if (!LADER[name]) name = "ausleihe";
+  if (!ich) name = "katalog";
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   $("#seiten-titel").textContent = SEITEN_TITEL[name] || $(`nav button[data-tab="${name}"]`).textContent;
   document.querySelectorAll("main > section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + name));
@@ -3157,7 +3305,7 @@ async function ladeKatalog() {
   await versuche(async () => {
     if (await katalogHolen() || !katalogZiel().children.length) zeichneKatalog(true);
   });
-  zeigeNachladen(await get("refresh_status").catch(() => null));
+  if (ich) zeigeNachladen(await get("refresh_status").catch(() => null));
 }
 $("#katalog-suche").addEventListener("input", debounce(() => zeichneKatalog(), 120));
 $("#katalog-versteckt").addEventListener("click", (e) => {
@@ -4222,6 +4370,46 @@ async function ladeEinstellungen() {
       <input id="st-${e.key}" name="${e.key}" value="${esc(e.wert)}" ${e.zahl ? 'type="number" min="0"' : ""}></div>`).join("");
   });
 }
+function zeigeLogoEinstellung(adresse, gast) {
+  setzeLogo(adresse);
+  $("#logo-vorschau").replaceChildren(logoElement(adresse));
+  $("#logo-text").textContent = !adresse ? "Gerade wird das ScanBook-Logo verwendet."
+    : adresse.startsWith("/logo") ? "Gerade wird dein hochgeladenes Bild verwendet." : "Gerade wird das Bild von diesem Link verwendet: " + adresse;
+  if (document.activeElement !== $("#logo-link")) $("#logo-link").value = adresse.startsWith("/logo") ? "" : adresse;
+  if (gast !== undefined) $("#gast-katalog").checked = gast;
+}
+async function ladeLogoEinstellung() {
+  const d = await get("anmeldung");
+  zeigeLogoEinstellung(d.logo, d.gast_katalog);
+}
+$("#logo-hochladen").addEventListener("click", () => $("#logo-datei").click());
+$("#logo-datei").addEventListener("change", (e) => {
+  const datei = e.target.files[0];
+  e.target.value = "";
+  if (!datei) return;
+  if (datei.size > 1024 * 1024) { toast("Das Bild ist zu groß (höchstens 1 MB).", true); return; }
+  const leser = new FileReader();
+  leser.onload = () => versuche(async () => {
+    zeigeLogoEinstellung((await post("logo", { art: "datei", daten: leser.result })).logo);
+    toast("Neues Logo gespeichert");
+  });
+  leser.readAsDataURL(datei);
+});
+$("#logo-link-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    zeigeLogoEinstellung((await post("logo", { art: "link", url: $("#logo-link").value.trim() })).logo);
+    toast("Logo-Link gespeichert");
+  });
+});
+$("#logo-standard").addEventListener("click", () => versuche(async () => {
+  zeigeLogoEinstellung((await post("logo", { art: "standard" })).logo);
+  toast("Wieder das ScanBook-Logo");
+}));
+$("#gast-katalog").addEventListener("change", (e) => versuche(async () => {
+  const d = await post("gast", { an: e.target.checked });
+  toast(d.gast_katalog ? "Gäste können den Katalog jetzt ohne Anmeldung ansehen" : "Gast-Ansicht ausgeschaltet");
+}));
 $("#settings-form").addEventListener("submit", (e) => {
   e.preventDefault();
   versuche(async () => {
@@ -4231,9 +4419,47 @@ $("#settings-form").addEventListener("submit", (e) => {
   });
 });
 
+// --- Eigenes Logo ---
+const STANDARD_LOGO = $(".brand .logo").cloneNode(true);
+const STANDARD_FAVICON = $("#favicon").href;
+$("#anm-logo").replaceWith(STANDARD_LOGO.cloneNode(true));
+function logoElement(adresse) {
+  if (!adresse) return STANDARD_LOGO.cloneNode(true);
+  const img = document.createElement("img");
+  img.className = "logo";
+  img.alt = "";
+  img.referrerPolicy = "no-referrer";
+  img.onerror = () => img.replaceWith(STANDARD_LOGO.cloneNode(true));  // Link kaputt → ScanBook-Logo
+  img.src = adresse;
+  return img;
+}
+let logoAdresse = null;
+function setzeLogo(adresse) {
+  if (adresse === logoAdresse) return;
+  logoAdresse = adresse;
+  for (const alt of [$(".brand .logo"), $(".anmelde-kopf .logo")]) alt.replaceWith(logoElement(adresse));
+  $("#favicon").href = adresse || STANDARD_FAVICON;
+}
+
 // --- Anmeldung ---
 let ich = null, gestartet = false;
-$("#anm-logo").replaceWith($(".brand .logo").cloneNode(true));
+const KATALOG_SUCHE_TEXT = $("#katalog-suche").placeholder;
+// Gast-Ansicht: nur der Katalog, ohne Anmeldung
+function alsGast() {
+  ich = null;
+  delete document.body.dataset.rolle;
+  document.body.classList.add("gast");
+  document.body.classList.remove("abgemeldet");
+  $("#anmeldung").classList.add("hidden");
+  $("#konto-name").textContent = "Gast";
+  $("#konto-rolle").textContent = "nur Katalog ansehen";
+  $("#katalog-suche").placeholder = "Suchen nach Titel, Autor, Serie, Genre, Verlag, Regal oder ISBN …";
+  ladeInfo().catch(() => {});
+  zeigeTab("katalog");
+}
+$("#konto-an").addEventListener("click", () => zeigeAnmeldung("login"));
+$("#gast-anmelden").addEventListener("click", () => zeigeAnmeldung("login"));
+$("#anm-gast-link").addEventListener("click", alsGast);
 function anmeldeAnsicht(name) {
   document.querySelectorAll("#anmeldung .ansicht").forEach((el) => el.classList.toggle("hidden", el.dataset.ansicht !== name));
   setTimeout(() => $(`#anmeldung [data-ansicht="${name}"] input`)?.focus(), 30);
@@ -4244,6 +4470,8 @@ async function zeigeAnmeldung(ansicht) {
   document.body.classList.add("abgemeldet");
   $("#anmeldung").classList.remove("hidden");
   const d = await get("anmeldung");
+  setzeLogo(d.logo);
+  document.body.classList.toggle("gast-moeglich", d.gast_katalog && d.eingerichtet);
   $("#anm-bib").textContent = d.bib_name;
   $("#anm-bufdi-link").classList.toggle("hidden", !d.bufdi_frei);
   $("#anm-notfall-link").classList.toggle("hidden", !d.lokal);
@@ -4252,6 +4480,8 @@ async function zeigeAnmeldung(ansicht) {
 }
 function angemeldetAls(b) {
   ich = b;
+  document.body.classList.remove("gast");
+  $("#katalog-suche").placeholder = KATALOG_SUCHE_TEXT;
   document.body.dataset.rolle = b.rolle;
   $("#konto-name").textContent = b.name;
   $("#konto-rolle").textContent = b.rolle_text + (b.gueltig_bis ? ` · bis ${deDatum(b.gueltig_bis)}` : "");
@@ -4271,7 +4501,10 @@ function angemeldetAls(b) {
 }
 async function anmeldungPruefen() {
   const d = await get("anmeldung");
-  if (d.benutzer) angemeldetAls(d.benutzer); else zeigeAnmeldung();
+  setzeLogo(d.logo);
+  if (d.benutzer) angemeldetAls(d.benutzer);
+  else if (d.gast_katalog && d.eingerichtet && !d.benutzer) alsGast();
+  else zeigeAnmeldung();
 }
 function gleichePasswoerter(form, a = "passwort", b = "passwort2") {
   if (form.elements[a].value === form.elements[b].value) return true;
