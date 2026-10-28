@@ -1824,6 +1824,11 @@ dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
 .waehlen .buch-chip { box-shadow: inset 0 0 0 1px var(--border); }
 .waehlen .buch-chip.gewaehlt { background: var(--accent); color: #fff; box-shadow: none; }
 .fach-nr .fach-scan { margin-top: 6px; }
+.regal-such-zeile { margin-top: 14px; }
+.fach-nr .fach-genre { width: fit-content; max-width: 100%; }
+.fach-nr .fach-genre.geerbt { color: var(--muted); }
+.fach.treffer .fach-genre, .regal-kopf b.treffer { background: var(--accent-soft); border-radius: 4px; padding: 0 3px; }
+.buch-chip.treffer { box-shadow: inset 0 0 0 2px var(--accent); }
 .auswahl-leiste { position: sticky; bottom: 16px; z-index: 5; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
   margin-top: 14px; padding: 10px 14px; border-radius: 14px; background: var(--surface); box-shadow: 0 6px 24px rgba(0, 0, 0, .18), 0 0 0 .5px var(--border); }
 .auswahl-leiste b { margin-right: auto; }
@@ -2042,6 +2047,10 @@ td.titel-zelle { min-width: 220px; }
         <button class="btn secondary" type="button" id="regal-waehlen" title="Bücher auswählen und selbst in ein anderes Fach stellen">Verschieben</button>
         <button class="btn secondary" type="button" id="regal-scan" title="Fach wählen und die Bücher scannen, die dort stehen sollen">Per Scan einräumen</button>
         <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
+      </div>
+      <div class="row regal-such-zeile">
+        <input id="regal-suche" class="grow" type="search" placeholder="Kategorie suchen, z. B. Manga, Krimi, Sachbuch … (auch Regalname oder Buchtitel)" autocomplete="off" aria-label="Kategorie in den Regalen suchen">
+        <span class="sub" id="regal-suche-info" style="color:var(--muted)"></span>
       </div>
       <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
       <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span><span>Grüne und gelbe Bücher antippen, sobald sie an ihrem Platz stehen.</span></div>
@@ -3387,8 +3396,16 @@ function regalGenreText(r) {
   if (rest) teile.push((eigene.length ? "sonst " : "") + (r.genres.length ? r.genres.join(", ") : "alle übrigen Bücher"));
   return esc(teile.join(" · "));
 }
+// Regal-Suche: alle Wörter müssen vorkommen, Umlaute und ß egal (wie im Katalog)
+function regalSuchTreffer(text, worte) {
+  const mitE = suchForm(text), ohneE = suchForm(text, false);
+  return worte.every((w) => mitE.includes(w) || ohneE.includes(w));
+}
 function zeichneRegale(d) {
   regalDaten = d;
+  const worte = suchWorte($("#regal-suche").value);
+  const suche = worte.length > 0;
+  let fachTreffer = 0, regalTreffer = 0;
   const anzahl = d.regale.length;
   $("#regale-drucken").disabled = !anzahl;
   $("#regal-waehlen").disabled = $("#regal-scan").disabled = !anzahl;
@@ -3402,20 +3419,38 @@ function zeichneRegale(d) {
     zeigeAuswahl();
   }
   $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
+    // Beim Suchen nur passende Fächer zeigen: Genre des Fachs (oder geerbt vom Regal), Regalname oder ein Buch darin
+    const nameTreffer = suche && regalSuchTreffer(r.name, worte);
+    const zeigen = r.inhalt.map((fach, f) => {
+      if (!suche || nameTreffer) return true;
+      const genres = (r.fach_genres[f] || []).length ? r.fach_genres[f] : r.genres;
+      return regalSuchTreffer(genres.join(" "), worte) || fach.some((b) => regalSuchTreffer(`${b.genre} ${b.titel} ${b.serie || ""} ${b.autor || ""}`, worte));
+    });
+    if (suche && !zeigen.some(Boolean)) return "";
+    if (suche) { regalTreffer++; fachTreffer += zeigen.filter(Boolean).length; }
     const belegt = r.inhalt.flat().reduce((n, b) => n + b.anzahl, 0);
     const platz = r.fach_kap.reduce((a, k) => a + k, 0);
     const faecher = r.inhalt.map((fach, f) => {
+      if (!zeigen[f]) return "";
       const n = fach.reduce((s, b) => s + b.anzahl, 0);
       const eigene = r.fach_genres[f] || [];
       const kap = r.fach_kap[f];
-      return `<div class="fach"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${eigene.length ? `<span class="fach-genre">${esc(eigene.join(", "))}</span>` : ""}
+      // Beim Suchen auch die vom Regal geerbten Genres zeigen, damit man sieht, warum das Fach passt
+      const genres = eigene.length ? eigene : suche ? r.genres : [];
+      const genreTreffer = suche && regalSuchTreffer(genres.join(" "), worte);
+      const chip = (b) => {
+        const html = buchChip(b);
+        return suche && !nameTreffer && !genreTreffer && regalSuchTreffer(`${b.genre} ${b.titel} ${b.serie || ""} ${b.autor || ""}`, worte)
+          ? html.replace('class="buch-chip ', 'class="buch-chip treffer ') : html;
+      };
+      return `<div class="fach ${genreTreffer ? "treffer" : ""}"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${genres.length ? `<span class="fach-genre ${eigene.length ? "" : "geerbt"}">${esc(genres.join(", "))}</span>` : ""}
           <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button></div>
         <div><div class="balken ${n >= kap ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / kap))}%"></div></div>
-        <div class="fach-buecher">${fach.map(buchChip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
+        <div class="fach-buecher">${fach.map(chip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
     }).join("");
     return `<div class="regal">
       <div class="regal-kopf">
-        <div class="grow"><b>${esc(r.name)}</b>
+        <div class="grow"><b class="${nameTreffer ? "treffer" : ""}">${esc(r.name)}</b>
           <div class="sub">${r.faecher} Fächer × ${r.fach_kapazitaet.some(Boolean) ? `${r.kapazitaet} Bücher (einzelne Fächer anders)` : `${r.kapazitaet} Bücher`} · belegt ${belegt}/${platz} · ${regalGenreText(r)}</div></div>
         <button class="btn small secondary" data-hoch="${r.id}" ${i === 0 ? "disabled" : ""} title="Nach vorne (wird bei gleichen Genres zuerst gefüllt)">↑</button>
         <button class="btn small secondary" data-runter="${r.id}" ${i === anzahl - 1 ? "disabled" : ""} title="Nach hinten">↓</button>
@@ -3423,9 +3458,15 @@ function zeichneRegale(d) {
         <button class="btn small secondary" data-bearbeiten="${r.id}">Bearbeiten</button>
         <button class="btn small danger" data-loeschen="${r.id}">Löschen</button>
       </div>
-      <details ${speicherLesen("regalOffen" + r.id, "1") === "1" ? "open" : ""} data-regal="${r.id}"><summary>Fächer anzeigen</summary>${faecher}</details>
+      <details ${suche || speicherLesen("regalOffen" + r.id, "1") === "1" ? "open" : ""} data-regal="${r.id}"><summary>Fächer anzeigen</summary>${faecher}</details>
     </div>`;
   }).join("") : `<p class="empty" style="padding-left:0">Noch keine Regale. Klicke auf „Regal hinzufügen“.</p>`;
+  if (suche && anzahl && !regalTreffer) {
+    $("#regale-liste").innerHTML = `<p class="empty" style="padding-left:0">Kein Fach passt zu „${esc($("#regal-suche").value.trim())}“.</p>`;
+  }
+  $("#regal-suche").closest(".row").classList.toggle("hidden", !anzahl);
+  $("#regal-suche-info").textContent = suche && regalTreffer
+    ? `${fachTreffer} ${fachTreffer === 1 ? "Fach" : "Fächer"} in ${regalTreffer} ${regalTreffer === 1 ? "Regal" : "Regalen"}` : "";
 
   const zuTun = d.umstellen.length + d.einraeumen;
   $("#regal-aufgaben").classList.toggle("hidden", !zuTun);
@@ -3480,6 +3521,10 @@ function oeffneRegal(r) {
   form.name.focus();
 }
 $("#regal-neu").addEventListener("click", () => oeffneRegal(null));
+$("#regal-suche").addEventListener("input", debounce(() => zeichneRegale(regalDaten), 120));
+$("#regal-suche").addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && e.target.value) { e.target.value = ""; zeichneRegale(regalDaten); }
+});
 $("#regale-drucken").addEventListener("click", () => drucken("regale"));
 $("#rg-close").addEventListener("click", () => $("#regal-dialog").close());
 $("#regal-form").addEventListener("focusin", (e) => {
@@ -3585,6 +3630,8 @@ $("#regale-liste").addEventListener("click", (e) => {
   }
 });
 $("#regale-liste").addEventListener("toggle", (e) => {
+  // Beim Suchen sind alle Treffer aufgeklappt – das nicht als Wahl merken
+  if ($("#regal-suche").value.trim()) return;
   if (e.target.dataset.regal) speicherSchreiben("regalOffen" + e.target.dataset.regal, e.target.open ? "1" : "0");
 }, true);
 // Grünes/gelbes Buch antippen: bestätigen, dass es jetzt an seinem Platz steht

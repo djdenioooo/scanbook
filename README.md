@@ -101,6 +101,8 @@ Soll ein Buch an einem bestimmten Platz stehen, stellst du es selbst dorthin. Es
 - **Per Scan direkt am Regal:** „Per Scan einräumen“ (oder „Scannen“ neben einem Fach), Fach wählen und die Bücher scannen, die dort stehen sollen (ISBN oder Mediencode). Terminal: Menüpunkt 16, dann 7.
 - **Wieder automatisch:** löst das 📌, dann sortiert ScanBook das Buch wieder selbst ein (Terminal: Punkt 8).
 
+**Kategorie suchen:** Über den Regalen steht ein Suchfeld. Tippe eine Kategorie ein (z. B. „Manga“ oder „Fantasy“), dann siehst du nur noch die Fächer, in die diese Kategorie gehört oder in denen solche Bücher stehen. Groß-/Kleinschreibung und Umlaute sind egal („Maerchen“ findet „Märchen“). Auch Regalnamen und Buchtitel werden gefunden. Esc leert die Suche.
+
 „Als Liste drucken“ (oben im Tab „Regale“) erzeugt eine Druckseite mit allen Regalen: jedes Regal auf einer eigenen Seite, darin Fach für Fach die Bücher mit Titel, Autor, Genre und Anzahl, dazu ein Kästchen zum Abhaken. Bücher, die noch eingeräumt oder umgestellt werden müssen, sind vermerkt. Mit „Drucken“ neben einem Regal druckst du nur dieses eine.
 
 ## Schülerausweise
