@@ -65,6 +65,8 @@ Serie und Band werden beim Scannen aus Google Books und der Deutschen Nationalbi
 
 Der Katalog lässt sich oben rechts zwischen „Cover“ und „Liste“ umschalten; die Wahl wird im Browser gemerkt. In der Cover-Ansicht steht jedes Buch mit seinem Cover, ob es da ist und in welchem Regal es steht. Hat ein Buch noch kein gespeichertes Cover, malt ScanBook eins in der Farbe seines Genres. Serien erscheinen als Stapel, ein Klick klappt die Bände auf.
 
+Reihen mit Staffeln (z. B. „Warrior Cats“) bekommen zusätzlich das Feld **Staffel**. Sobald eine Serie eingetragen ist, bietet das Auswahlmenü die Staffeln an, die es in dieser Serie schon gibt; „＋ Neue Staffel …“ legt eine weitere an (eine Zahl wie „2“ wird als „Staffel 2“ angezeigt, ein Name wie „Die Macht der drei“ bleibt, wie er ist). Jede Staffel zählt ihre Bände wieder ab 1. Im Katalog, in der Vorschau und im Regal stehen die Bände dann nach Staffel und Band geordnet, Bände ohne Staffel (z. B. Specials) am Ende.
+
 Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog den Knopf „Alle Bücher nachladen“ (Terminal: Menüpunkt 15). Er ergänzt nur leere Angaben. Die Cover werden direkt im Browser von Google Books, Open Library oder der DNB geladen.
 
 ## Datensicherung
