@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -2961,20 +2961,415 @@ def export_daten(typ):
     return ["Ausleiher", "Klasse", "Titel", "ISBN", "Mediencode", "Geliehen am", "Rückgabe bis", "Tage überfällig"], zeilen
 
 
+# --- MAHNBRIEFE AUS EIGENER VORLAGE ---
+# Im Ordner "vorlagen" neben dem Programm liegen Briefvorlagen als Word-Datei (.docx) oder Webseite (.html).
+# Platzhalter wie {Name} oder {Bücherliste} werden für jede Person mit überfälligen Büchern ausgefüllt.
+VORLAGEN_DIR = os.path.join(BASE_DIR, "vorlagen")
+VORLAGEN_ENDUNGEN = (".docx", ".html", ".htm")
+STANDARD_VORLAGE = "Mahnbrief"
+
+# Platzhalter und ihre Beschreibung (auch für die Anleitung im Vorlagen-Ordner)
+PLATZHALTER = [
+    ("Name", "Vor- und Nachname"),
+    ("Vorname", "Vorname"),
+    ("Nachname", "Nachname"),
+    ("Klasse", "Klasse (leer, wenn keine eingetragen ist)"),
+    ("Ausweis", "Ausweisnummer"),
+    ("Bücherliste", "alle überfälligen Bücher untereinander, mit Fälligkeitsdatum"),
+    ("Titel", "Buchtitel (mehrere mit Komma getrennt)"),
+    ("Anzahl", "Anzahl der überfälligen Bücher"),
+    ("Ausgeliehen", "Ausleihdatum (bei mehreren Büchern das früheste)"),
+    ("Fällig", "Rückgabedatum (bei mehreren Büchern das früheste)"),
+    ("Tage", "Tage überfällig (bei mehreren Büchern die meisten)"),
+    ("Datum", "heutiges Datum"),
+    ("Schule", "Schulname aus den Einstellungen"),
+    ("Bibliothek", "Name der Bücherei aus den Einstellungen"),
+    ("Adresse", "Adresse aus den Einstellungen"),
+    ("Email", "E-Mail aus den Einstellungen"),
+]
+PLATZHALTER_MUSTER = re.compile(r"\{\s*([A-Za-zÄÖÜäöüß_\- ]{2,30}?)\s*\}")
+
+
+def platzhalter_schluessel(name):
+    """'Fälligkeit', 'faellig', 'FÄLLIG' und 'E-Mail' sollen alle gleich funktionieren."""
+    name = name.lower()
+    for alt, neu in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        name = name.replace(alt, neu)
+    return re.sub(r"[\s_\-]", "", name)
+
+
+PLATZHALTER_ALIASE = {
+    "schueler": "name", "schuelername": "name", "klassenname": "klasse", "ausweisnummer": "ausweis",
+    "buecher": "buecherliste", "liste": "buecherliste", "buchtitel": "titel", "buch": "titel",
+    "ausleihdatum": "ausgeliehen", "geliehenam": "ausgeliehen", "faelligam": "faellig", "faelligkeit": "faellig",
+    "faelligkeitsdatum": "faellig", "rueckgabe": "faellig", "rueckgabebis": "faellig", "rueckgabedatum": "faellig",
+    "tageueberfaellig": "tage", "ueberfaellig": "tage", "heute": "datum", "schulname": "schule",
+    "bibname": "bibliothek", "buecherei": "bibliothek", "mail": "email", "kontakt": "email",
+}
+
+
+def mahn_personen(klasse=None, schueler_id=None):
+    """Alle Personen mit überfälligen Büchern, sortiert nach Klasse und Name – je Person ein Brief."""
+    sql = '''
+        SELECT a.schueler_id, a.ausleiher, s.vorname, s.nachname, COALESCE(s.klasse, ''), COALESCE(s.ausweis, ''),
+               b.titel, b.autor_formatiert, a.isbn, COALESCE(a.exemplar, ''), a.ausgeliehen_am, a.rueckgabe_bis
+        FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn LEFT JOIN schueler s ON s.id = a.schueler_id
+        WHERE a.status = 'aktiv' AND a.rueckgabe_bis < ?
+    '''
+    params = [heute().isoformat()]
+    if schueler_id:
+        sql += " AND a.schueler_id = ?"
+        params.append(schueler_id)
+    with db_connection() as conn:
+        rows = conn.execute(sql + " ORDER BY a.rueckgabe_bis", params).fetchall()
+
+    personen = {}
+    for sid, ausleiher, vorname, nachname, kl, ausweis, titel, autor, isbn, code, von, bis in rows:
+        if klasse and kl != klasse:
+            continue
+        schluessel = sid or (ausleiher or "").strip().lower()
+        p = personen.get(schluessel)
+        if not p:
+            name = schueler_name(vorname or "", nachname or "") if sid and (vorname or nachname) else (ausleiher or "")
+            if not (vorname or nachname):  # Name ohne Schülerliste (z. B. „Frau Schmidt“): ganzer Name zur Anrede
+                vorname, nachname = name, name.rsplit(" ", 1)[-1]
+            p = personen[schluessel] = {"name": name, "vorname": vorname or "", "nachname": nachname or "",
+                                        "klasse": kl, "ausweis": ausweis, "buecher": []}
+        p["buecher"].append({"titel": titel or "", "autor": "" if (autor or "") in LEERWERTE else autor,
+                             "isbn": isbn, "code": code, "ausgeliehen": von, "faellig": bis,
+                             "tage": (heute() - date.fromisoformat(bis)).days})
+    return sorted(personen.values(), key=lambda p: (klassen_sortierwert(p["klasse"]) if p["klasse"] else (1000, ""),
+                                                    p["nachname"].lower(), p["vorname"].lower()))
+
+
+def mahn_buchzeile(b):
+    autor = f" ({b['autor']})" if b["autor"] else ""
+    return (f"{b['titel']}{autor} – ausgeliehen am {de_datum(b['ausgeliehen'])}, "
+            f"fällig seit {de_datum(b['faellig'])} ({b['tage']} {'Tag' if b['tage'] == 1 else 'Tage'} überfällig)")
+
+
+def mahn_werte(person=None):
+    """Platzhalter → Text. Ohne Person nur die allgemeinen Angaben (für Kopf- und Fußzeilen)."""
+    werte = {
+        "datum": heute().strftime("%d.%m.%Y"),
+        "schule": get_einstellung("schulname"),
+        "bibliothek": get_einstellung("bib_name", "Schulbibliothek"),
+        "adresse": get_einstellung("adresse"),
+        "email": get_einstellung("kontakt_email"),
+    }
+    if person:
+        buecher = person["buecher"]
+        werte.update({
+            "name": person["name"], "vorname": person["vorname"], "nachname": person["nachname"],
+            "klasse": person["klasse"], "ausweis": person["ausweis"], "anzahl": str(len(buecher)),
+            "titel": ", ".join(b["titel"] for b in buecher),
+            "ausgeliehen": de_datum(min(b["ausgeliehen"] for b in buecher)),
+            "faellig": de_datum(min(b["faellig"] for b in buecher)),
+            "tage": str(max(b["tage"] for b in buecher)),
+            "buecherliste": "\n".join("• " + mahn_buchzeile(b) for b in buecher),
+        })
+    return werte
+
+
+def platzhalter_ersetzen(text, werte, umwandeln=lambda s: s):
+    """Ersetzt bekannte Platzhalter; Unbekanntes (z. B. CSS in geschweiften Klammern) bleibt stehen."""
+    def ersetzen(m):
+        schluessel = platzhalter_schluessel(m.group(1))
+        schluessel = PLATZHALTER_ALIASE.get(schluessel, schluessel)
+        return umwandeln(werte[schluessel]) if schluessel in werte else m.group(0)
+    return PLATZHALTER_MUSTER.sub(ersetzen, text)
+
+
+def mahn_vorlagen():
+    """Liefert die Dateinamen aller Vorlagen. Legt beim ersten Mal den Ordner mit Beispielvorlagen an."""
+    os.makedirs(VORLAGEN_DIR, exist_ok=True)
+    namen = sorted((n for n in os.listdir(VORLAGEN_DIR)
+                    if n.lower().endswith(VORLAGEN_ENDUNGEN) and not n.startswith(("~$", "."))), key=str.lower)
+    if not namen:
+        with open(os.path.join(VORLAGEN_DIR, STANDARD_VORLAGE + ".html"), "w", encoding="utf-8") as f:
+            f.write(STANDARD_VORLAGE_HTML)
+        with open(os.path.join(VORLAGEN_DIR, STANDARD_VORLAGE + ".docx"), "wb") as f:
+            f.write(standard_vorlage_docx())
+        namen = [STANDARD_VORLAGE + ".docx", STANDARD_VORLAGE + ".html"]
+    anleitung = os.path.join(VORLAGEN_DIR, "LIESMICH.txt")
+    if not os.path.exists(anleitung):
+        with open(anleitung, "w", encoding="utf-8-sig") as f:
+            f.write(VORLAGEN_ANLEITUNG)
+    return namen
+
+
+def mahn_vorlage_pfad(name=""):
+    """Sicherer Pfad zu einer Vorlage aus dem Ordner (nur Namen aus der Liste, keine anderen Ordner)."""
+    namen = mahn_vorlagen()
+    if name not in namen:
+        name = namen[0]
+    return name, os.path.join(VORLAGEN_DIR, name)
+
+
+MAHN_TEXT = [
+    "{Name}",
+    "Klasse {Klasse}",
+    "",
+    "{Schule} · {Bibliothek}, {Datum}",
+    "",
+    "Erinnerung: Bitte Bücher zurückgeben",
+    "",
+    "Liebe/r {Vorname},",
+    "",
+    "diese Bücher aus der Schulbücherei hättest du schon zurückgeben sollen:",
+    "",
+    "{Bücherliste}",
+    "",
+    "Bitte bring das Buch bzw. die Bücher so bald wie möglich in die Bücherei zurück. Wenn du ein Buch "
+    "verloren hast oder noch länger brauchst, sprich uns bitte an.",
+    "",
+    "Vielen Dank!",
+    "Dein Bücherei-Team",
+    "",
+    "Bei Fragen: {Email}",
+]
+
+VORLAGEN_ANLEITUNG = """Vorlagen für Mahnbriefe
+========================
+
+In diesen Ordner kannst du eigene Briefvorlagen legen:
+  • Word-Datei (.docx) – ScanBook erstellt daraus eine Word-Datei mit einem Brief pro Seite.
+  • Webseite (.html)   – ScanBook zeigt die Briefe im Browser zum Drucken an.
+
+Die mitgelieferten Beispiele „Mahnbrief.docx“ und „Mahnbrief.html“ darfst du ändern,
+umbenennen oder löschen. Gibt es keine Vorlage mehr, legt ScanBook die Beispiele neu an.
+
+Platzhalter in geschweiften Klammern werden für jeden Schüler ausgefüllt:
+""" + "\n".join(f"  {{{name}}}".ljust(18) + beschreibung for name, beschreibung in PLATZHALTER) + """
+
+{Bücherliste} am besten allein in eine eigene Zeile schreiben.
+Groß-/Kleinschreibung ist egal, statt ü geht auch ue (z. B. {Buecherliste}).
+In Word den Platzhalter möglichst in einem Zug eintippen (nicht teilweise fett o. Ä.).
+
+Drucken: in ScanBook unter „Ausleihe“ auf „Mahnbriefe“ klicken.
+"""
+
+STANDARD_VORLAGE_HTML = """<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Mahnbrief</title>
+<!-- Diese Vorlage kannst du mit jedem Texteditor ändern. Alles zwischen <body> und </body> ist EIN Brief.
+     Platzhalter wie {Name} oder {Bücherliste} werden ausgefüllt, die Liste steht in LIESMICH.txt. -->
+<style>
+  .brief { font: 11pt/1.5 Arial, Helvetica, sans-serif; padding: 25mm 22mm 20mm 25mm; }
+  .absender { font-size: 8pt; color: #555; border-bottom: 1px solid #999; display: inline-block; margin-bottom: 4mm; }
+  .datum { text-align: right; margin: 14mm 0 10mm; }
+  h1 { font-size: 13pt; margin: 0 0 8mm; }
+  .buecher { margin: 4mm 0 6mm 6mm; }
+  .gruss { margin-top: 10mm; }
+</style>
+</head>
+<body>
+<div class="absender">{Schule} · {Bibliothek} · {Adresse}</div>
+<div><b>{Name}</b><br>Klasse {Klasse}</div>
+<div class="datum">{Datum}</div>
+<h1>Erinnerung: Bitte Bücher zurückgeben</h1>
+<p>Liebe/r {Vorname},</p>
+<p>diese Bücher aus der Schulbücherei hättest du schon zurückgeben sollen:</p>
+<div class="buecher">{Bücherliste}</div>
+<p>Bitte bring das Buch bzw. die Bücher so bald wie möglich in die Bücherei zurück.
+Wenn du ein Buch verloren hast oder noch länger brauchst, sprich uns bitte an.</p>
+<p class="gruss">Vielen Dank!<br>Dein Bücherei-Team</p>
+<p style="font-size:9pt;color:#555">Bei Fragen: {Email}</p>
+</body>
+</html>
+"""
+
+
+def mahnbriefe_html(vorlage_text, personen):
+    """(Stile, [Brief-HTML je Person]) aus einer HTML-Vorlage: alles im <body> ist ein Brief."""
+    vorlage_text = re.sub(r"<!--.*?-->", "", vorlage_text, flags=re.S)  # Kommentare (z. B. Hinweise) weglassen
+    stile = "".join(re.findall(r"<style[^>]*>.*?</style>", vorlage_text, re.S | re.I))
+    koerper = re.search(r"<body[^>]*>(.*)</body>", vorlage_text, re.S | re.I)
+    brief = koerper.group(1) if koerper else re.sub(r"<style[^>]*>.*?</style>", "", vorlage_text, flags=re.S | re.I)
+
+    def umwandeln(text):
+        return html.escape(text).replace("\n", "<br>")
+    return stile, [platzhalter_ersetzen(brief, mahn_werte(p), umwandeln) for p in personen]
+
+
+# Word-Dateien (.docx) sind ZIP-Archive mit XML – das geht ohne Zusatzprogramme
+DOCX_TEXT = re.compile(r"(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)", re.S)
+DOCX_SEITENUMBRUCH = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>'
+
+
+def docx_absatz_ersetzen(absatz, werte):
+    """Ersetzt Platzhalter in einem Absatz – auch wenn Word sie auf mehrere Textstücke verteilt hat."""
+    stuecke = list(DOCX_TEXT.finditer(absatz))
+    texte = [html.unescape(m.group(2)) for m in stuecke]
+    gesamt = "".join(texte)
+    if "{" not in gesamt:
+        return absatz
+    treffer = list(PLATZHALTER_MUSTER.finditer(gesamt))
+    if not treffer:
+        return absatz
+    # Für jedes Zeichen merken, in welchem Textstück es steht
+    zu_stueck = [i for i, t in enumerate(texte) for _ in t]
+    neu = list(texte)
+    for m in reversed(treffer):
+        ersatz = platzhalter_ersetzen(m.group(0), werte)
+        if ersatz == m.group(0):
+            continue
+        erstes, letztes = zu_stueck[m.start()], zu_stueck[m.end() - 1]
+        anfang = m.start() - sum(len(t) for t in texte[:erstes])
+        ende = m.end() - sum(len(t) for t in texte[:letztes])
+        if erstes == letztes:
+            neu[erstes] = neu[erstes][:anfang] + ersatz + neu[erstes][ende:]
+        else:
+            neu[erstes] = neu[erstes][:anfang] + ersatz
+            for i in range(erstes + 1, letztes):
+                neu[i] = ""
+            neu[letztes] = neu[letztes][ende:]
+    teile, pos = [], 0
+    for m, text in zip(stuecke, neu):
+        inhalt = html.escape(text, quote=False).replace("\n", '</w:t><w:br/><w:t xml:space="preserve">')
+        teile += [absatz[pos:m.start()], '<w:t xml:space="preserve">', inhalt, "</w:t>"]
+        pos = m.end()
+    return "".join(teile) + absatz[pos:]
+
+
+def docx_xml_ersetzen(xml, werte):
+    return re.sub(r"<w:p[ >].*?</w:p>", lambda m: docx_absatz_ersetzen(m.group(0), werte), xml, flags=re.S)
+
+
+def mahnbriefe_docx(vorlage_pfad, personen):
+    """Eine Word-Datei mit allen Briefen hintereinander, jeder Brief auf einer neuen Seite."""
+    import zipfile
+    import io
+    with zipfile.ZipFile(vorlage_pfad) as quelle:
+        dateien = {info: quelle.read(info.filename) for info in quelle.infolist()}
+    allgemein = mahn_werte()
+    ausgabe = io.BytesIO()
+    with zipfile.ZipFile(ausgabe, "w", zipfile.ZIP_DEFLATED) as ziel:
+        for info, daten in dateien.items():
+            name = info.filename
+            if name == "word/document.xml":
+                xml = daten.decode("utf-8")
+                m = re.search(r"(<w:body>)(.*?)(<w:sectPr[ >].*?</w:sectPr>\s*)?(</w:body>)", xml, re.S)
+                if not m:
+                    raise ValueError("Die Word-Vorlage hat ein unbekanntes Format.")
+                koerper = re.sub(r"<w:bookmark(Start|End)\b[^>]*/>", "", m.group(2))
+                briefe = []
+                for nr, person in enumerate(personen):
+                    brief = docx_xml_ersetzen(koerper, mahn_werte(person))
+                    # Bilder brauchen in der ganzen Datei eindeutige Nummern
+                    brief = re.sub(r'(<wp:docPr\b[^>]*\bid=")(\d+)', lambda d: d.group(1) + str(int(d.group(2)) + nr * 1000), brief)
+                    briefe.append(brief)
+                daten = (xml[:m.start(2)] + DOCX_SEITENUMBRUCH.join(briefe) + (m.group(3) or "") + xml[m.end(3) if m.group(3) else m.end(2):]).encode("utf-8")
+            elif re.match(r"word/(header|footer)\d*\.xml$", name):
+                daten = docx_xml_ersetzen(daten.decode("utf-8"), allgemein).encode("utf-8")
+            ziel.writestr(info, daten)
+    return ausgabe.getvalue()
+
+
+def standard_vorlage_docx():
+    """Baut die mitgelieferte Word-Vorlage (eine schlichte, gut änderbare .docx-Datei)."""
+    import zipfile
+    import io
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+    def absatz(text):
+        if not text:
+            return "<w:p/>"
+        fett = text in ("{Name}", "Erinnerung: Bitte Bücher zurückgeben")
+        groesse = '<w:sz w:val="26"/>' if text.startswith("Erinnerung") else ""
+        lauf = f'<w:rPr>{"<w:b/>" if fett else ""}{groesse}</w:rPr>' if fett or groesse else ""
+        rechts = '<w:pPr><w:jc w:val="right"/></w:pPr>' if text.startswith("{Schule}") else ""
+        return f'<w:p>{rechts}<w:r>{lauf}<w:t xml:space="preserve">{html.escape(text, quote=False)}</w:t></w:r></w:p>'
+
+    dokument = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {w}><w:body>'
+                + "".join(absatz(t) for t in MAHN_TEXT)
+                + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+                  '<w:pgMar w:top="1701" w:right="1247" w:bottom="1134" w:left="1418" w:header="709" w:footer="709" w:gutter="0"/>'
+                  '</w:sectPr></w:body></w:document>')
+    stile = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles {w}><w:docDefaults>'
+             '<w:rPrDefault><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="22"/>'
+             '<w:lang w:val="de-DE"/></w:rPr></w:rPrDefault>'
+             '<w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>'
+             '</w:docDefaults></w:styles>')
+    typen = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>'
+             '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+             '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+             '</Types>')
+    rel = 'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"'
+    paket = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships {rel}>'
+             '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+             '</Relationships>')
+    dok_rel = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships {rel}>'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+               '</Relationships>')
+    puffer = io.BytesIO()
+    with zipfile.ZipFile(puffer, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", typen)
+        z.writestr("_rels/.rels", paket)
+        z.writestr("word/document.xml", dokument)
+        z.writestr("word/_rels/document.xml.rels", dok_rel)
+        z.writestr("word/styles.xml", stile)
+    return puffer.getvalue()
+
+
+def mahnbriefe_speichern(vorlage="", klasse=None):
+    """Erstellt die Mahnbriefe als Datei im Export-Ordner (für das Terminal). Liefert (Pfad, Anzahl)."""
+    personen = mahn_personen(klasse)
+    if not personen:
+        return None, 0
+    name, pfad = mahn_vorlage_pfad(vorlage)
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    ziel = os.path.join(EXPORT_DIR, f"Mahnbriefe_{heute():%Y%m%d}")
+    if name.lower().endswith(".docx"):
+        with open(ziel + ".docx", "wb") as f:
+            f.write(mahnbriefe_docx(pfad, personen))
+        return ziel + ".docx", len(personen)
+    with open(pfad, encoding="utf-8-sig") as f:
+        stile, briefe = mahnbriefe_html(f.read(), personen)
+    with open(ziel + ".html", "w", encoding="utf-8") as f:
+        f.write(f'<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Mahnbriefe</title>{stile}'
+                '<style>@page { size: A4; margin: 0; } .brief { break-after: page; }</style></head><body>'
+                + "".join(f'<div class="brief">{b}</div>' for b in briefe) + "</body></html>")
+    return ziel + ".html", len(personen)
+
+
 def export_menu():
     ueberschrift("📄 EXPORT (CSV / EXCEL)")
     print("1. Gesamter Katalog")
     print("2. Aktuelle Ausleihen")
     print("3. Mahnliste (überfällige Bücher)")
-    print("4. Zurück zum Hauptmenü")
-    wahl = input("\nWähle eine Option (1-4): ").strip()
+    print("4. Mahnbriefe aus Vorlage (Word oder HTML)")
+    print("5. Zurück zum Hauptmenü")
+    wahl = input("\nWähle eine Option (1-5): ").strip()
 
+    if wahl == "4":
+        mahnbriefe_menu()
+        return
     typ = {"1": "katalog", "2": "ausleihen", "3": "mahnliste"}.get(wahl)
     if not typ:
         return
     kopf, zeilen = export_daten(typ)
     exportiere_csv(typ, kopf, zeilen)
 
+
+
+def mahnbriefe_menu():
+    vorlagen = mahn_vorlagen()
+    print(f"\nVorlagen im Ordner {VORLAGEN_DIR}:")
+    vorlage = vorlagen[0] if len(vorlagen) == 1 else waehle_aus_liste(vorlagen, str, "\nWelche Vorlage? Nummer: ")
+    if not vorlage:
+        return
+    klasse = input("Nur eine Klasse (z. B. 5a, [ENTER] = alle): ").strip() or None
+    pfad, anzahl = mahnbriefe_speichern(vorlage, klasse)
+    if not pfad:
+        print("✅ Keine überfälligen Bücher – es gibt nichts zu mahnen.")
+        return
+    print(f"✅ {anzahl} Mahnbrief(e) gespeichert unter: {pfad}")
 
 # --- DATENBANK-BACKUP ---
 # Sicherungen liegen im Ordner "backups" neben dem Programm. Ist ein zweiter Ordner eingestellt
