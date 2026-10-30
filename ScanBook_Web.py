@@ -18,10 +18,11 @@ import secrets
 import sqlite3
 import threading
 import webbrowser
+import zipfile
 from datetime import date, datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import ScanBook as sb
 
@@ -1254,6 +1255,11 @@ body { margin: 0; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Helvetica N
 .liste .hinweis { color: #8a5a00; font-size: 9pt; }
 .liste .leer td { color: #999; font-style: italic; }
 @page liste { size: A4; margin: 12mm 14mm; }
+/* Mahnbriefe: ein Brief pro A4-Seite, Aussehen kommt aus der Vorlage */
+.blatt.briefe { display: block; }
+.brief { padding: 20mm 20mm 20mm 25mm; font-size: 11pt; line-height: 1.5; }
+.leiste select { font: inherit; border: .5px solid rgba(60,60,67,.3); border-radius: 8px; padding: 6px 8px; background: #fff; }
+.leiste a { text-decoration: none; }
 @page { size: A4; margin: 0; }
 @media print {
   body { background: #fff; }
@@ -1265,13 +1271,14 @@ body { margin: 0; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Helvetica N
 """
 
 
-def druckseite(titel, hinweis, felder, pro_seite, klasse, skript=""):
-    knopf = '<button onclick="window.print()">Drucken</button>' if felder else ""
+def druckseite(titel, hinweis, felder, pro_seite, klasse, skript="", knopf=None, steuerung="", kopf=""):
+    if knopf is None:
+        knopf = '<button onclick="window.print()">Drucken</button>' if felder else ""
     blaetter = "".join(f'<div class="blatt {klasse}">{"".join(felder[i:i + pro_seite])}</div>'
                        for i in range(0, len(felder), pro_seite))
     return f"""<!doctype html><html lang="de"><head><meta charset="utf-8"><title>{html.escape(titel)}</title>
-<style>{DRUCK_CSS}</style></head><body>
-<div class="leiste"><span class="grow"><b>{html.escape(titel)}</b> · {html.escape(hinweis)}</span>{knopf}
+<style>{DRUCK_CSS}</style>{kopf}</head><body>
+<div class="leiste"><span class="grow"><b>{html.escape(titel)}</b> · {html.escape(hinweis)}</span>{steuerung}{knopf}
 <button class="zweit" onclick="window.close()">Schließen</button></div>
 {blaetter or '<p class="leer">Nichts zu drucken.</p>'}
 <script>{skript}</script></body></html>"""
@@ -1369,7 +1376,70 @@ def druck_regale(params):
                       seiten, 1, "liste")
 
 
-DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten, "regale": druck_regale}
+def mahn_auswahl(params):
+    """Gewählte Vorlage, Personen und Klassen für die Mahnbriefe."""
+    try:
+        name, pfad = sb.mahn_vorlage_pfad(params.get("vorlage", ""))
+    except OSError as e:
+        raise ApiFehler(f"Der Vorlagen-Ordner lässt sich nicht öffnen: {e}", 500)
+    schueler = int(params["schueler"]) if params.get("schueler", "").isdigit() else None
+    alle = sb.mahn_personen(schueler_id=schueler)
+    klassen = sorted({p["klasse"] for p in alle if p["klasse"]}, key=sb.klassen_sortierwert)
+    personen = [p for p in alle if not params.get("klasse") or p["klasse"] == params["klasse"]]
+    return name, pfad, personen, klassen
+
+
+def druck_mahnbriefe(params):
+    name, pfad, personen, klassen = mahn_auswahl(params)
+
+    def auswahl(feld, werte, gewaehlt, leer=None):
+        optionen = ([f'<option value="">{html.escape(leer)}</option>'] if leer else []) + [
+            f'<option{" selected" if w == gewaehlt else ""}>{html.escape(w)}</option>' for w in werte]
+        return f'<select name="{feld}" onchange="this.form.submit()">{"".join(optionen)}</select>'
+    versteckt = (f'<input type="hidden" name="schueler" value="{html.escape(params["schueler"])}">'
+                 if params.get("schueler") else "")
+    steuerung = (f'<form method="get" style="display:contents">{versteckt}'
+                 f'{auswahl("vorlage", sb.mahn_vorlagen(), name)}'
+                 f'{auswahl("klasse", klassen, params.get("klasse", ""), "Alle Klassen") if klassen else ""}</form>')
+    ordner = f"Vorlagen liegen im Ordner {sb.VORLAGEN_DIR}"
+
+    if name.lower().endswith(".docx"):
+        abfrage = urlencode({"vorlage": name, **{k: params[k] for k in ("klasse", "schueler") if params.get(k)}})
+        knopf = (f'<a href="/export/mahnbriefe.docx?{html.escape(abfrage)}"><button type="button">Word-Datei herunterladen</button></a>'
+                 if personen else "")
+        zeilen = "".join(f'<tr><td>{html.escape(p["name"])}</td><td>{html.escape(p["klasse"])}</td>'
+                         f'<td>{"<br>".join(html.escape(sb.mahn_buchzeile(b)) for b in p["buecher"])}</td></tr>'
+                         for p in personen)
+        seite = (f'<h1>Mahnbriefe mit „{html.escape(name)}“</h1><div class="unter">Die Word-Datei enthält einen Brief pro Seite '
+                 f'für diese {len(personen)} Person(en). Öffne sie nach dem Herunterladen in Word und drucke sie dort.</div>'
+                 f'<table><thead><tr><th>Name</th><th>Klasse</th><th>Überfällige Bücher</th></tr></thead>'
+                 f'<tbody>{zeilen}</tbody></table>')
+        return druckseite("Mahnbriefe", f"{len(personen)} Brief(e). {ordner}", [seite] if personen else [], 1, "liste",
+                          knopf=knopf, steuerung=steuerung)
+
+    try:
+        with open(pfad, encoding="utf-8-sig") as f:
+            stile, briefe = sb.mahnbriefe_html(f.read(), personen)
+    except (OSError, UnicodeDecodeError) as e:
+        raise ApiFehler(f"Die Vorlage „{name}“ lässt sich nicht lesen: {e}", 500)
+    return druckseite("Mahnbriefe", f"{len(briefe)} Brief(e), einer pro Seite. {ordner}",
+                      [f'<div class="brief">{b}</div>' for b in briefe], 1, "briefe", steuerung=steuerung, kopf=stile)
+
+
+def mahnbriefe_docx(params):
+    name, pfad, personen, _ = mahn_auswahl(params)
+    if not name.lower().endswith(".docx"):
+        raise ApiFehler("Bitte eine Word-Vorlage (.docx) wählen.")
+    if not personen:
+        raise ApiFehler("Keine überfälligen Bücher – es gibt nichts zu mahnen.", 404)
+    try:
+        return sb.mahnbriefe_docx(pfad, personen)
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        raise ApiFehler(f"Die Word-Vorlage „{name}“ lässt sich nicht verarbeiten: {e}", 500)
+
+
+DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten, "regale": druck_regale,
+                "mahnbriefe": druck_mahnbriefe}
 
 
 GET_ROUTEN = {
@@ -1555,6 +1625,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._senden(200, DRUCK_ROUTEN[url.path[7:]](params), "text/html; charset=utf-8")
             except ApiFehler as e:
                 self._senden(e.status, html.escape(str(e)), "text/plain; charset=utf-8")
+        elif url.path == "/export/mahnbriefe.docx":
+            try:
+                daten = mahnbriefe_docx(params)
+            except ApiFehler as e:
+                self._senden(e.status, html.escape(str(e)), "text/plain; charset=utf-8")
+                return
+            dateiname = f"Mahnbriefe_{sb.heute():%Y%m%d}.docx"
+            self._senden(200, daten, "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                         {"Content-Disposition": f'attachment; filename="{dateiname}"'})
         elif url.path.startswith("/export/") and url.path[8:-4] in EXPORT_TYPEN and url.path.endswith(".csv"):
             typ = url.path[8:-4]
             kopf, zeilen = sb.export_daten(typ)
@@ -2247,6 +2326,7 @@ td.titel-zelle { min-width: 220px; }
       <div class="row" style="margin-bottom:14px">
         <h2 class="grow" style="margin:0">Aktuelle Ausleihen</h2>
         <input id="loans-filter" style="max-width:260px" placeholder="Filtern nach Name, Klasse oder Titel …" autocomplete="off">
+        <button class="btn secondary" type="button" id="mahnbriefe-btn" title="Mahnbriefe aus der eigenen Vorlage (Ordner „vorlagen“)">✉️ Mahnbriefe</button>
       </div>
       <div class="segment" id="loans-status">
         <button type="button" data-status="alle" class="active">Alle <span id="anz-alle"></span></button>
@@ -2339,6 +2419,7 @@ td.titel-zelle { min-width: 220px; }
           <a href="/export/katalog.csv"><button class="btn secondary" type="button">Katalog</button></a>
           <a href="/export/ausleihen.csv"><button class="btn secondary" type="button">Aktuelle Ausleihen</button></a>
           <a href="/export/mahnliste.csv"><button class="btn secondary" type="button">Mahnliste</button></a>
+          <button class="btn secondary" type="button" id="mahnbriefe-btn2">✉️ Mahnbriefe</button>
         </div>
         <h3 style="margin-top:22px">💾 Datensicherung</h3>
         <p class="hint" id="backup-info">Einmal täglich wird automatisch gesichert. Hier kannst du zusätzlich ein Backup erstellen.</p>
@@ -4002,6 +4083,8 @@ function zeichneAusleihen() {
   stueckweise($("#loans-body"), $("#loans-mehr"), liste, ausleihZeile, leer, true);
 }
 $("#loans-filter").addEventListener("input", zeichneAusleihen);
+$("#mahnbriefe-btn").addEventListener("click", () => drucken("mahnbriefe"));
+$("#mahnbriefe-btn2").addEventListener("click", () => drucken("mahnbriefe"));
 
 async function zurueckgeben(id) {
   await versuche(async () => {

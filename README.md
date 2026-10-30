@@ -69,6 +69,19 @@ Reihen mit Staffeln (z. B. „Warrior Cats“) bekommen zusätzlich das Feld **S
 
 Für Bücher, die schon vor Version 2.3.0 im Katalog waren, gibt es im Katalog den Knopf „Alle Bücher nachladen“ (Terminal: Menüpunkt 15). Er ergänzt nur leere Angaben. Die Cover werden direkt im Browser von Google Books, Open Library oder der DNB geladen.
 
+## Mahnbriefe aus eigener Vorlage
+
+Für überfällige Bücher druckt ScanBook Erinnerungsbriefe – einen Brief pro Schüler mit allen überfälligen Büchern.
+Die Vorlagen liegen im Ordner `vorlagen` neben dem Programm (beim ersten Mal legt ScanBook dort `Mahnbrief.docx`,
+`Mahnbrief.html` und eine `LIESMICH.txt` mit allen Platzhaltern an).
+
+- **Word-Vorlage (.docx):** ScanBook erstellt eine Word-Datei mit einem Brief pro Seite.
+- **HTML-Vorlage (.html):** Die Briefe erscheinen im Browser und lassen sich direkt drucken.
+
+Platzhalter wie `{Name}`, `{Vorname}`, `{Klasse}`, `{Bücherliste}`, `{Titel}`, `{Fällig}`, `{Tage}`, `{Datum}` oder `{Schule}`
+werden für jeden Schüler ausgefüllt. Im Browser: *Ausleihe → Mahnbriefe* (dort Vorlage und Klasse wählen), im Terminal:
+*Export → Mahnbriefe aus Vorlage* (die Datei landet im Ordner `exporte`).
+
 ## Datensicherung
 
 ScanBook sichert die Datenbank automatisch einmal täglich in den Ordner `backups/` – beim Start und, wenn das Programm über Nacht offen bleibt, auch an den folgenden Tagen. Die automatischen Backups der letzten 14 Tage bleiben erhalten.
