@@ -14,6 +14,7 @@ import secrets
 import bisect
 import shutil
 import sqlite3
+import stat
 import subprocess
 import urllib.request
 import urllib.parse
@@ -24,7 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.20.0"
+VERSION = "2.20.1"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -319,10 +320,81 @@ def update_installieren(neue_dateien):
         alte_dateien_aufraeumen(BACKUP_DIR, backup_praefix, MAX_UPDATE_BACKUPS)
         backups.append(os.path.basename(backup_file))
 
-    for pfad, _, code in neue_dateien:
-        with open(pfad, "w", encoding="utf-8") as f:
-            f.write(code)
+    # Erst alle neuen Dateien als .neu daneben schreiben, dann austauschen.
+    # Klappt ein Austausch nicht, werden die schon ersetzten Dateien zurückgeholt,
+    # damit ScanBook.py und ScanBook_Web.py nie aus verschiedenen Versionen stammen.
+    neu_pfade = []
+    try:
+        for pfad, _, code in neue_dateien:
+            with open(pfad + ".neu", "w", encoding="utf-8") as f:
+                f.write(code)
+            neu_pfade.append(pfad + ".neu")
+    except OSError as e:
+        for neu in neu_pfade:
+            _still_loeschen(neu)
+        raise UpdateFehler(update_fehlertext(e)) from e
+
+    ersetzt = []
+    try:
+        for pfad, _, _ in neue_dateien:
+            alt = None
+            if os.path.exists(pfad):
+                with open(pfad, "r", encoding="utf-8") as f:
+                    alt = f.read()
+            datei_austauschen(pfad + ".neu", pfad)
+            ersetzt.append((pfad, alt))
+    except OSError as e:
+        for pfad, alt in reversed(ersetzt):
+            if alt is not None:
+                try:
+                    with open(pfad, "w", encoding="utf-8") as f:
+                        f.write(alt)
+                except OSError:
+                    pass
+        for pfad, _, _ in neue_dateien:
+            _still_loeschen(pfad + ".neu")
+        raise UpdateFehler(update_fehlertext(e)) from e
     return backups
+
+
+class UpdateFehler(ValueError):
+    """Das Update konnte nicht geschrieben werden; die alte Version läuft unverändert weiter."""
+
+
+def _still_loeschen(pfad):
+    try:
+        os.remove(pfad)
+    except OSError:
+        pass
+
+
+def datei_austauschen(quelle, ziel, versuche=10):
+    """Ersetzt ziel durch quelle. Unter Windows kann eine Datei kurz gesperrt sein
+    (Virenscanner, Indexdienst, Cloud-Sync) oder schreibgeschützt markiert sein –
+    dann wird der Schreibschutz entfernt und es einige Sekunden lang erneut versucht."""
+    for versuch in range(versuche):
+        try:
+            os.replace(quelle, ziel)
+            return
+        except PermissionError:
+            if versuch == versuche - 1:
+                raise
+            try:
+                os.chmod(ziel, stat.S_IREAD | stat.S_IWRITE)
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+
+def update_fehlertext(e):
+    datei = getattr(e, "filename", None) or "eine Programmdatei"
+    if isinstance(e, PermissionError):
+        return (f"Windows lässt ScanBook die Datei {os.path.basename(str(datei)).removesuffix('.neu')} "
+                "nicht überschreiben. Es wurde nichts verändert, die bisherige Version läuft weiter. "
+                "Bitte prüfen: Ist der Ordner schreibgeschützt (Rechtsklick → Eigenschaften), "
+                "ist die Datei in einem anderen Programm geöffnet, oder blockiert der Virenschutz "
+                "(„Überwachter Ordnerzugriff“) Python? Danach das Update noch einmal starten.")
+    return f"Das Update konnte nicht gespeichert werden ({e}). Es wurde nichts verändert."
 
 
 def checkForUpdates():

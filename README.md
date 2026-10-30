@@ -180,6 +180,8 @@ Die Datenbank enthält Namen von Ausleihern und wird deshalb über `.gitignore` 
 
 Ein Update ersetzt `ScanBook.py` und `ScanBook_Web.py`. Es wird nur installiert, wenn die Versionsnummer in `ScanBook.py` höher ist und beide Dateien fehlerfrei geladen werden können. Die letzten 3 alten Versionen werden in `backups/` aufbewahrt.
 
+Die neuen Dateien werden erst als `.neu` daneben gespeichert und dann ausgetauscht. Ist eine Datei unter Windows kurz gesperrt (Virenscanner, Indexdienst) oder schreibgeschützt, versucht ScanBook es einige Sekunden lang erneut. Klappt es trotzdem nicht, bleibt die alte Version vollständig erhalten und ScanBook zeigt, was zu prüfen ist.
+
 In der Browser-Oberfläche gibt es dafür unter „Verwaltung“ den Bereich „Programm-Update“. Ist eine neue Version da, erscheint oben neben der Versionsnummer ein Knopf. Nach dem Installieren startet ScanBook von selbst neu und die Seite lädt sich neu.
 
 Die Updates werden ohne Anmeldung von GitHub geladen. Das Repository muss deshalb **öffentlich** sein.
