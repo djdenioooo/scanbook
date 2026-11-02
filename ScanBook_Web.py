@@ -724,10 +724,7 @@ def api_update_install(_):
         raise ApiFehler(f"GitHub ist gerade nicht erreichbar ({e}).", 502)
     if not dateien:
         raise ApiFehler("ScanBook ist schon auf dem neuesten Stand.")
-    try:
-        backups = sb.update_installieren(dateien)
-    except sb.UpdateFehler as e:
-        raise ApiFehler(str(e))
+    backups = sb.update_installieren(dateien)
     print(f"🚀 Update auf Version {version} installiert – ScanBook startet neu ...")
     neustart["angefordert"] = True
     # Erst antworten, dann den Server anhalten; main() startet das Programm danach neu
