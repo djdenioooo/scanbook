@@ -82,6 +82,22 @@ Platzhalter wie `{Name}`, `{Vorname}`, `{Klasse}`, `{Bücherliste}`, `{Titel}`, 
 werden für jeden Schüler ausgefüllt. Im Browser: *Ausleihe → Mahnbriefe* (dort Vorlage und Klasse wählen), im Terminal:
 *Export → Mahnbriefe aus Vorlage* (die Datei landet im Ordner `exporte`).
 
+## Erinnerungen per E-Mail
+
+Unter *Ausleihe → Per E-Mail erinnern* schickt ScanBook jedem Schüler mit überfälligen Büchern eine Mail an seine
+Schul-Adresse (Feld „E-Mail Schüler“). Der Text kommt aus der HTML-Vorlage im Ordner `vorlagen`, mit denselben Platzhaltern
+wie bei den Mahnbriefen. Vor dem Senden siehst du, wer was bekommt; wer in den letzten 7 Tagen schon erinnert wurde, ist nicht
+angehakt. Schüler ohne Adresse werden aufgelistet, für sie druckst du wie bisher einen Brief.
+
+- **Einrichten (Admin):** *Verwaltung → E-Mail-Versand*: Mailserver (SMTP), Port, Verschlüsselung, Benutzername, Absender
+  und Betreff. ScanBook verschickt nur Mails, es liest kein Postfach. Mit „Test-Mail an mich senden“ lässt sich alles prüfen.
+- **Passwort:** wird nie gespeichert (auch nicht in Backups). Es wird beim ersten Senden eingegeben und bleibt nur bis zum
+  Beenden von ScanBook im Arbeitsspeicher.
+- **Adressen:** Mit einem Muster wie `vorname.nachname@meine-schule.de` (so bildet z. B. IServ die Adressen) schlägt
+  „Adressen vorschlagen …“ für alle Schüler ohne Adresse eine vor (ä → ae, ß → ss, Leerzeichen → Bindestrich); vor dem
+  Übernehmen lässt sich jede ändern. Alternativ eine Spalte „E-Mail“ beim Klassenlisten-Import mitgeben.
+- **Datenschutz:** Gesendete Erinnerungen werden nur mit Datum vermerkt und fallen unter die Löschfrist.
+
 ## Datensicherung
 
 ScanBook sichert die Datenbank automatisch einmal täglich in den Ordner `backups/` – beim Start und, wenn das Programm über Nacht offen bleibt, auch an den folgenden Tagen. Die automatischen Backups der letzten 14 Tage bleiben erhalten.
