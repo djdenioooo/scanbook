@@ -430,6 +430,20 @@ def api_extend(body):
     return {"titel": titel, "ausleiher": ausleiher, "rueckgabe_bis": neues_datum.isoformat()}
 
 
+def api_rueckgabedatum(body):
+    """Admin: Rückgabedatum einer Ausleihe von Hand setzen, auch in die Vergangenheit (z. B. Tippfehler korrigieren)."""
+    try:
+        neues_datum = date.fromisoformat(text(body, "datum"))
+    except ValueError:
+        raise ApiFehler("Bitte ein gültiges Datum wählen.")
+    if not 2000 <= neues_datum.year <= 2100:
+        raise ApiFehler("Bitte ein gültiges Datum wählen.")
+    with sb.db_connection() as conn:
+        _, titel, ausleiher, _ = aktive_ausleihe(conn, body.get("id"))
+        conn.execute("UPDATE ausleihen SET rueckgabe_bis = ? WHERE id = ?", (neues_datum.isoformat(), body.get("id")))
+    return {"titel": titel, "ausleiher": ausleiher, "rueckgabe_bis": neues_datum.isoformat()}
+
+
 def api_settings_save(body):
     werte = body.get("werte") or {}
     for key, label, pruefung in sb.STAMMDATEN:
@@ -1543,6 +1557,7 @@ POST_ROUTEN = {
     "checkout": api_checkout,
     "return": api_return,
     "extend": api_extend,
+    "rueckgabedatum": api_rueckgabedatum,
     "settings": api_settings_save,
     "backup": api_backup,
     "backup_ordner": api_backup_ordner,
@@ -1590,7 +1605,7 @@ KONTO_POST = {
 }
 OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
 VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
-NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu", "logo", "gast", "mail_settings", "mail_test", "mail_adressen"}
+NUR_ADMIN_POST = {"rueckgabedatum", "settings", "backup_ordner", "notfall_neu", "logo", "gast", "mail_settings", "mail_test", "mail_adressen"}
 
 
 # --- WEBSERVER ---
@@ -2072,6 +2087,8 @@ dialog.breit { width: min(760px, calc(100vw - 32px)); }
 .mail-liste td:first-child { width: 28px; }
 .mail-liste input[type=email] { padding: 6px 8px; font-size: 14px; min-width: 220px; }
 .mail-liste tr.ohne td { color: var(--muted); }
+.datum-aendern { border: 0; background: none; cursor: pointer; padding: 0 2px; font-size: 13px; opacity: .55; }
+.datum-aendern:hover { opacity: 1; }
 .vorschau-kopf { display: grid; grid-template-columns: 150px 1fr; gap: 22px; }
 @media (max-width: 560px) { .vorschau-kopf { grid-template-columns: 1fr; } .cover-box { max-width: 160px; } }
 .cover-box { aspect-ratio: 2 / 3; border-radius: 8px; overflow: hidden; background: var(--fill); display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
@@ -2728,6 +2745,21 @@ td.titel-zelle { min-width: 220px; }
       <button class="btn secondary" type="button" id="sc-drucken">Ausweis drucken</button>
       <button class="btn danger" type="button" id="sc-loeschen">Löschen</button>
       <button class="btn secondary" type="button" id="sc-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- RÜCKGABEDATUM ÄNDERN (Admin) -->
+<dialog id="datum-dialog" style="width:min(420px, calc(100vw - 32px))">
+  <form id="datum-form" class="dlg-body">
+    <h2>Rückgabedatum ändern</h2>
+    <p class="hint" id="datum-info"></p>
+    <input type="hidden" name="id">
+    <label for="datum-neu">Zurückgeben bis</label>
+    <input id="datum-neu" name="datum" type="date" required>
+    <div class="actions">
+      <button class="btn" type="submit">Speichern</button>
+      <button class="btn secondary" type="button" id="datum-close" style="margin-left:auto">Abbrechen</button>
     </div>
   </form>
 </dialog>
@@ -4217,7 +4249,7 @@ function ausleihZeile(a) {
       <td><b>${esc(a.titel)}</b><div class="sub">${esc(a.autor)}${a.exemplar ? ` · ${esc(a.exemplar)}` : ""}</div></td>
       <td>${esc(a.ausleiher)}${a.klasse ? `<div class="sub">Klasse ${esc(a.klasse)}</div>` : ""}</td>
       <td class="num">${deDatum(a.ausgeliehen_am)}</td>
-      <td class="num">${deDatum(a.rueckgabe_bis)}${a.verlaengerungen ? `<div class="sub">${a.verlaengerungen}× verlängert</div>` : ""}</td>
+      <td class="num">${deDatum(a.rueckgabe_bis)}${ich?.rolle === "admin" ? ` <button class="btn-icon datum-aendern" type="button" data-datum="${a.id}" title="Rückgabedatum ändern" aria-label="Rückgabedatum ändern">✏️</button>` : ""}${a.verlaengerungen ? `<div class="sub">${a.verlaengerungen}× verlängert</div>` : ""}</td>
       <td>${statusBadge(a.tage)}</td>
       <td style="white-space:nowrap">
         <button class="btn small" data-return="${a.id}">Zurückgeben</button>
@@ -4258,7 +4290,29 @@ async function verlaengern(id) {
     await ladeAusleihen();
   });
 }
+function datumAendern(id) {
+  const a = ausleihen.find((x) => x.id === id);
+  if (!a) return;
+  const form = $("#datum-form");
+  form.id.value = id;
+  form.datum.value = a.rueckgabe_bis;
+  $("#datum-info").textContent = `„${a.titel}“ bei ${a.ausleiher}. Ein Datum in der Vergangenheit macht die Ausleihe sofort überfällig.`;
+  $("#datum-dialog").showModal();
+  form.datum.focus();
+}
+$("#datum-close").addEventListener("click", () => $("#datum-dialog").close());
+$("#datum-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const form = e.target;
+  versuche(async () => {
+    const r = await post("rueckgabedatum", { id: Number(form.id.value), datum: form.datum.value });
+    toast(`„${r.titel}“: Rückgabe jetzt bis ${deDatum(r.rueckgabe_bis)}`);
+    $("#datum-dialog").close();
+    await ladeAusleihen();
+  });
+});
 $("#loans-body").addEventListener("click", (e) => {
+  if (e.target.dataset.datum) datumAendern(Number(e.target.dataset.datum));
   if (e.target.dataset.return) zurueckgeben(Number(e.target.dataset.return));
   if (e.target.dataset.extend) verlaengern(Number(e.target.dataset.extend));
 });
