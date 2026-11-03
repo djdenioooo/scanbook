@@ -13,6 +13,8 @@ import hashlib
 import secrets
 import bisect
 import shutil
+import smtplib
+import unicodedata
 import sqlite3
 import subprocess
 import urllib.request
@@ -22,9 +24,11 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
+from email.message import EmailMessage
+from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.20.0"
+VERSION = "2.21.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -450,9 +454,22 @@ def init_db():
                 ausweis TEXT UNIQUE COLLATE NOCASE,
                 vorname TEXT,
                 nachname TEXT,
-                klasse TEXT DEFAULT ''
+                klasse TEXT DEFAULT '',
+                email TEXT DEFAULT ''
             )
         ''')
+
+        # Versendete Erinnerungs-Mails (damit niemand doppelt gemahnt wird; fällt unter die Löschfrist)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mail_versand (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schueler_id INTEGER,
+                an TEXT,
+                gesendet_am TEXT,
+                anzahl INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS mail_versand_schueler ON mail_versand(schueler_id, gesendet_am)")
 
         # Mediencodes: eigene Nummer pro Exemplar, als Etikett im Buch (eigener = schon vorhandenes Etikett)
         cursor.execute('''
@@ -525,6 +542,9 @@ def init_db():
         # Eigene Anzahl Bücher je Fach (z. B. schmale Mangas): JSON-Liste mit einer Zahl je Fach (0 = wie das Regal)
         if "fach_kapazitaet" not in regal_spalten:
             cursor.execute("ALTER TABLE regale ADD COLUMN fach_kapazitaet TEXT DEFAULT ''")
+
+        if "email" not in {row[1] for row in cursor.execute("PRAGMA table_info(schueler)")}:
+            cursor.execute("ALTER TABLE schueler ADD COLUMN email TEXT DEFAULT ''")
 
         vorhandene_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(ausleihen)")}
         if "zurueckgegeben_am" not in vorhandene_spalten:
@@ -2382,12 +2402,26 @@ def schueler_name(vorname, nachname):
     return f"{vorname} {nachname}".strip()
 
 
-def schueler_speichern(schueler_id, vorname, nachname, klasse, ausweis=""):
-    """Legt einen Schüler an (schueler_id leer) oder ändert ihn. Leere Ausweisnummer = automatisch vergeben."""
+def email_pruefen(email):
+    """Leer ist erlaubt (keine Adresse). Sonst eine einfache Prüfung auf name@schule.de."""
+    email = str(email or "").strip()
+    if email and not EMAIL_MUSTER.fullmatch(email):
+        raise ValueError(f"„{email}“ sieht nicht wie eine E-Mail-Adresse aus.")
+    return email
+
+
+EMAIL_MUSTER = re.compile(r"[^@\s<>,;\"]+@[^@\s<>,;\"]+\.[A-Za-z]{2,}")
+
+
+def schueler_speichern(schueler_id, vorname, nachname, klasse, ausweis="", email=None):
+    """Legt einen Schüler an (schueler_id leer) oder ändert ihn. Leere Ausweisnummer = automatisch vergeben.
+    email=None lässt eine vorhandene Adresse unverändert."""
     vorname, nachname, klasse = (str(w or "").strip() for w in (vorname, nachname, klasse))
     ausweis = code_normalisieren(ausweis)
     if not vorname or not nachname:
         raise ValueError("Bitte Vor- und Nachname eingeben.")
+    if email is not None:
+        email = email_pruefen(email)
     with db_connection() as conn:
         if ausweis:
             neuer_code_pruefen(conn, ausweis, schueler_id)
@@ -2400,12 +2434,14 @@ def schueler_speichern(schueler_id, vorname, nachname, klasse, ausweis=""):
             if not conn.execute("UPDATE schueler SET vorname = ?, nachname = ?, klasse = ?, ausweis = ? WHERE id = ?",
                                 (vorname, nachname, klasse, ausweis, schueler_id)).rowcount:
                 raise ValueError("Diesen Schüler gibt es nicht (mehr).")
+            if email is not None:
+                conn.execute("UPDATE schueler SET email = ? WHERE id = ?", (email, schueler_id))
             # Name auch bei den Ausleihen anpassen, damit Listen und Mahnliste stimmen
             conn.execute("UPDATE ausleihen SET ausleiher = ? WHERE schueler_id = ?",
                          (schueler_name(vorname, nachname), schueler_id))
             return schueler_id
-        return conn.execute("INSERT INTO schueler (ausweis, vorname, nachname, klasse) VALUES (?, ?, ?, ?)",
-                            (ausweis, vorname, nachname, klasse)).lastrowid
+        return conn.execute("INSERT INTO schueler (ausweis, vorname, nachname, klasse, email) VALUES (?, ?, ?, ?, ?)",
+                            (ausweis, vorname, nachname, klasse, email or "")).lastrowid
 
 
 def schueler_loeschen(schueler_id):
@@ -2417,16 +2453,17 @@ def schueler_loeschen(schueler_id):
         # Frühere Ausleihen bleiben mit Namen erhalten (bis zur Löschfrist)
         conn.execute("UPDATE ausleihen SET schueler_id = NULL WHERE schueler_id = ?", (schueler_id,))
         conn.execute("DELETE FROM schueler WHERE id = ?", (schueler_id,))
+        conn.execute("DELETE FROM mail_versand WHERE schueler_id = ?", (schueler_id,))
 
 
 def lade_schueler(schueler_id):
     with db_connection() as conn:
-        row = conn.execute("SELECT id, ausweis, vorname, nachname, klasse FROM schueler WHERE id = ?",
+        row = conn.execute("SELECT id, ausweis, vorname, nachname, klasse, email FROM schueler WHERE id = ?",
                            (schueler_id,)).fetchone()
     if not row:
         return None
     return {"id": row[0], "ausweis": row[1], "vorname": row[2], "nachname": row[3], "klasse": row[4] or "",
-            "name": schueler_name(row[2], row[3])}
+            "email": row[5] or "", "name": schueler_name(row[2], row[3])}
 
 
 def klassen_sortierwert(klasse):
@@ -2436,39 +2473,51 @@ def klassen_sortierwert(klasse):
 
 
 SCHUELER_KOPF = {"vorname": "vorname", "nachname": "nachname", "name": "nachname", "familienname": "nachname",
-                 "klasse": "klasse", "ausweis": "ausweis", "ausweisnummer": "ausweis", "nummer": "ausweis"}
+                 "klasse": "klasse", "ausweis": "ausweis", "ausweisnummer": "ausweis", "nummer": "ausweis",
+                 "email": "email", "mail": "email", "emailschüler": "email", "emailschueler": "email",
+                 "emailadresse": "email"}
 
 
 def schueler_importieren(text):
     """Liest eine Klassenliste ein (aus Excel kopiert oder als CSV-Datei).
-    Spalten: Nachname, Vorname, Klasse und optional Ausweisnummer – oder in der Reihenfolge der Kopfzeile."""
+    Spalten: Nachname, Vorname, Klasse und optional Ausweisnummer und E-Mail – oder in der Reihenfolge der Kopfzeile.
+    Bei Schülern, die es schon gibt, wird eine fehlende E-Mail-Adresse aus der Liste ergänzt."""
     zeilen = [z for z in (text or "").lstrip("﻿").splitlines() if z.strip()]
     if not zeilen:
         return {"neu": 0, "vorhanden": 0, "fehler": []}
     trenner = max("\t;,", key=zeilen[0].count)
     zeilen = list(csv.reader(zeilen, delimiter=trenner))
-    reihenfolge = ["nachname", "vorname", "klasse", "ausweis"]
-    kopf = [SCHUELER_KOPF.get(z.strip().lower().replace("-", "")) for z in zeilen[0]]
+    reihenfolge = ["nachname", "vorname", "klasse", "ausweis", "email"]
+    kopf = [SCHUELER_KOPF.get(re.sub(r"[\s\-_]", "", z.strip().lower())) for z in zeilen[0]]
     if "vorname" in kopf and "nachname" in kopf:
         reihenfolge, zeilen = kopf, zeilen[1:]
 
-    neu, vorhanden, fehler = 0, 0, []
+    neu, vorhanden, fehler, mails = 0, 0, [], 0
     with db_connection() as conn:
-        bekannt = {(v.lower(), n.lower(), (k or "").lower())
-                   for v, n, k in conn.execute("SELECT vorname, nachname, klasse FROM schueler")}
+        bekannt = {(v.lower(), n.lower(), (k or "").lower()): (sid, m or "")
+                   for sid, v, n, k, m in conn.execute("SELECT id, vorname, nachname, klasse, email FROM schueler")}
     for nr, zeile in enumerate(zeilen, 1):
         werte = {feld: zeile[i].strip() for i, feld in enumerate(reihenfolge) if feld and i < len(zeile)}
         schluessel = tuple(werte.get(f, "").lower() for f in ("vorname", "nachname", "klasse"))
         if schluessel in bekannt:
             vorhanden += 1
+            sid, alte_mail = bekannt[schluessel]
+            if werte.get("email") and not alte_mail:
+                try:
+                    with db_connection() as conn:
+                        conn.execute("UPDATE schueler SET email = ? WHERE id = ?", (email_pruefen(werte["email"]), sid))
+                    mails += 1
+                except ValueError as e:
+                    fehler.append(f"Zeile {nr} ({' '.join(zeile).strip()}): {e}")
             continue
         try:
-            schueler_speichern(None, werte.get("vorname"), werte.get("nachname"), werte.get("klasse"), werte.get("ausweis"))
-            bekannt.add(schluessel)
+            schueler_speichern(None, werte.get("vorname"), werte.get("nachname"), werte.get("klasse"), werte.get("ausweis"),
+                               werte.get("email", ""))
+            bekannt[schluessel] = (None, werte.get("email", ""))
             neu += 1
         except ValueError as e:
             fehler.append(f"Zeile {nr} ({' '.join(zeile).strip()}): {e}")
-    return {"neu": neu, "vorhanden": vorhanden, "fehler": fehler}
+    return {"neu": neu, "vorhanden": vorhanden, "fehler": fehler, "mails": mails}
 
 
 def exemplare_von(isbn):
@@ -3012,7 +3061,7 @@ def mahn_personen(klasse=None, schueler_id=None):
     """Alle Personen mit überfälligen Büchern, sortiert nach Klasse und Name – je Person ein Brief."""
     sql = '''
         SELECT a.schueler_id, a.ausleiher, s.vorname, s.nachname, COALESCE(s.klasse, ''), COALESCE(s.ausweis, ''),
-               b.titel, b.autor_formatiert, a.isbn, COALESCE(a.exemplar, ''), a.ausgeliehen_am, a.rueckgabe_bis
+               COALESCE(s.email, ''), b.titel, b.autor_formatiert, a.isbn, COALESCE(a.exemplar, ''), a.ausgeliehen_am, a.rueckgabe_bis
         FROM ausleihen a JOIN buecher b ON a.isbn = b.isbn LEFT JOIN schueler s ON s.id = a.schueler_id
         WHERE a.status = 'aktiv' AND a.rueckgabe_bis < ?
     '''
@@ -3024,7 +3073,7 @@ def mahn_personen(klasse=None, schueler_id=None):
         rows = conn.execute(sql + " ORDER BY a.rueckgabe_bis", params).fetchall()
 
     personen = {}
-    for sid, ausleiher, vorname, nachname, kl, ausweis, titel, autor, isbn, code, von, bis in rows:
+    for sid, ausleiher, vorname, nachname, kl, ausweis, email, titel, autor, isbn, code, von, bis in rows:
         if klasse and kl != klasse:
             continue
         schluessel = sid or (ausleiher or "").strip().lower()
@@ -3034,7 +3083,8 @@ def mahn_personen(klasse=None, schueler_id=None):
             if not (vorname or nachname):  # Name ohne Schülerliste (z. B. „Frau Schmidt“): ganzer Name zur Anrede
                 vorname, nachname = name, name.rsplit(" ", 1)[-1]
             p = personen[schluessel] = {"name": name, "vorname": vorname or "", "nachname": nachname or "",
-                                        "klasse": kl, "ausweis": ausweis, "buecher": []}
+                                        "klasse": kl, "ausweis": ausweis, "buecher": [],
+                                        "schueler_id": sid, "email": email}
         p["buecher"].append({"titel": titel or "", "autor": "" if (autor or "") in LEERWERTE else autor,
                              "isbn": isbn, "code": code, "ausgeliehen": von, "faellig": bis,
                              "tage": (heute() - date.fromisoformat(bis)).days})
@@ -3371,6 +3421,242 @@ def mahnbriefe_menu():
         return
     print(f"✅ {anzahl} Mahnbrief(e) gespeichert unter: {pfad}")
 
+# --- ERINNERUNGEN PER E-MAIL ---
+# ScanBook verschickt nur (SMTP, wie Outlook beim Senden) und liest kein Postfach.
+# Das Passwort wird nie gespeichert: Es steht nur im Arbeitsspeicher, bis ScanBook beendet wird.
+MAIL_EINSTELLUNGEN = [
+    ("mail_muster", "Muster für Schüler-Adressen", "z. B. vorname.nachname@meine-schule.de"),
+    ("smtp_server", "Mailserver (SMTP)", "z. B. meine-schule.de oder smtp.office365.com"),
+    ("smtp_port", "Port", "587"),
+    ("smtp_sicherheit", "Verschlüsselung", "starttls"),
+    ("smtp_benutzer", "Benutzername", "meist die eigene E-Mail-Adresse"),
+    ("mail_absender", "Absender-Adresse", "z. B. buecherei@meine-schule.de"),
+    ("mail_betreff", "Betreff", ""),
+]
+MAIL_STANDARD = {"smtp_port": "587", "smtp_sicherheit": "starttls",
+                 "mail_betreff": "Erinnerung: Bitte Bücher zurückgeben ({Bibliothek})"}
+SMTP_SICHERHEIT = {"starttls": "STARTTLS (meist Port 587)", "ssl": "SSL/TLS (meist Port 465)"}
+MAIL_SPERRE_TAGE = 7  # wer in den letzten 7 Tagen erinnert wurde, ist beim nächsten Mal nicht vorausgewählt
+mail_passwort = {"wert": ""}
+
+
+def mail_einstellung(schluessel):
+    return get_einstellung(schluessel, MAIL_STANDARD.get(schluessel, "")).strip() or MAIL_STANDARD.get(schluessel, "")
+
+
+def mail_einstellungen_speichern(werte):
+    if "mail_muster" in werte and str(werte["mail_muster"]).strip():
+        muster = str(werte["mail_muster"]).strip()
+        if "@" not in muster or not ({"vorname", "nachname"} & set(re.findall(r"[a-z]+", muster.split("@")[0].lower()))):
+            raise ValueError("Das Muster braucht „vorname“ und/oder „nachname“ vor dem @, z. B. vorname.nachname@meine-schule.de")
+    if "smtp_port" in werte and str(werte["smtp_port"]).strip():
+        if not str(werte["smtp_port"]).strip().isdigit() or not 0 < int(werte["smtp_port"]) < 65536:
+            raise ValueError("Der Port ist eine Zahl, meist 587 oder 465.")
+    if "smtp_sicherheit" in werte and werte["smtp_sicherheit"] not in SMTP_SICHERHEIT:
+        raise ValueError("Unbekannte Verschlüsselung.")
+    if str(werte.get("mail_absender", "")).strip():
+        email_pruefen(werte["mail_absender"])
+    for key, _, _ in MAIL_EINSTELLUNGEN:
+        if key in werte:
+            set_einstellung(key, str(werte[key]).strip())
+
+
+def adress_teil(text):
+    """'Jörg-Peter' → 'joerg-peter', 'Ünal Çelik' → 'uenal-celik' (so wie IServ Kontonamen bildet)."""
+    text = text.strip().lower()
+    for alt, neu in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        text = text.replace(alt, neu)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = re.sub(r"\s+", "-", text)
+    return re.sub(r"[^a-z0-9.\-]", "", text).strip(".-")
+
+
+def adresse_aus_muster(muster, vorname, nachname):
+    """Muster 'vorname.nachname@schule.de' → 'max.mustermann@schule.de'. Leer, wenn das Muster fehlt."""
+    muster = (muster or "").strip()
+    if "@" not in muster:
+        return ""
+    lokal, domain = muster.rsplit("@", 1)
+    lokal = re.sub(r"vorname", lambda _: "\x00", lokal, flags=re.I)
+    lokal = re.sub(r"nachname", lambda _: "\x01", lokal, flags=re.I)
+    lokal = lokal.replace("\x00", adress_teil(vorname)).replace("\x01", adress_teil(nachname))
+    return f"{lokal}@{domain.strip().lower()}" if lokal.strip(".-_") else ""
+
+
+def mail_vorschlaege(nur_fehlende=True):
+    """Vorschläge für alle Schüler (ohne Adresse) nach dem eingestellten Muster – zum Prüfen vor dem Übernehmen."""
+    muster = mail_einstellung("mail_muster")
+    with db_connection() as conn:
+        rows = conn.execute("SELECT id, vorname, nachname, klasse, COALESCE(email, '') FROM schueler").fetchall()
+    liste = []
+    for sid, vorname, nachname, klasse, email in rows:
+        if nur_fehlende and email:
+            continue
+        vorschlag = adresse_aus_muster(muster, vorname or "", nachname or "")
+        if vorschlag and vorschlag != email:
+            liste.append({"id": sid, "name": schueler_name(vorname, nachname), "klasse": klasse or "",
+                          "email": email, "vorschlag": vorschlag})
+    liste.sort(key=lambda x: (klassen_sortierwert(x["klasse"]), x["name"].lower()))
+    return liste
+
+
+def mail_adressen_uebernehmen(eintraege):
+    """eintraege: [{'id': 1, 'email': '…'}, …] – setzt die Adressen (nach Prüfung)."""
+    neu = [(email_pruefen(e.get("email")), int(e["id"])) for e in eintraege if str(e.get("id", "")).isdigit()]
+    with db_connection() as conn:
+        conn.executemany("UPDATE schueler SET email = ? WHERE id = ?", neu)
+    return len(neu)
+
+
+def zuletzt_erinnert():
+    """schueler_id → Datum/Uhrzeit der letzten Erinnerungs-Mail."""
+    with db_connection() as conn:
+        return dict(conn.execute("SELECT schueler_id, MAX(gesendet_am) FROM mail_versand GROUP BY schueler_id"))
+
+
+def mail_vorlagen():
+    """Für Mails gehen nur HTML-Vorlagen (eine Word-Datei kann man nicht als Mailtext schicken)."""
+    return [n for n in mahn_vorlagen() if n.lower().endswith((".html", ".htm"))]
+
+
+def mail_vorlage_text(name=""):
+    namen = mail_vorlagen()
+    if name not in namen:
+        name = namen[0] if namen else ""
+    if not name:
+        return "", STANDARD_VORLAGE_HTML
+    with open(os.path.join(VORLAGEN_DIR, name), encoding="utf-8-sig") as f:
+        return name, f.read()
+
+
+def html_zu_text(inhalt):
+    """Einfache Textfassung der Mail für Programme, die kein HTML anzeigen."""
+    inhalt = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", inhalt, flags=re.S | re.I)
+    inhalt = re.sub(r"<br\s*/?>", "\n", inhalt, flags=re.I)
+    inhalt = re.sub(r"</(p|div|h\d|li|tr)>", "\n\n", inhalt, flags=re.I)
+    inhalt = html.unescape(re.sub(r"<[^>]+>", "", inhalt))
+    zeilen = [z.strip() for z in inhalt.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(zeilen)).strip() + "\n"
+
+
+def mail_einstellungen_pruefen():
+    fehlt = [label for key, label, _ in MAIL_EINSTELLUNGEN
+             if key in ("smtp_server", "smtp_benutzer", "mail_absender") and not mail_einstellung(key)]
+    if fehlt:
+        raise ValueError("Bitte zuerst unter Verwaltung → E-Mail-Versand ausfüllen: " + ", ".join(fehlt) + ".")
+    if not mail_passwort["wert"]:
+        raise ValueError("Bitte das Passwort für das Mail-Konto eingeben.")
+
+
+def smtp_verbinden():
+    """Öffnet die Verbindung zum Mailserver und meldet sich an. Fehler kommen als verständlicher Text."""
+    mail_einstellungen_pruefen()
+    server, port = mail_einstellung("smtp_server"), int(mail_einstellung("smtp_port") or 587)
+    nicht_erreichbar = (f"{server} ist über Port {port} nicht erreichbar. Stimmt die Adresse? Manche Netze "
+                        "(z. B. von Schulträger oder Stadtverwaltung) sperren den Mailversand, dann hilft die IT weiter.")
+    smtp, anmeldung = None, False
+    try:
+        if mail_einstellung("smtp_sicherheit") == "ssl":
+            smtp = smtplib.SMTP_SSL(server, port, timeout=20, context=ssl_kontext())
+        else:
+            smtp = smtplib.SMTP(server, port, timeout=20)
+            smtp.starttls(context=ssl_kontext())
+        anmeldung = True
+        smtp.login(mail_einstellung("smtp_benutzer"), mail_passwort["wert"])
+        return smtp
+    except Exception as e:
+        if smtp:
+            try:
+                smtp.close()
+            except Exception:
+                pass
+        # Reihenfolge wichtig: SMTP-Fehler und SSL-Fehler sind in Python auch OSError
+        if anmeldung:  # bei der Anmeldung gescheitert: Passwort vergessen, damit es neu eingegeben wird
+            mail_passwort["wert"] = ""
+        if isinstance(e, smtplib.SMTPAuthenticationError) or (anmeldung and isinstance(e, smtplib.SMTPServerDisconnected)):
+            raise ValueError("Anmeldung am Mailserver fehlgeschlagen: Benutzername oder Passwort stimmen nicht.")
+        if isinstance(e, smtplib.SMTPNotSupportedError):
+            raise ValueError("Der Mailserver kann kein STARTTLS. Probiere „SSL/TLS“ mit Port 465.")
+        if isinstance(e, (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected)):
+            raise ValueError(nicht_erreichbar)
+        if isinstance(e, smtplib.SMTPException):
+            raise ValueError(f"Der Mailserver meldet einen Fehler: {e}")
+        if isinstance(e, ssl.SSLError):
+            raise ValueError(f"Verschlüsselung mit {server} klappt nicht ({e}). Stimmen Port und Verschlüsselung?")
+        if isinstance(e, OSError):
+            raise ValueError(nicht_erreichbar)
+        raise
+
+
+def mail_bauen(an, betreff, inhalt_html, stile=""):
+    msg = EmailMessage()
+    absender = mail_einstellung("mail_absender")
+    msg["From"] = formataddr((get_einstellung("bib_name", "Schulbibliothek"), absender))
+    msg["To"] = an
+    msg["Subject"] = betreff
+    msg["Message-ID"] = make_msgid(domain=absender.rsplit("@", 1)[-1])
+    msg.set_content(html_zu_text(inhalt_html))
+    msg.add_alternative(f'<!doctype html><html lang="de"><head><meta charset="utf-8">{stile}</head>'
+                        f'<body><div class="brief" style="padding:0">{inhalt_html}</div></body></html>', subtype="html")
+    return msg
+
+
+def test_mail_senden():
+    """Schickt eine Probe-Mail an die eigene Absender-Adresse."""
+    smtp = smtp_verbinden()
+    try:
+        an = mail_einstellung("mail_absender")
+        smtp.send_message(mail_bauen(an, "ScanBook: Test-Mail",
+                                     "<p>Hallo,</p><p>diese Test-Mail kommt von ScanBook. Der Mailversand funktioniert.</p>"))
+    finally:
+        smtp.quit()
+    return an
+
+
+def mail_erinnerungen(vorlage=""):
+    """Alle Personen mit überfälligen Büchern, mit Adresse und letzter Erinnerung – für die Auswahl vor dem Senden."""
+    letzte = zuletzt_erinnert()
+    grenze = (datetime.now() - timedelta(days=MAIL_SPERRE_TAGE)).isoformat(" ", "seconds")
+    liste = []
+    for p in mahn_personen():
+        zuletzt = letzte.get(p["schueler_id"], "") if p["schueler_id"] else ""
+        liste.append({"schueler_id": p["schueler_id"], "name": p["name"], "klasse": p["klasse"], "email": p["email"],
+                      "buecher": [mahn_buchzeile(b) for b in p["buecher"]], "zuletzt": zuletzt,
+                      "vorausgewaehlt": bool(p["email"]) and not (zuletzt and zuletzt > grenze)})
+    return liste
+
+
+def mail_erinnerungen_senden(schueler_ids, vorlage=""):
+    """Schickt jedem gewählten Schüler mit Adresse eine Erinnerung aus der HTML-Vorlage. Liefert gesendet/fehler."""
+    gewaehlt = {int(i) for i in schueler_ids}
+    personen = [p for p in mahn_personen() if p["schueler_id"] in gewaehlt and p["email"]]
+    if not personen:
+        raise ValueError("Niemand ausgewählt, der eine E-Mail-Adresse hat.")
+    _, vorlage_text = mail_vorlage_text(vorlage)
+    stile, briefe = mahnbriefe_html(vorlage_text, personen)
+    betreff_vorlage = mail_einstellung("mail_betreff")
+    gesendet, fehler = [], []
+    smtp = smtp_verbinden()
+    try:
+        for p, brief in zip(personen, briefe):
+            betreff = platzhalter_ersetzen(betreff_vorlage, mahn_werte(p)).replace("\n", " ")
+            try:
+                smtp.send_message(mail_bauen(p["email"], betreff, brief, stile))
+            except smtplib.SMTPException as e:
+                fehler.append(f"{p['name']} ({p['email']}): {e}")
+                continue
+            with db_connection() as conn:
+                conn.execute("INSERT INTO mail_versand (schueler_id, an, gesendet_am, anzahl) VALUES (?, ?, ?, ?)",
+                             (p["schueler_id"], p["email"], datetime.now().isoformat(" ", "seconds"), len(p["buecher"])))
+            gesendet.append(p["name"])
+    finally:
+        try:
+            smtp.quit()
+        except smtplib.SMTPException:
+            pass
+    return {"gesendet": gesendet, "fehler": fehler}
+
+
 # --- DATENBANK-BACKUP ---
 # Sicherungen liegen im Ordner "backups" neben dem Programm. Ist ein zweiter Ordner eingestellt
 # (USB-Stick, OneDrive, Netzlaufwerk), kommt jede Sicherung zusätzlich dorthin – falls der PC ausfällt.
@@ -3512,6 +3798,7 @@ def alte_ausleihen_loeschen():
             DELETE FROM ausleihen
             WHERE status = 'zurueckgegeben' AND COALESCE(zurueckgegeben_am, rueckgabe_bis) < ?
         ''', (grenze,)).rowcount
+        conn.execute("DELETE FROM mail_versand WHERE gesendet_am < ?", (grenze,))
     if geloescht:
         print(f"🔒 Datenschutz: {geloescht} abgeschlossene Ausleihe(n) älter als {monate} Monate gelöscht.")
 

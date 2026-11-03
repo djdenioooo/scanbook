@@ -1070,14 +1070,14 @@ def barcode_svg(text, hoehe=40):
 
 # --- SCHÜLER ---
 def schueler_daten(row):
-    sid, ausweis, vorname, nachname, klasse, aktiv, ueberfaellig = row
-    return {"id": sid, "ausweis": ausweis, "vorname": vorname, "nachname": nachname, "klasse": klasse or "",
+    sid, ausweis, vorname, nachname, klasse, aktiv, ueberfaellig, email = row
+    return {"id": sid, "ausweis": ausweis, "vorname": vorname, "nachname": nachname, "klasse": klasse or "", "email": email or "",
             "name": sb.schueler_name(vorname, nachname), "aktiv": aktiv, "ueberfaellig": ueberfaellig}
 
 
 # Aktive Ausleihen einmal pro Schüler zusammenzählen (statt zwei Unterabfragen je Schüler)
 SCHUELER_SQL = '''
-    SELECT s.id, s.ausweis, s.vorname, s.nachname, s.klasse, COALESCE(z.aktiv, 0), COALESCE(z.ueber, 0)
+    SELECT s.id, s.ausweis, s.vorname, s.nachname, s.klasse, COALESCE(z.aktiv, 0), COALESCE(z.ueber, 0), s.email
     FROM schueler s LEFT JOIN (
         SELECT schueler_id, COUNT(*) AS aktiv, SUM(rueckgabe_bis < ?) AS ueber
         FROM ausleihen WHERE status = 'aktiv' AND schueler_id IS NOT NULL GROUP BY schueler_id
@@ -1149,7 +1149,8 @@ def api_code(params):
 def api_schueler_save(body):
     try:
         sid = sb.schueler_speichern(body.get("id") or None, text(body, "vorname"), text(body, "nachname"),
-                                    text(body, "klasse"), text(body, "ausweis"))
+                                    text(body, "klasse"), text(body, "ausweis"),
+                                    text(body, "email") if "email" in body else None)
     except ValueError as e:
         raise ApiFehler(str(e))
     return sb.lade_schueler(sid)
@@ -1165,6 +1166,74 @@ def api_schueler_delete(body):
 
 def api_schueler_import(body):
     return sb.schueler_importieren(body.get("text"))
+
+
+# --- ERINNERUNGEN PER E-MAIL ---
+def mit_valueerror(funktion, *args):
+    try:
+        return funktion(*args)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+
+
+def api_mail_settings(_):
+    return {
+        "felder": [{"key": k, "label": l, "hinweis": h, "wert": sb.mail_einstellung(k)} for k, l, h in sb.MAIL_EINSTELLUNGEN],
+        "sicherheit": sb.SMTP_SICHERHEIT,
+        "passwort_gesetzt": bool(sb.mail_passwort["wert"]),
+    }
+
+
+def api_mail_settings_save(body):
+    mit_valueerror(sb.mail_einstellungen_speichern, body.get("werte") or {})
+    return api_mail_settings(None)
+
+
+def passwort_uebernehmen(body):
+    """Ein mitgeschicktes Passwort gilt ab jetzt bis zum Beenden von ScanBook (wird nirgends gespeichert)."""
+    if text(body, "passwort"):
+        sb.mail_passwort["wert"] = str(body["passwort"])
+
+
+def api_mail_passwort_vergessen(_):
+    sb.mail_passwort["wert"] = ""
+    return {"passwort_gesetzt": False}
+
+
+def api_mail_test(body):
+    passwort_uebernehmen(body)
+    return {"an": mit_valueerror(sb.test_mail_senden), "passwort_gesetzt": bool(sb.mail_passwort["wert"])}
+
+
+def api_mail_vorschlaege(_):
+    return {"muster": sb.mail_einstellung("mail_muster"), "vorschlaege": sb.mail_vorschlaege()}
+
+
+def api_mail_adressen(body):
+    eintraege = body.get("eintraege")
+    if not isinstance(eintraege, list):
+        raise ApiFehler("Ungültige Anfrage.")
+    return {"anzahl": mit_valueerror(sb.mail_adressen_uebernehmen, [e for e in eintraege if isinstance(e, dict)])}
+
+
+def api_mail_erinnerungen(_):
+    return {
+        "personen": sb.mail_erinnerungen(),
+        "vorlagen": sb.mail_vorlagen(),
+        "passwort_gesetzt": bool(sb.mail_passwort["wert"]),
+        "eingerichtet": all(sb.mail_einstellung(k) for k in ("smtp_server", "smtp_benutzer", "mail_absender")),
+        "sperre_tage": sb.MAIL_SPERRE_TAGE,
+    }
+
+
+def api_mail_senden(body):
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise ApiFehler("Ungültige Anfrage.")
+    passwort_uebernehmen(body)
+    ergebnis = mit_valueerror(sb.mail_erinnerungen_senden, ids, text(body, "vorlage"))
+    ergebnis["passwort_gesetzt"] = bool(sb.mail_passwort["wert"])
+    return ergebnis
 
 
 # --- MEDIENCODES ---
@@ -1458,6 +1527,9 @@ GET_ROUTEN = {
     "schueler": api_schueler,
     "code": api_code,
     "codes_status": api_codes_status,
+    "mail_settings": api_mail_settings,
+    "mail_vorschlaege": api_mail_vorschlaege,
+    "mail_erinnerungen": api_mail_erinnerungen,
 }
 
 POST_ROUTEN = {
@@ -1494,6 +1566,11 @@ POST_ROUTEN = {
     "exemplar_entfernen": api_exemplar_entfernen,
     "codes_erzeugen": api_codes_erzeugen,
     "etiketten_gedruckt": api_etiketten_gedruckt,
+    "mail_settings": api_mail_settings_save,
+    "mail_test": api_mail_test,
+    "mail_passwort_vergessen": api_mail_passwort_vergessen,
+    "mail_adressen": api_mail_adressen,
+    "mail_senden": api_mail_senden,
 }
 
 EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste")
@@ -1513,7 +1590,7 @@ KONTO_POST = {
 }
 OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
 VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
-NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu", "logo", "gast"}
+NUR_ADMIN_POST = {"settings", "backup_ordner", "notfall_neu", "logo", "gast", "mail_settings", "mail_test", "mail_adressen"}
 
 
 # --- WEBSERVER ---
@@ -1987,6 +2064,14 @@ tr.staffel-zeile td { padding: 8px 12px 4px 34px; background: transparent; color
 
 /* Buchvorschau */
 dialog.vorschau { width: min(760px, calc(100vw - 32px)); }
+dialog.breit { width: min(760px, calc(100vw - 32px)); }
+.mail-liste { max-height: 48vh; overflow: auto; margin: 12px 0; }
+.mail-liste td { vertical-align: top; }
+.mail-liste .buecher { color: var(--muted); font-size: 13px; }
+.mail-liste .adresse { color: var(--muted); font-size: 13px; word-break: break-all; margin-right: 6px; }
+.mail-liste td:first-child { width: 28px; }
+.mail-liste input[type=email] { padding: 6px 8px; font-size: 14px; min-width: 220px; }
+.mail-liste tr.ohne td { color: var(--muted); }
 .vorschau-kopf { display: grid; grid-template-columns: 150px 1fr; gap: 22px; }
 @media (max-width: 560px) { .vorschau-kopf { grid-template-columns: 1fr; } .cover-box { max-width: 160px; } }
 .cover-box { aspect-ratio: 2 / 3; border-radius: 8px; overflow: hidden; background: var(--fill); display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
@@ -2327,6 +2412,7 @@ td.titel-zelle { min-width: 220px; }
         <h2 class="grow" style="margin:0">Aktuelle Ausleihen</h2>
         <input id="loans-filter" style="max-width:260px" placeholder="Filtern nach Name, Klasse oder Titel …" autocomplete="off">
         <button class="btn secondary" type="button" id="mahnbriefe-btn" title="Mahnbriefe aus der eigenen Vorlage (Ordner „vorlagen“)">✉️ Mahnbriefe</button>
+        <button class="btn secondary" type="button" id="mailerinnern-btn" title="Überfällige Bücher per E-Mail an die Schüler erinnern">📧 Per E-Mail erinnern</button>
       </div>
       <div class="segment" id="loans-status">
         <button type="button" data-status="alle" class="active">Alle <span id="anz-alle"></span></button>
@@ -2448,6 +2534,33 @@ td.titel-zelle { min-width: 220px; }
       <form id="settings-form">
         <div class="form-grid" id="settings-fields"></div>
         <div class="actions"><button class="btn" type="submit">Speichern</button></div>
+      </form>
+    </div>
+    <div class="card nur-admin">
+      <h2>E-Mail-Versand</h2>
+      <p class="hint">Damit kannst du Rückgabe-Erinnerungen per E-Mail an die Schüler schicken (unter „Ausleihe“). ScanBook verschickt nur Mails, es liest kein Postfach. Am besten das Mail-Konto der Bücherei bei IServ oder der Schule nehmen, kein privates. Die Zugangsdaten bekommst du von der Schul-IT.</p>
+      <form id="mail-form">
+        <div class="form-grid">
+          <div class="full"><label for="ml-mail_muster">Muster für Schüler-Adressen</label>
+            <div class="row"><input id="ml-mail_muster" name="mail_muster" class="grow" autocomplete="off" placeholder="z. B. vorname.nachname@meine-schule.de">
+            <button class="btn secondary" type="button" id="mail-vorschlaege-btn">Adressen vorschlagen …</button></div>
+            <p class="hint" style="margin:4px 0 0">„vorname“ und „nachname“ werden durch den Namen ersetzt (ä → ae, ß → ss, Leerzeichen → Bindestrich). Wie die Adressen bei euch genau aussehen, siehst du in IServ.</p></div>
+          <div><label for="ml-smtp_server">Mailserver (SMTP)</label><input id="ml-smtp_server" name="smtp_server" autocomplete="off"></div>
+          <div class="row" style="gap:10px;align-items:end">
+            <div style="width:90px"><label for="ml-smtp_port">Port</label><input id="ml-smtp_port" name="smtp_port" type="number" min="1" max="65535"></div>
+            <div class="grow"><label for="ml-smtp_sicherheit">Verschlüsselung</label><select id="ml-smtp_sicherheit" name="smtp_sicherheit" style="width:100%"></select></div>
+          </div>
+          <div><label for="ml-smtp_benutzer">Benutzername</label><input id="ml-smtp_benutzer" name="smtp_benutzer" autocomplete="off"></div>
+          <div><label for="ml-mail_absender">Absender-Adresse</label><input id="ml-mail_absender" name="mail_absender" type="email" autocomplete="off"></div>
+          <div class="full"><label for="ml-mail_betreff">Betreff</label><input id="ml-mail_betreff" name="mail_betreff" autocomplete="off">
+            <p class="hint" style="margin:4px 0 0">Platzhalter wie in der Mahnbrief-Vorlage gehen auch hier, z. B. {Name} oder {Anzahl}. Der Text der Mail kommt aus deiner HTML-Vorlage im Ordner „vorlagen“.</p></div>
+        </div>
+        <p class="hint" id="mail-passwort-info" style="margin-top:12px"></p>
+        <div class="actions">
+          <button class="btn" type="submit">Speichern</button>
+          <button class="btn secondary" type="button" id="mail-test-btn">Test-Mail an mich senden</button>
+          <button class="btn secondary hidden" type="button" id="mail-vergessen-btn">Passwort vergessen</button>
+        </div>
       </form>
     </div>
     <div class="card nur-admin">
@@ -2607,6 +2720,7 @@ td.titel-zelle { min-width: 220px; }
       <div><label for="sc-nachname">Nachname</label><input id="sc-nachname" name="nachname" autocomplete="off"></div>
       <div><label for="sc-klasse">Klasse</label><input id="sc-klasse" name="klasse" list="klassen-liste" autocomplete="off" placeholder="z. B. 5a"></div>
       <div><label for="sc-ausweis">Ausweisnummer</label><input id="sc-ausweis" name="ausweis" autocomplete="off" placeholder="leer = automatisch"></div>
+      <div class="full"><label for="sc-email">E-Mail Schüler</label><input id="sc-email" name="email" type="email" autocomplete="off" placeholder="z. B. max.muster@meine-schule.de"></div>
     </div>
     <div class="vorschau-block hidden" id="sc-ausleihen-block"><h3>Gerade ausgeliehen</h3><ul class="log" id="sc-ausleihen"></ul></div>
     <div class="actions">
@@ -2618,11 +2732,49 @@ td.titel-zelle { min-width: 220px; }
   </form>
 </dialog>
 
+<!-- E-MAIL-ERINNERUNGEN -->
+<dialog id="mail-dialog" class="breit">
+  <form id="mail-senden-form" class="dlg-body">
+    <h2>Per E-Mail erinnern</h2>
+    <p class="hint" id="md-info"></p>
+    <div class="row" id="md-vorlage-zeile"><label for="md-vorlage" style="margin:0">Vorlage</label><select id="md-vorlage"></select>
+      <label class="check" style="margin-left:auto"><input type="checkbox" id="md-alle"> alle mit Adresse</label></div>
+    <div class="table-wrap mail-liste"><table>
+      <thead><tr><th></th><th>Schüler und überfällige Bücher</th></tr></thead>
+      <tbody id="md-body"></tbody>
+    </table></div>
+    <p class="hint" id="md-ohne"></p>
+    <div id="md-passwort-zeile"><label for="md-passwort">Passwort des Mail-Kontos</label>
+      <input id="md-passwort" type="password" autocomplete="off">
+      <p class="hint" style="margin:4px 0 0">Wird nicht gespeichert. ScanBook merkt es sich nur, bis du es beendest.</p></div>
+    <div class="actions">
+      <button class="btn" type="submit" id="md-senden">Senden</button>
+      <button class="btn secondary" type="button" id="md-briefe">Briefe für die anderen drucken</button>
+      <button class="btn secondary" type="button" id="md-close" style="margin-left:auto">Schließen</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="vorschlag-dialog" class="breit">
+  <form id="vorschlag-form" class="dlg-body">
+    <h2>E-Mail-Adressen vorschlagen</h2>
+    <p class="hint" id="vs-info"></p>
+    <div class="table-wrap mail-liste"><table>
+      <thead><tr><th><input type="checkbox" id="vs-alle" checked></th><th>Schüler</th><th>Klasse</th><th>Vorschlag</th></tr></thead>
+      <tbody id="vs-body"></tbody>
+    </table></div>
+    <div class="actions">
+      <button class="btn" type="submit">Ausgewählte übernehmen</button>
+      <button class="btn secondary" type="button" id="vs-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- KLASSENLISTE-IMPORT -->
 <dialog id="import-dialog">
   <form id="import-form" class="dlg-body">
     <h2>Klassenliste importieren</h2>
-    <p class="hint">Eine Zeile pro Schüler: <b>Nachname; Vorname; Klasse</b>, optional als vierte Spalte eine vorhandene Ausweisnummer. Am einfachsten die Spalten aus Excel kopieren und hier einfügen, oder eine CSV-Datei wählen. Eine Kopfzeile mit „Vorname“, „Nachname“, „Klasse“ darf dabei sein, dann ist die Reihenfolge egal. Schüler, die es schon gibt, werden übersprungen.</p>
+    <p class="hint">Eine Zeile pro Schüler: <b>Nachname; Vorname; Klasse</b>, optional als vierte Spalte eine vorhandene Ausweisnummer und als fünfte die E-Mail-Adresse. Am einfachsten die Spalten aus Excel kopieren und hier einfügen, oder eine CSV-Datei wählen. Eine Kopfzeile mit „Vorname“, „Nachname“, „Klasse“ darf dabei sein, dann ist die Reihenfolge egal. Schüler, die es schon gibt, werden übersprungen (eine fehlende E-Mail-Adresse wird aber ergänzt).</p>
     <textarea name="text" id="import-text" rows="9" placeholder="Muster;Max;5a&#10;Beispiel;Lea;5a"></textarea>
     <div class="row" style="margin-top:10px"><input type="file" id="import-datei" accept=".csv,.txt,text/csv,text/plain" style="background:none;padding:0"></div>
     <div class="actions">
@@ -2893,7 +3045,7 @@ const LADER = {
   verwaltung: () => {
     if (ich?.rolle !== "buecherei") ladeBenutzer();
     ladeStatistik(); ladeCodesStatus(); ladeBackups();
-    if (ich?.rolle === "admin") { ladeEinstellungen(); ladeLogoEinstellung().catch(() => {}); }
+    if (ich?.rolle === "admin") { ladeEinstellungen(); ladeLogoEinstellung().catch(() => {}); ladeMailEinstellungen(); }
   },
 };
 // Alte Lesezeichen weiter unterstützen
@@ -4293,7 +4445,7 @@ async function oeffneSchueler(x) {
   const form = $("#schueler-form");
   form.reset();
   form.id.value = x?.id ?? "";
-  for (const f of ["vorname", "nachname", "klasse", "ausweis"]) form[f].value = x?.[f] ?? "";
+  for (const f of ["vorname", "nachname", "klasse", "ausweis", "email"]) form[f].value = x?.[f] ?? "";
   if (!x && aktiveKlasse) form.klasse.value = aktiveKlasse;
   $("#schueler-dlg-titel").textContent = x ? x.name : "Neuer Schüler";
   $("#sc-drucken").classList.toggle("hidden", !x);
@@ -4322,7 +4474,7 @@ $("#schueler-form").addEventListener("submit", (e) => {
     if (neu) {
       // Gleich den nächsten Schüler derselben Klasse erfassen
       const form = $("#schueler-form");
-      for (const f of ["vorname", "nachname", "ausweis"]) form[f].value = "";
+      for (const f of ["vorname", "nachname", "ausweis", "email"]) form[f].value = "";
       form.vorname.focus();
     } else {
       $("#schueler-dialog").close();
@@ -4359,7 +4511,8 @@ $("#import-form").addEventListener("submit", (e) => {
   e.preventDefault();
   versuche(async () => {
     const r = await post("schueler_import", { text: $("#import-text").value });
-    toast(`${r.neu} Schüler importiert` + (r.vorhanden ? `, ${r.vorhanden} gab es schon` : ""), false);
+    toast(`${r.neu} Schüler importiert` + (r.vorhanden ? `, ${r.vorhanden} gab es schon` : "")
+      + (r.mails ? `, bei ${r.mails} die E-Mail ergänzt` : ""), false);
     if (r.fehler.length) alert("Diese Zeilen wurden nicht übernommen:\n\n" + r.fehler.slice(0, 20).join("\n") + (r.fehler.length > 20 ? `\n… und ${r.fehler.length - 20} weitere` : ""));
     else $("#import-dialog").close();
     ladeSchueler();
@@ -4499,6 +4652,144 @@ $("#settings-form").addEventListener("submit", (e) => {
     await post("settings", { werte: formDaten(e.target) });
     toast("Einstellungen gespeichert");
     await ladeInfo();
+  });
+});
+
+// --- E-Mail-Versand ---
+function zeigePasswortInfo(gesetzt) {
+  $("#mail-passwort-info").textContent = gesetzt
+    ? "Das Passwort ist eingegeben und bleibt bis zum Beenden von ScanBook im Speicher. Gespeichert wird es nicht."
+    : "Das Passwort wird nicht gespeichert. Du gibst es beim ersten Senden ein, danach merkt ScanBook es sich bis zum Beenden.";
+  $("#mail-vergessen-btn").classList.toggle("hidden", !gesetzt);
+}
+async function ladeMailEinstellungen() {
+  await versuche(async () => {
+    const d = await get("mail_settings");
+    $("#ml-smtp_sicherheit").innerHTML = Object.entries(d.sicherheit).map(([k, t]) => `<option value="${k}">${esc(t)}</option>`).join("");
+    for (const f of d.felder) {
+      const feld = $("#ml-" + f.key);
+      feld.value = f.wert;
+      if (f.hinweis && feld.tagName === "INPUT" && !feld.placeholder) feld.placeholder = f.hinweis;
+    }
+    zeigePasswortInfo(d.passwort_gesetzt);
+  });
+}
+async function mailSpeichern() {
+  const d = await post("mail_settings", { werte: formDaten($("#mail-form")) });
+  zeigePasswortInfo(d.passwort_gesetzt);
+}
+$("#ml-smtp_sicherheit").addEventListener("change", (e) => {
+  const port = $("#ml-smtp_port");
+  if (e.target.value === "ssl" && port.value === "587") port.value = "465";
+  if (e.target.value === "starttls" && port.value === "465") port.value = "587";
+});
+$("#mail-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => { await mailSpeichern(); toast("E-Mail-Einstellungen gespeichert"); });
+});
+$("#mail-test-btn").addEventListener("click", () => versuche(async () => {
+  await mailSpeichern();
+  const status = await get("mail_settings");
+  let passwort = "";
+  if (!status.passwort_gesetzt) {
+    passwort = prompt("Passwort des Mail-Kontos (wird nicht gespeichert):") || "";
+    if (!passwort) return;
+  }
+  toast("Test-Mail wird gesendet …");
+  const d = await post("mail_test", { passwort });
+  zeigePasswortInfo(d.passwort_gesetzt);
+  toast(`Test-Mail an ${d.an} gesendet. Schau in dein Postfach.`);
+}));
+$("#mail-vergessen-btn").addEventListener("click", () => versuche(async () => {
+  zeigePasswortInfo((await post("mail_passwort_vergessen")).passwort_gesetzt);
+  toast("Passwort aus dem Speicher gelöscht");
+}));
+
+// Adressen nach Muster vorschlagen
+let vorschlaege = [];
+$("#mail-vorschlaege-btn").addEventListener("click", () => versuche(async () => {
+  await mailSpeichern();
+  const d = await get("mail_vorschlaege");
+  if (!d.muster) { toast("Bitte zuerst ein Muster eintragen, z. B. vorname.nachname@meine-schule.de", true); return; }
+  vorschlaege = d.vorschlaege;
+  if (!vorschlaege.length) { toast("Alle Schüler haben schon eine E-Mail-Adresse."); return; }
+  $("#vs-info").textContent = `Für ${vorschlaege.length} Schüler ohne Adresse, nach dem Muster ${d.muster}. Du kannst jede Adresse vor dem Übernehmen noch ändern, z. B. bei Doppelnamen.`;
+  $("#vs-body").innerHTML = vorschlaege.map((v, i) => `<tr>
+    <td><input type="checkbox" data-i="${i}" checked></td><td>${esc(v.name)}</td><td>${esc(v.klasse)}</td>
+    <td><input type="email" data-i="${i}" value="${esc(v.vorschlag)}"></td></tr>`).join("");
+  $("#vs-alle").checked = true;
+  $("#vorschlag-dialog").showModal();
+}));
+$("#vs-alle").addEventListener("change", (e) => {
+  for (const c of $("#vs-body").querySelectorAll("input[type=checkbox]")) c.checked = e.target.checked;
+});
+$("#vs-close").addEventListener("click", () => $("#vorschlag-dialog").close());
+$("#vorschlag-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  versuche(async () => {
+    const eintraege = [...$("#vs-body").querySelectorAll("input[type=checkbox]:checked")].map((c) => ({
+      id: vorschlaege[c.dataset.i].id,
+      email: $("#vs-body").querySelector(`input[type=email][data-i="${c.dataset.i}"]`).value.trim(),
+    }));
+    if (!eintraege.length) { toast("Nichts ausgewählt.", true); return; }
+    const d = await post("mail_adressen", { eintraege });
+    toast(`${d.anzahl} E-Mail-Adresse(n) übernommen`);
+    $("#vorschlag-dialog").close();
+    ladeSchueler();
+  });
+});
+
+// Erinnerungen senden
+let mailDaten = null;
+function deZeit(wert) {
+  if (!wert) return "–";
+  const [tag, zeit] = wert.split(" ");
+  return deDatum(tag) + (zeit ? ", " + zeit.slice(0, 5) : "");
+}
+async function oeffneMailDialog() {
+  const d = mailDaten = await get("mail_erinnerungen");
+  const mit = d.personen.filter((p) => p.email), ohne = d.personen.filter((p) => !p.email);
+  $("#md-info").textContent = !d.personen.length ? "Keine überfälligen Bücher, es gibt nichts zu erinnern."
+    : !d.eingerichtet ? "Der Mailversand ist noch nicht eingerichtet. Ein Admin trägt die Zugangsdaten unter Verwaltung → E-Mail-Versand ein."
+    : `${mit.length} von ${d.personen.length} Person(en) mit überfälligen Büchern haben eine E-Mail-Adresse. Wer in den letzten ${d.sperre_tage} Tagen schon erinnert wurde, ist nicht angehakt.`;
+  $("#md-vorlage").innerHTML = (d.vorlagen.length ? d.vorlagen : ["Mahnbrief.html"]).map((n) => `<option>${esc(n)}</option>`).join("");
+  $("#md-body").innerHTML = mit.map((p) => `<tr>
+    <td><input type="checkbox" data-id="${p.schueler_id}" ${p.vorausgewaehlt ? "checked" : ""}></td>
+    <td><b>${esc(p.name)}</b>${p.klasse ? " · " + esc(p.klasse) : ""} <span class="adresse">${esc(p.email)}</span>
+      ${p.zuletzt ? `<span class="badge warn">zuletzt erinnert ${deZeit(p.zuletzt)}</span>` : ""}
+      <div class="buecher">${p.buecher.map(esc).join("<br>")}</div></td></tr>`).join("")
+    || `<tr><td colspan="2" class="hint">Niemand mit überfälligen Büchern hat eine E-Mail-Adresse.</td></tr>`;
+  $("#md-ohne").textContent = ohne.length ? `Ohne E-Mail-Adresse (bitte Brief drucken): ${ohne.map((p) => p.name + (p.klasse ? " (" + p.klasse + ")" : "")).join(", ")}` : "";
+  $("#md-briefe").classList.toggle("hidden", !ohne.length);
+  $("#md-passwort-zeile").classList.toggle("hidden", d.passwort_gesetzt);
+  $("#md-passwort").value = "";
+  $("#md-alle").checked = mit.length > 0 && mit.every((p) => p.vorausgewaehlt);
+  $("#md-senden").disabled = !mit.length || !d.eingerichtet;
+  if (!$("#mail-dialog").open) $("#mail-dialog").showModal();
+}
+$("#mailerinnern-btn").addEventListener("click", () => versuche(oeffneMailDialog));
+$("#md-alle").addEventListener("change", (e) => {
+  for (const c of $("#md-body").querySelectorAll("input[type=checkbox]")) c.checked = e.target.checked;
+});
+$("#md-close").addEventListener("click", () => $("#mail-dialog").close());
+$("#md-briefe").addEventListener("click", () => drucken("mahnbriefe"));
+$("#mail-senden-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const ids = [...$("#md-body").querySelectorAll("input[type=checkbox]:checked")].map((c) => Number(c.dataset.id));
+  if (!ids.length) { toast("Bitte mindestens einen Schüler anhaken.", true); return; }
+  if (!mailDaten.passwort_gesetzt && !$("#md-passwort").value) { toast("Bitte das Passwort des Mail-Kontos eingeben.", true); $("#md-passwort").focus(); return; }
+  if (!confirm(`${ids.length} Erinnerung(en) per E-Mail senden?`)) return;
+  const knopf = $("#md-senden");
+  knopf.disabled = true;
+  knopf.textContent = "Wird gesendet …";
+  versuche(async () => {
+    const r = await post("mail_senden", { ids, vorlage: $("#md-vorlage").value, passwort: $("#md-passwort").value });
+    toast(`${r.gesendet.length} Erinnerung(en) gesendet`, false);
+    if (r.fehler.length) alert("Diese Mails konnten nicht gesendet werden:\n\n" + r.fehler.join("\n"));
+    await oeffneMailDialog();
+  }).finally(() => {
+    knopf.textContent = "Senden";
+    knopf.disabled = !mailDaten.eingerichtet || !mailDaten.personen.some((p) => p.email);
   });
 });
 
