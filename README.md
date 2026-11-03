@@ -82,6 +82,10 @@ Platzhalter wie `{Name}`, `{Vorname}`, `{Klasse}`, `{Bücherliste}`, `{Titel}`, 
 werden für jeden Schüler ausgefüllt. Im Browser: *Ausleihe → Mahnbriefe* (dort Vorlage und Klasse wählen), im Terminal:
 *Export → Mahnbriefe aus Vorlage* (die Datei landet im Ordner `exporte`).
 
+**Rückgabedatum von Hand ändern (Admin):** In der Liste *Aktuelle Ausleihen* steht neben jedem Rückgabedatum ein ✏️.
+Damit lässt sich das Datum frei setzen, auch in die Vergangenheit (z. B. um einen Tippfehler zu korrigieren oder die
+Erinnerungen zu testen). Das zählt nicht als Verlängerung.
+
 ## Erinnerungen per E-Mail
 
 Unter *Ausleihe → Per E-Mail erinnern* schickt ScanBook jedem Schüler mit überfälligen Büchern eine Mail an seine
