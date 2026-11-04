@@ -95,8 +95,11 @@ angehakt. Schüler ohne Adresse werden aufgelistet, für sie druckst du wie bish
 
 - **Einrichten (Admin):** *Verwaltung → E-Mail-Versand*: Mailserver (SMTP), Port, Verschlüsselung, Benutzername, Absender
   und Betreff. ScanBook verschickt nur Mails, es liest kein Postfach. Mit „Test-Mail an mich senden“ lässt sich alles prüfen.
-- **Passwort:** wird nie gespeichert (auch nicht in Backups). Es wird beim ersten Senden eingegeben und bleibt nur bis zum
-  Beenden von ScanBook im Arbeitsspeicher.
+- **Passwort:** Unter Windows kann ein Admin es unter *Verwaltung → E-Mail-Versand* speichern. Es wird mit dem
+  Windows-Konto verschlüsselt (Windows-Datenschutz-API) und lässt sich nur auf diesem PC mit diesem Windows-Konto lesen,
+  nicht aus einer kopierten Datenbank oder einem Backup. „Passwort löschen“ entfernt es wieder; scheitert die Anmeldung am
+  Mailserver (z. B. Passwort in IServ geändert), wird das gespeicherte Passwort automatisch gelöscht. Ohne Speichern wird es
+  beim ersten Senden abgefragt und bleibt bis zum Beenden von ScanBook im Arbeitsspeicher.
 - **Adressen:** Mit einem Muster wie `vorname.nachname@meine-schule.de` (so bildet z. B. IServ die Adressen) schlägt
   „Adressen vorschlagen …“ für alle Schüler ohne Adresse eine vor (ä → ae, ß → ss, Leerzeichen → Bindestrich); vor dem
   Übernehmen lässt sich jede ändern. Alternativ eine Spalte „E-Mail“ beim Klassenlisten-Import mitgeben.
