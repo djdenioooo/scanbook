@@ -1194,7 +1194,7 @@ def api_mail_settings(_):
     return {
         "felder": [{"key": k, "label": l, "hinweis": h, "wert": sb.mail_einstellung(k)} for k, l, h in sb.MAIL_EINSTELLUNGEN],
         "sicherheit": sb.SMTP_SICHERHEIT,
-        "passwort_gesetzt": bool(sb.mail_passwort["wert"]),
+        **sb.mail_passwort_status(),
     }
 
 
@@ -1204,19 +1204,26 @@ def api_mail_settings_save(body):
 
 
 def passwort_uebernehmen(body):
-    """Ein mitgeschicktes Passwort gilt ab jetzt bis zum Beenden von ScanBook (wird nirgends gespeichert)."""
+    """Ein mitgeschicktes Passwort gilt ab jetzt bis zum Beenden von ScanBook (gespeichert wird es nur über
+    „Passwort speichern“ in den Einstellungen)."""
     if text(body, "passwort"):
         sb.mail_passwort["wert"] = str(body["passwort"])
 
 
 def api_mail_passwort_vergessen(_):
-    sb.mail_passwort["wert"] = ""
-    return {"passwort_gesetzt": False}
+    sb.mail_passwort_loeschen()
+    return sb.mail_passwort_status()
+
+
+def api_mail_passwort_speichern(body):
+    passwort = str(body.get("passwort") or "")
+    mit_valueerror(sb.mail_passwort_speichern, passwort)
+    return sb.mail_passwort_status()
 
 
 def api_mail_test(body):
     passwort_uebernehmen(body)
-    return {"an": mit_valueerror(sb.test_mail_senden), "passwort_gesetzt": bool(sb.mail_passwort["wert"])}
+    return {"an": mit_valueerror(sb.test_mail_senden), **sb.mail_passwort_status()}
 
 
 def api_mail_vorschlaege(_):
@@ -1234,7 +1241,7 @@ def api_mail_erinnerungen(_):
     return {
         "personen": sb.mail_erinnerungen(),
         "vorlagen": sb.mail_vorlagen(),
-        "passwort_gesetzt": bool(sb.mail_passwort["wert"]),
+        "passwort_gesetzt": sb.mail_passwort_laden(),
         "eingerichtet": all(sb.mail_einstellung(k) for k in ("smtp_server", "smtp_benutzer", "mail_absender")),
         "sperre_tage": sb.MAIL_SPERRE_TAGE,
     }
@@ -1584,6 +1591,7 @@ POST_ROUTEN = {
     "mail_settings": api_mail_settings_save,
     "mail_test": api_mail_test,
     "mail_passwort_vergessen": api_mail_passwort_vergessen,
+    "mail_passwort_speichern": api_mail_passwort_speichern,
     "mail_adressen": api_mail_adressen,
     "mail_senden": api_mail_senden,
 }
@@ -1605,7 +1613,8 @@ KONTO_POST = {
 }
 OHNE_ANMELDUNG = {"anmeldung", "login", "logout", "einrichten", "bufdi_anlegen", "notfall"}
 VOR_PASSWORTWECHSEL = OHNE_ANMELDUNG | {"passwort_aendern"}  # mehr geht erst nach eigenem Passwort
-NUR_ADMIN_POST = {"rueckgabedatum", "settings", "backup_ordner", "notfall_neu", "logo", "gast", "mail_settings", "mail_test", "mail_adressen"}
+NUR_ADMIN_POST = {"rueckgabedatum", "settings", "backup_ordner", "notfall_neu", "logo", "gast", "mail_settings", "mail_test", "mail_adressen",
+                  "mail_passwort_vergessen", "mail_passwort_speichern"}
 
 
 # --- WEBSERVER ---
@@ -2572,12 +2581,17 @@ td.titel-zelle { min-width: 220px; }
           <div class="full"><label for="ml-mail_betreff">Betreff</label><input id="ml-mail_betreff" name="mail_betreff" autocomplete="off">
             <p class="hint" style="margin:4px 0 0">Platzhalter wie in der Mahnbrief-Vorlage gehen auch hier, z. B. {Name} oder {Anzahl}. Der Text der Mail kommt aus deiner HTML-Vorlage im Ordner „vorlagen“.</p></div>
         </div>
-        <p class="hint" id="mail-passwort-info" style="margin-top:12px"></p>
         <div class="actions">
           <button class="btn" type="submit">Speichern</button>
           <button class="btn secondary" type="button" id="mail-test-btn">Test-Mail an mich senden</button>
-          <button class="btn secondary hidden" type="button" id="mail-vergessen-btn">Passwort vergessen</button>
         </div>
+        <h3 style="margin-top:22px">Passwort</h3>
+        <p class="hint" id="mail-passwort-info"></p>
+        <div class="row" id="mail-passwort-zeile">
+          <input id="ml-passwort" type="password" class="grow" autocomplete="new-password" placeholder="Passwort des Mail-Kontos">
+          <button class="btn secondary" type="button" id="mail-pw-speichern-btn">Passwort speichern</button>
+        </div>
+        <div class="actions" style="margin-top:10px"><button class="btn danger hidden" type="button" id="mail-vergessen-btn">Passwort löschen</button></div>
       </form>
     </div>
     <div class="card nur-admin">
@@ -4710,11 +4724,17 @@ $("#settings-form").addEventListener("submit", (e) => {
 });
 
 // --- E-Mail-Versand ---
-function zeigePasswortInfo(gesetzt) {
-  $("#mail-passwort-info").textContent = gesetzt
-    ? "Das Passwort ist eingegeben und bleibt bis zum Beenden von ScanBook im Speicher. Gespeichert wird es nicht."
-    : "Das Passwort wird nicht gespeichert. Du gibst es beim ersten Senden ein, danach merkt ScanBook es sich bis zum Beenden.";
-  $("#mail-vergessen-btn").classList.toggle("hidden", !gesetzt);
+function zeigePasswortInfo(d) {
+  $("#mail-passwort-info").textContent = d.passwort_gespeichert
+    ? "Das Passwort ist auf diesem PC gespeichert, verschlüsselt mit deinem Windows-Konto. Auf einem anderen PC oder in einem Backup lässt es sich nicht lesen. Beim Senden wird es nicht mehr abgefragt."
+    : !d.speichern_moeglich
+      ? "Sicher speichern geht nur unter Windows. Das Passwort wird beim ersten Senden abgefragt und gilt bis zum Beenden von ScanBook."
+      : d.passwort_gesetzt
+        ? "Das Passwort ist eingegeben und gilt bis zum Beenden von ScanBook. Wenn du es hier speicherst, fragt ScanBook nicht mehr danach."
+        : "Noch kein Passwort gespeichert. Du kannst es hier speichern (verschlüsselt mit deinem Windows-Konto) oder beim Senden jedes Mal eingeben.";
+  $("#mail-passwort-zeile").classList.toggle("hidden", !d.speichern_moeglich);
+  $("#mail-pw-speichern-btn").textContent = d.passwort_gespeichert ? "Neues Passwort speichern" : "Passwort speichern";
+  $("#mail-vergessen-btn").classList.toggle("hidden", !d.passwort_gesetzt && !d.passwort_gespeichert);
 }
 async function ladeMailEinstellungen() {
   await versuche(async () => {
@@ -4725,12 +4745,13 @@ async function ladeMailEinstellungen() {
       feld.value = f.wert;
       if (f.hinweis && feld.tagName === "INPUT" && !feld.placeholder) feld.placeholder = f.hinweis;
     }
-    zeigePasswortInfo(d.passwort_gesetzt);
+    zeigePasswortInfo(d);
   });
 }
 async function mailSpeichern() {
-  const d = await post("mail_settings", { werte: formDaten($("#mail-form")) });
-  zeigePasswortInfo(d.passwort_gesetzt);
+  const werte = formDaten($("#mail-form"));
+  delete werte.passwort;
+  zeigePasswortInfo(await post("mail_settings", { werte }));
 }
 $("#ml-smtp_sicherheit").addEventListener("change", (e) => {
   const port = $("#ml-smtp_port");
@@ -4751,12 +4772,20 @@ $("#mail-test-btn").addEventListener("click", () => versuche(async () => {
   }
   toast("Test-Mail wird gesendet …");
   const d = await post("mail_test", { passwort });
-  zeigePasswortInfo(d.passwort_gesetzt);
+  zeigePasswortInfo(d);
   toast(`Test-Mail an ${d.an} gesendet. Schau in dein Postfach.`);
 }));
 $("#mail-vergessen-btn").addEventListener("click", () => versuche(async () => {
-  zeigePasswortInfo((await post("mail_passwort_vergessen")).passwort_gesetzt);
-  toast("Passwort aus dem Speicher gelöscht");
+  if (!confirm("Passwort löschen? Danach wird es beim Senden wieder abgefragt.")) return;
+  zeigePasswortInfo(await post("mail_passwort_vergessen"));
+  toast("Passwort gelöscht");
+}));
+$("#mail-pw-speichern-btn").addEventListener("click", () => versuche(async () => {
+  const passwort = $("#ml-passwort").value;
+  if (!passwort) { toast("Bitte das Passwort eingeben.", true); $("#ml-passwort").focus(); return; }
+  zeigePasswortInfo(await post("mail_passwort_speichern", { passwort }));
+  $("#ml-passwort").value = "";
+  toast("Passwort verschlüsselt gespeichert. Am besten gleich eine Test-Mail senden.");
 }));
 
 // Adressen nach Muster vorschlagen

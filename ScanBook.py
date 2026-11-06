@@ -11,7 +11,9 @@ import hmac
 import getpass
 import hashlib
 import secrets
+import base64
 import bisect
+import ctypes
 import shutil
 import smtplib
 import unicodedata
@@ -28,7 +30,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.22.0"
+VERSION = "2.23.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -3438,6 +3440,72 @@ MAIL_STANDARD = {"smtp_port": "587", "smtp_sicherheit": "starttls",
 SMTP_SICHERHEIT = {"starttls": "STARTTLS (meist Port 587)", "ssl": "SSL/TLS (meist Port 465)"}
 MAIL_SPERRE_TAGE = 7  # wer in den letzten 7 Tagen erinnert wurde, ist beim nächsten Mal nicht vorausgewählt
 mail_passwort = {"wert": ""}
+MAIL_PASSWORT_GESCHUETZT = "mail_passwort_geschuetzt"  # mit Windows (DPAPI) verschlüsselt, nur auf diesem PC lesbar
+DPAPI_ZUSATZ = b"ScanBook-Mailpasswort"
+
+
+class _DpapiBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(daten, verschluesseln):
+    """Ver-/Entschlüsselt mit der Windows-Datenschutz-API: Nur dasselbe Windows-Konto auf diesem PC kann es lesen."""
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    puffer, zusatz = ctypes.create_string_buffer(daten, len(daten)), ctypes.create_string_buffer(DPAPI_ZUSATZ, len(DPAPI_ZUSATZ))
+    rein = _DpapiBlob(len(daten), ctypes.cast(puffer, ctypes.POINTER(ctypes.c_char)))
+    extra = _DpapiBlob(len(DPAPI_ZUSATZ), ctypes.cast(zusatz, ctypes.POINTER(ctypes.c_char)))
+    raus = _DpapiBlob()
+    funktion = crypt32.CryptProtectData if verschluesseln else crypt32.CryptUnprotectData
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN: nie ein Fenster zeigen
+    if not funktion(ctypes.byref(rein), None, ctypes.byref(extra), None, None, 0x1, ctypes.byref(raus)):
+        raise OSError("Windows konnte das Passwort nicht " + ("verschlüsseln." if verschluesseln else "entschlüsseln."))
+    try:
+        return ctypes.string_at(raus.pbData, raus.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(raus.pbData, ctypes.c_void_p))
+
+
+def passwort_speichern_moeglich():
+    return os.name == "nt"
+
+
+def mail_passwort_speichern(passwort):
+    """Speichert das Passwort verschlüsselt (nur unter Windows) und benutzt es ab sofort."""
+    if not passwort:
+        raise ValueError("Bitte das Passwort eingeben.")
+    if not passwort_speichern_moeglich():
+        raise ValueError("Sicher speichern geht nur unter Windows. Das Passwort gilt jetzt bis zum Beenden von ScanBook.")
+    set_einstellung(MAIL_PASSWORT_GESCHUETZT, base64.b64encode(_dpapi(passwort.encode("utf-8"), True)).decode())
+    mail_passwort["wert"] = passwort
+
+
+def mail_passwort_loeschen():
+    mail_passwort["wert"] = ""
+    set_einstellung(MAIL_PASSWORT_GESCHUETZT, "")
+
+
+def mail_passwort_gespeichert():
+    return bool(get_einstellung(MAIL_PASSWORT_GESCHUETZT))
+
+
+def mail_passwort_laden():
+    """Holt ein gespeichertes Passwort in den Speicher. Auf einem anderen PC oder Windows-Konto klappt das nicht:
+    Dann bleibt es leer und wird beim Senden abgefragt."""
+    if mail_passwort["wert"] or not passwort_speichern_moeglich():
+        return bool(mail_passwort["wert"])
+    gespeichert = get_einstellung(MAIL_PASSWORT_GESCHUETZT)
+    if gespeichert:
+        try:
+            mail_passwort["wert"] = _dpapi(base64.b64decode(gespeichert), False).decode("utf-8")
+        except (OSError, ValueError, AttributeError):
+            pass
+    return bool(mail_passwort["wert"])
+
+
+def mail_passwort_status():
+    return {"passwort_gesetzt": mail_passwort_laden(), "passwort_gespeichert": mail_passwort_gespeichert(),
+            "speichern_moeglich": passwort_speichern_moeglich()}
 
 
 def mail_einstellung(schluessel):
@@ -3544,7 +3612,7 @@ def mail_einstellungen_pruefen():
              if key in ("smtp_server", "smtp_benutzer", "mail_absender") and not mail_einstellung(key)]
     if fehlt:
         raise ValueError("Bitte zuerst unter Verwaltung → E-Mail-Versand ausfüllen: " + ", ".join(fehlt) + ".")
-    if not mail_passwort["wert"]:
+    if not mail_passwort_laden():
         raise ValueError("Bitte das Passwort für das Mail-Konto eingeben.")
 
 
@@ -3574,7 +3642,11 @@ def smtp_verbinden():
         if anmeldung:  # bei der Anmeldung gescheitert: Passwort vergessen, damit es neu eingegeben wird
             mail_passwort["wert"] = ""
         if isinstance(e, smtplib.SMTPAuthenticationError) or (anmeldung and isinstance(e, smtplib.SMTPServerDisconnected)):
-            raise ValueError("Anmeldung am Mailserver fehlgeschlagen: Benutzername oder Passwort stimmen nicht.")
+            hinweis = ""
+            if mail_passwort_gespeichert():  # z. B. Passwort in IServ geändert: altes gespeichertes nicht immer wieder probieren
+                mail_passwort_loeschen()
+                hinweis = " Das gespeicherte Passwort wurde gelöscht, bitte neu eingeben."
+            raise ValueError("Anmeldung am Mailserver fehlgeschlagen: Benutzername oder Passwort stimmen nicht." + hinweis)
         if isinstance(e, smtplib.SMTPNotSupportedError):
             raise ValueError("Der Mailserver kann kein STARTTLS. Probiere „SSL/TLS“ mit Port 465.")
         if isinstance(e, (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected)):
