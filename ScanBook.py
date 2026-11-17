@@ -12,7 +12,6 @@ import getpass
 import hashlib
 import secrets
 import base64
-import bisect
 import ctypes
 import shutil
 import smtplib
@@ -23,14 +22,13 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import xml.etree.ElementTree as ET
-from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.26.0"
+VERSION = "2.26.1"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -1785,24 +1783,6 @@ def natuerlich(text):
     return re.sub(r"\d+", lambda m: m.group(0).zfill(8), (text or "").lower())
 
 
-def laengste_folge(werte):
-    """Positionen der längsten nicht fallenden Teilfolge – diese Bücher können stehen bleiben."""
-    enden, enden_pos, vorgaenger = [], [], [-1] * len(werte)
-    for i, wert in enumerate(werte):
-        k = bisect.bisect_right(enden, wert)
-        if k == len(enden):
-            enden.append(wert)
-            enden_pos.append(i)
-        else:
-            enden[k], enden_pos[k] = wert, i
-        vorgaenger[i] = enden_pos[k - 1] if k else -1
-    folge, i = [], enden_pos[-1] if enden_pos else -1
-    while i != -1:
-        folge.append(i)
-        i = vorgaenger[i]
-    return folge[::-1]
-
-
 def faecher_belegen(buecher, regal, faecher=None, schon_belegt=None):
     """Verteilt die sortierten Bücher auf die Fächer (faecher = Nummern der Fächer, die zur Wahl stehen,
     None = alle; schon_belegt = {Fachnummer: Platz für festgelegte Bücher}). Liefert (Liste je dieser
@@ -1815,8 +1795,9 @@ def faecher_belegen(buecher, regal, faecher=None, schon_belegt=None):
     position = {f: nr for nr, f in enumerate(faecher, 1)}  # echte Fachnummer → 1..anzahl_faecher
     platz = [max(1, b["anzahl"]) for b in buecher]
     gespeichert = [position.get(b["fach"]) if b["regal_id"] == regal["id"] else None for b in buecher]
-    mit_fach = [i for i, f in enumerate(gespeichert) if f]
-    bleiben = {mit_fach[k] for k in laengste_folge([gespeichert[i] for i in mit_fach])}
+    # Bücher, die schon in einem dieser Fächer stehen, bleiben dort – auch wenn sie nach der Sortierung
+    # eigentlich ein Fach weiter gehören. Sonst würde jedes Umstellen die Nachbarn mitverschieben.
+    bleiben = {i for i, f in enumerate(gespeichert) if f}
 
     fach = [None] * len(buecher)
     if not bleiben:
@@ -1840,26 +1821,30 @@ def faecher_belegen(buecher, regal, faecher=None, schon_belegt=None):
                 fach[i] = vorher or erstes
             vorher = fach[i]
 
-    inhalt = [deque() for _ in range(anzahl_faecher + 2)]  # Index 1..n = Fächer, n+1 = passt nicht mehr
+    inhalt = [[] for _ in range(anzahl_faecher + 2)]  # Index 1..n = Fächer, n+1 = passt nicht mehr
     belegt = [0] * (anzahl_faecher + 2)  # mitgezählt statt jedes Mal neu summiert – sonst wird es bei vollen Fächern sehr langsam
     for i, f in enumerate(fach):
         inhalt[f].append(i)
         belegt[f] += platz[i]
 
-    # Zu volle Fächer: erstes Buch ins vorige Fach (wenn dort Platz ist), sonst letztes ins nächste
+    # Zu volle Fächer: Zuerst müssen Bücher weichen, die dort noch nicht stehen (neue oder umzustellende) –
+    # was schon in diesem Fach steht, bleibt stehen. Das vorderste ins vorige Fach (wenn dort Platz ist),
+    # sonst das hinterste ins nächste.
     for f in range(1, anzahl_faecher + 1):
         while belegt[f] > kap[f] and len(inhalt[f]) > (1 if kap[f] else 0):
-            if f > 1 and belegt[f - 1] + platz[inhalt[f][0]] <= kap[f - 1]:
-                i = inhalt[f].popleft()
-                inhalt[f - 1].append(i)
-                belegt[f - 1] += platz[i]
+            neue = [i for i in inhalt[f] if gespeichert[i] != f]
+            kandidaten = neue or inhalt[f]
+            vorne = min(kandidaten)
+            if f > 1 and belegt[f - 1] + platz[vorne] <= kap[f - 1]:
+                i, ziel = vorne, f - 1
             else:
-                i = inhalt[f].pop()
-                inhalt[f + 1].appendleft(i)
-                belegt[f + 1] += platz[i]
+                i, ziel = max(kandidaten), f + 1
+            inhalt[f].remove(i)
+            inhalt[ziel].append(i)
+            belegt[ziel] += platz[i]
             belegt[f] -= platz[i]
-    return ([[buecher[i] for i in inhalt[f]] for f in range(1, anzahl_faecher + 1)],
-            [buecher[i] for i in inhalt[anzahl_faecher + 1]])
+    return ([[buecher[i] for i in sorted(inhalt[f])] for f in range(1, anzahl_faecher + 1)],
+            [buecher[i] for i in sorted(inhalt[anzahl_faecher + 1])])
 
 
 _plan_cache = {"stand": None, "plan": None}
