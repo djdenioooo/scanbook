@@ -742,6 +742,28 @@ def api_fach_scan(body):
     return {"isbn": isbn, "titel": buch["titel"], "vorher": vorher, "jetzt": sb.standort_von(isbn)[0]}
 
 
+
+def api_regalliste_import(body):
+    """Bearbeitete Regalliste einlesen: erst nur ansehen (uebernehmen false), dann übernehmen."""
+    try:
+        daten = base64.b64decode(body.get("datei") or "", validate=True)
+    except (ValueError, TypeError):
+        raise ApiFehler("Die Datei ließ sich nicht hochladen.")
+    if len(daten) > 20 * 1024 * 1024:
+        raise ApiFehler("Die Datei ist zu groß (mehr als 20 MB).")
+    try:
+        ergebnis = sb.regalliste_importieren(daten, uebernehmen=body.get("uebernehmen") is True)
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    regale = sb.lade_regale()
+    for a in ergebnis["aenderungen"]:
+        a["felder"] = [{"feld": f, "alt": alt, "neu": neu} for f, (alt, neu) in a["felder"].items()]
+        a.pop("platz", None)
+        a.pop("datei_platz", None)
+    ergebnis["aenderungen"] = ergebnis["aenderungen"][:1000]
+    ergebnis["regale"] = len(regale)
+    return ergebnis
+
 # --- PROGRAMM-UPDATE ---
 neustart = {"angefordert": False}
 
@@ -1338,6 +1360,7 @@ body { margin: 0; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Helvetica N
 .leiste .grow { flex: 1; min-width: 200px; color: rgba(60,60,67,.7); }
 .leiste button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 8px 16px; background: #007aff; color: #fff; cursor: pointer; }
 .leiste button.zweit { background: rgba(118,118,128,.12); color: #007aff; }
+.leiste a.knopf { font-weight: 600; border-radius: 10px; padding: 8px 16px; background: rgba(118,118,128,.12); color: #007aff; text-decoration: none; }
 .blatt { width: 210mm; height: 297mm; margin: 16px auto; background: #fff; display: grid; align-content: start; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,.1); break-after: page; }
 .barcode { display: block; width: 100%; fill: #000; }
 .leer { padding: 40px; text-align: center; color: rgba(60,60,67,.7); }
@@ -1501,6 +1524,63 @@ def druck_regale(params):
                       seiten, 1, "liste")
 
 
+def druck_umstellen(params):
+    """Liste zum Abarbeiten: welches Buch von wo nach wo muss – sortiert nach dem alten Platz (zum Herausnehmen)
+    oder nach dem neuen Platz (zum Einräumen)."""
+    plan = sb.regal_plan()
+    regale = plan["regale"]
+    nach_ziel = params.get("sortierung") == "nach"
+    mit_neuen = params.get("neu") == "1"
+    reihenfolge = {r["id"]: i for i, r in enumerate(regale)}
+    position = {}
+    for r in regale:
+        for f, inhalt in enumerate(r["inhalt"], 1):
+            for i, b in enumerate(inhalt):
+                position[b["isbn"]] = i
+    bib = sb.get_einstellung("bib_name", "Schulbibliothek")
+    datum = date.today().strftime("%d.%m.%Y")
+
+    def platz_schluessel(platz):
+        return (reihenfolge.get(platz[0], 999), platz[1]) if platz else (-1, 0)
+
+    # Bücher ohne bisherigen Platz nur auf Wunsch – außer sie haben aus einer importierten Regalliste einen neuen Platz
+    buecher = sb.umstellungen(plan) + [b for b in sb.noch_einzuraeumen(plan) if mit_neuen or b.get("ziel")]
+    gruppe = (lambda b: b["soll"]) if nach_ziel else (lambda b: b["ist"])
+    buecher.sort(key=lambda b: (platz_schluessel(gruppe(b)), platz_schluessel(b["soll"] if not nach_ziel else b["ist"]),
+                                position.get(b["isbn"], 0), sb.natuerlich(b["titel"])))
+
+    def titel_von(b):
+        mit_serie = b["serie"] and b["band"] and b["serie"].lower() not in b["titel"].lower()
+        folge = sb.serie_text(b["serie"], b["band"], b["staffel"]) if b["staffel"] else f'{b["serie"]} {b["band"]}'
+        return (f'{folge}: ' if mit_serie else "") + b["titel"]
+
+    zeilen, letzte = [], object()
+    for b in buecher:
+        platz = gruppe(b)
+        if platz != letzte:
+            letzte = platz
+            ueber = sb.standort_text(regale, platz) or "Noch nicht eingeräumt"
+            zeilen.append(f'<tr class="fach"><td colspan="4">{"Nach: " if nach_ziel else "Aus: "}{html.escape(ueber)}</td></tr>')
+        anderer = sb.standort_text(regale, b["ist"] if nach_ziel else b["soll"]) or "noch nicht eingeräumt"
+        zeilen.append(f'<tr><td class="haken">☐</td><td>{html.escape(titel_von(b))}</td><td>{html.escape(b["autor"])}</td>'
+                      f'<td><b>{"" if nach_ziel else "→ "}{html.escape(anderer)}</b></td></tr>')
+    spalte = "Kommt aus" if nach_ziel else "Kommt nach"
+    seite = f"""<h1>Bücher umstellen</h1>
+<div class="unter">{html.escape(bib)} · {len(buecher)} {"Buch" if len(buecher) == 1 else "Bücher"} · Stand {datum} ·
+{"sortiert nach dem neuen Platz (zum Einräumen)" if nach_ziel else "sortiert nach dem alten Platz (zum Herausnehmen)"}</div>
+<table><thead><tr><th class="haken"></th><th>Titel</th><th>Autor</th><th>{spalte}</th></tr></thead>
+<tbody>{"".join(zeilen)}</tbody></table>
+<p class="unter" style="margin-top:12px">Abgehakt? In ScanBook unter „Regale → Zu tun“ die Bücher antippen oder „Erledigt – so eingeräumt“ klicken.</p>"""
+
+    def link(text, **neu):
+        werte = {"sortierung": params.get("sortierung", "von"), "neu": params.get("neu", "0"), **neu}
+        return f'<a class="zweit knopf" href="?{urlencode(werte)}">{html.escape(text)}</a>'
+    steuerung = (link("Nach neuem Platz sortieren", sortierung="nach") if not nach_ziel else link("Nach altem Platz sortieren", sortierung="von"))
+    steuerung += link("Ohne neue Bücher", neu="0") if mit_neuen else link("Neue Bücher (noch einräumen) dazu", neu="1")
+    return druckseite("Umstell-Liste", f"{len(buecher)} Bücher zum Umstellen.", [seite] if buecher else [], 1, "liste",
+                      steuerung=steuerung)
+
+
 def mahn_auswahl(params):
     """Gewählte Vorlage, Personen und Klassen für die Mahnbriefe."""
     try:
@@ -1563,7 +1643,7 @@ def mahnbriefe_docx(params):
         raise ApiFehler(f"Die Word-Vorlage „{name}“ lässt sich nicht verarbeiten: {e}", 500)
 
 
-DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten, "regale": druck_regale,
+DRUCK_ROUTEN = {"ausweise": druck_ausweise, "etiketten": druck_etiketten, "regale": druck_regale, "umstellen": druck_umstellen,
                 "mahnbriefe": druck_mahnbriefe}
 
 
@@ -1615,6 +1695,7 @@ POST_ROUTEN = {
     "buecher_festlegen": api_buecher_festlegen,
     "buecher_freigeben": api_buecher_freigeben,
     "fach_scan": api_fach_scan,
+    "regalliste_import": api_regalliste_import,
     "update_install": api_update_install,
     "logo": api_logo_save,
     "gast": api_gast_save,
@@ -1634,7 +1715,7 @@ POST_ROUTEN = {
     "mail_senden": api_mail_senden,
 }
 
-EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste")
+EXPORT_TYPEN = ("katalog", "ausleihen", "mahnliste", "regalliste")
 
 # Diese Aufrufe bekommen den Handler (angemeldeter Benutzer, Cookie, Adresse) mit
 KONTO_GET = {"anmeldung": api_anmeldung, "benutzer": api_benutzer}
@@ -2426,7 +2507,8 @@ td.titel-zelle { min-width: 220px; }
       <h2>📦 Zu tun</h2>
       <p class="hint" id="regal-aufgaben-text"></p>
       <ul class="log aufgaben" id="regal-umstellen"></ul>
-      <div class="actions"><button class="btn" type="button" id="regal-uebernehmen">Erledigt – so eingeräumt</button></div>
+      <div class="actions"><button class="btn" type="button" id="regal-uebernehmen">Erledigt – so eingeräumt</button>
+        <button class="btn secondary" type="button" id="umstellen-drucken" title="Liste zum Abhaken: welches Buch von wo nach wo">Umstell-Liste drucken</button></div>
     </div>
     <div class="card" id="kategorien-karte">
       <div class="row">
@@ -2464,6 +2546,15 @@ td.titel-zelle { min-width: 220px; }
       <h2>⚠️ Ohne Platz</h2>
       <p class="hint">Diese Bücher passen in kein Regal. Lege mehr Fächer an, erhöhe „Bücher pro Fach“ oder lege ein Regal ohne Genres für alle übrigen Bücher an.</p>
       <ul class="log aufgaben" id="ohne-platz-liste"></ul>
+    </div>
+    <div class="card" id="regalliste-karte">
+      <div class="row">
+        <h2 class="grow" style="margin:0">📤 Regalliste exportieren / importieren</h2>
+        <a href="/export/regalliste.csv"><button class="btn secondary" type="button" id="regalliste-export">Exportieren</button></a>
+        <button class="btn" type="button" id="regalliste-import">Importieren …</button>
+        <input type="file" id="regalliste-datei" accept=".csv,.txt,.xlsx,text/csv" class="hidden">
+      </div>
+      <p class="hint" style="margin-top:8px">Exportieren speichert alle Regale mit allen Fächern und Büchern als Tabelle (öffnet sich in Excel). Darin kannst du <b>Regal</b>, <b>Fach</b>, <b>Regal-Kategorie</b>, Genre, Serie, Staffel und Band ändern – selbst oder du gibst die Datei Claude zum Sortieren. Beim Importieren siehst du zuerst, was sich ändert. Bücher mit neuem Platz stehen danach oben unter „Zu tun“ (von → nach). Ausleihen, Schüler und alles andere bleiben, wie sie sind.</p>
     </div>
   </section>
 
@@ -2823,6 +2914,23 @@ td.titel-zelle { min-width: 220px; }
       <button class="btn secondary" type="button" id="kat-close" style="margin-left:auto">Abbrechen</button>
     </div>
   </form>
+</dialog>
+
+<!-- REGALLISTE IMPORTIEREN -->
+<dialog id="import-regale-dialog" class="breit">
+  <div class="dlg-body">
+    <h2>Regalliste importieren</h2>
+    <p class="hint" id="ir-info"></p>
+    <ul class="log" id="ir-meldungen"></ul>
+    <div class="table-wrap mail-liste"><table>
+      <thead><tr><th style="width:38%">Buch</th><th>Was sich ändert</th></tr></thead>
+      <tbody id="ir-body"></tbody>
+    </table></div>
+    <div class="actions">
+      <button class="btn" type="button" id="ir-uebernehmen">Übernehmen</button>
+      <button class="btn secondary" type="button" id="ir-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- KATEGORIEN ZUORDNEN -->
@@ -4406,6 +4514,48 @@ $("#fs-form").addEventListener("submit", (e) => {
     $("#fs-log").insertAdjacentHTML("afterbegin", `<li><span>📌 <b>${esc(r.titel)}</b> → ${esc(r.jetzt)}</span>${von}</li>`);
   });
 });
+
+// --- Regalliste exportieren / importieren ---
+let importDatei = null;
+const FELD_NAMEN = { kategorie: "Kategorie", genre: "Genre", serie: "Serie", staffel: "Staffel", band: "Band" };
+$("#umstellen-drucken").addEventListener("click", () => drucken("umstellen"));
+$("#regalliste-import").addEventListener("click", () => $("#regalliste-datei").click());
+$("#regalliste-datei").addEventListener("change", (e) => {
+  const datei = e.target.files[0];
+  e.target.value = "";
+  if (!datei) return;
+  const leser = new FileReader();
+  leser.onload = () => {
+    importDatei = leser.result.split(",", 2)[1] || "";
+    versuche(async () => zeigeImport(await post("regalliste_import", { datei: importDatei })));
+  };
+  leser.readAsDataURL(datei);
+});
+function zeigeImport(r) {
+  const n = r.aenderungen.length;
+  $("#ir-info").textContent = `${r.buecher} ${r.buecher === 1 ? "Buch" : "Bücher"} in der Datei gefunden. ` + (n
+    ? `${r.umstellen} ${r.umstellen === 1 ? "Buch bekommt" : "Bücher bekommen"} einen neuen Platz, bei ${r.angaben} ändern sich Kategorie oder Angaben. ` +
+      "Vor dem Übernehmen wird automatisch eine Sicherung gemacht."
+    : "Es ändert sich nichts – alles ist schon so wie in der Datei.");
+  $("#ir-meldungen").innerHTML = [...r.warnungen.map((w) => `<li>⚠️ ${esc(w)}</li>`), ...r.fehler.map((f) => `<li>❌ ${esc(f)}</li>`)].join("");
+  $("#ir-body").innerHTML = r.aenderungen.map((a) => {
+    const teile = [];
+    if (a.nach) teile.push(`📦 ${esc(a.von)} → <b>${esc(a.nach)}</b>`);
+    a.felder.forEach((f) => teile.push(`${FELD_NAMEN[f.feld] || esc(f.feld)}: ${esc(f.alt || "–")} → <b>${esc(f.neu || "–")}</b>`));
+    return `<tr><td><b>${esc(a.titel)}</b><div class="sub">${esc(a.autor)}</div></td><td>${teile.join("<br>")}</td></tr>`;
+  }).join("") + (n > r.aenderungen.length ? `<tr><td colspan="2">… und ${n - r.aenderungen.length} weitere</td></tr>` : "");
+  $("#ir-body").closest(".table-wrap").classList.toggle("hidden", !n);
+  $("#ir-uebernehmen").classList.toggle("hidden", !n);
+  $("#import-regale-dialog").showModal();
+}
+$("#ir-close").addEventListener("click", () => $("#import-regale-dialog").close());
+$("#ir-uebernehmen").addEventListener("click", () => versuche(async () => {
+  const r = await post("regalliste_import", { datei: importDatei, uebernehmen: true });
+  $("#import-regale-dialog").close();
+  toast(r.umstellen ? `Übernommen. ${r.umstellen} ${r.umstellen === 1 ? "Buch hat" : "Bücher haben"} einen neuen Platz – siehe „Zu tun“.` : "Übernommen.");
+  await ladeRegale();
+  $("#regal-aufgaben").scrollIntoView({ behavior: "smooth", block: "start" });
+}));
 
 $("#regale-liste").addEventListener("click", (e) => {
   const d = e.target.dataset;
