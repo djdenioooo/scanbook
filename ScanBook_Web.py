@@ -688,6 +688,27 @@ def api_einraeumen_bestaetigen(body):
     return {"an": bool(body.get("an"))}
 
 
+def api_umstell_text(params):
+    """Versteckte Funktion: Umstell-Liste als Text, eine Zeile pro Buch (z. B. für die Erinnerungen-App).
+    von/bis = Regal-IDs; es zählen die Bücher, deren neuer Platz in diesen Regalen liegt."""
+    plan = sb.regal_plan()
+    regale = plan["regale"]
+    nr = {r["id"]: i for i, r in enumerate(regale)}
+    von = nr.get(int(params["von"])) if str(params.get("von", "")).isdigit() else None
+    bis = nr.get(int(params["bis"])) if str(params.get("bis", "")).isdigit() else None
+    von = 0 if von is None else von
+    bis = len(regale) - 1 if bis is None else bis
+    von, bis = min(von, bis), max(von, bis)
+    buecher = sb.umstellungen(plan) + [b for b in sb.noch_einzuraeumen(plan) if b.get("ziel")]
+    buecher = [b for b in buecher if von <= nr.get(b["soll"][0], -1) <= bis]
+    position = {b["isbn"]: i for r in regale for inhalt in r["inhalt"] for i, b in enumerate(inhalt)}
+    buecher.sort(key=lambda b: (nr[b["soll"][0]], b["soll"][1], position.get(b["isbn"], 0)))
+    zeilen = [{"isbn": b["isbn"],
+               "text": f'{b["titel"]}: {sb.standort_text(regale, b["ist"]) or "noch nicht eingeräumt"} → {sb.standort_text(regale, b["soll"])}'}
+              for b in buecher]
+    return {"zeilen": zeilen, "regale": [{"id": r["id"], "name": r["name"]} for r in regale]}
+
+
 def api_buecher_eingeraeumt(body):
     """Einzelne Bücher als eingeräumt bzw. umgestellt bestätigen."""
     sb.buecher_eingeraeumt(isbn_liste(body))
@@ -1659,6 +1680,7 @@ GET_ROUTEN = {
     "stats": api_stats,
     "settings": api_settings,
     "regale": api_regale,
+    "umstell_text": api_umstell_text,
     "kategorie_zuordnung": api_kategorie_zuordnung,
     "update_check": api_update_check,
     "schueler": api_schueler,
@@ -2504,7 +2526,7 @@ td.titel-zelle { min-width: 220px; }
   <!-- REGALE -->
   <section id="tab-regale">
     <div class="card hidden" id="regal-aufgaben">
-      <h2>📦 Zu tun</h2>
+      <h2 id="zu-tun-titel" style="user-select:none;-webkit-user-select:none;-webkit-touch-callout:none">📦 Zu tun</h2>
       <p class="hint" id="regal-aufgaben-text"></p>
       <ul class="log aufgaben" id="regal-umstellen"></ul>
       <div class="actions"><button class="btn" type="button" id="regal-uebernehmen">Erledigt – so eingeräumt</button>
@@ -2914,6 +2936,24 @@ td.titel-zelle { min-width: 220px; }
       <button class="btn secondary" type="button" id="kat-close" style="margin-left:auto">Abbrechen</button>
     </div>
   </form>
+</dialog>
+
+<!-- UMSTELL-LISTE ALS TEXT (versteckt: lange auf „Zu tun“ drücken) -->
+<dialog id="umstell-text-dialog">
+  <div class="dlg-body">
+    <h2>Umstell-Liste als Text</h2>
+    <p class="hint">Eine Zeile pro Buch – in der Erinnerungen-App eingefügt, wird jede Zeile eine eigene Erinnerung. Die kopierten Bücher werden gleichzeitig als erledigt (umgestellt) markiert.</p>
+    <div class="form-grid">
+      <div><label for="ut-von">Neuer Platz von Regal</label><select id="ut-von"></select></div>
+      <div><label for="ut-bis">bis Regal</label><select id="ut-bis"></select></div>
+    </div>
+    <p class="hint" id="ut-info" style="margin-top:12px"></p>
+    <textarea id="ut-text" rows="8" readonly style="width:100%;font-size:13px"></textarea>
+    <div class="actions">
+      <button class="btn" type="button" id="ut-kopieren">Kopieren und als erledigt markieren</button>
+      <button class="btn secondary" type="button" id="ut-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- REGALLISTE IMPORTIEREN -->
@@ -4514,6 +4554,51 @@ $("#fs-form").addEventListener("submit", (e) => {
     $("#fs-log").insertAdjacentHTML("afterbegin", `<li><span>📌 <b>${esc(r.titel)}</b> → ${esc(r.jetzt)}</span>${von}</li>`);
   });
 });
+
+// --- Versteckt: Umstell-Liste als Text kopieren (lange auf „📦 Zu tun“ drücken, am PC auch Doppelklick) ---
+let utZeilen = [];
+async function ladeUmstellText() {
+  const r = await get("umstell_text", { von: $("#ut-von").value, bis: $("#ut-bis").value });
+  utZeilen = r.zeilen;
+  $("#ut-text").value = utZeilen.map((z) => z.text).join("\n");
+  $("#ut-info").textContent = utZeilen.length ? `${utZeilen.length} ${utZeilen.length === 1 ? "Buch" : "Bücher"}` : "In diesen Regalen muss nichts umgestellt werden.";
+  $("#ut-kopieren").disabled = !utZeilen.length;
+}
+async function oeffneUmstellText() {
+  const r = await get("umstell_text");
+  const optionen = r.regale.map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join("");
+  $("#ut-von").innerHTML = optionen;
+  $("#ut-bis").innerHTML = optionen;
+  if (r.regale.length) $("#ut-bis").value = r.regale[r.regale.length - 1].id;
+  await ladeUmstellText();
+  $("#umstell-text-dialog").showModal();
+}
+{
+  const titel = $("#zu-tun-titel");
+  let timer = null;
+  const stopp = () => clearTimeout(timer);
+  titel.addEventListener("pointerdown", () => { stopp(); timer = setTimeout(() => versuche(oeffneUmstellText), 800); });
+  ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => titel.addEventListener(ev, stopp));
+  titel.addEventListener("dblclick", () => { stopp(); versuche(oeffneUmstellText); });
+  titel.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+["#ut-von", "#ut-bis"].forEach((sel) => $(sel).addEventListener("change", () => versuche(ladeUmstellText)));
+$("#ut-close").addEventListener("click", () => $("#umstell-text-dialog").close());
+$("#ut-kopieren").addEventListener("click", () => versuche(async () => {
+  const text = $("#ut-text").value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const feld = $("#ut-text");
+    feld.focus();
+    feld.select();
+    if (!document.execCommand("copy")) throw new Error("Kopieren hat nicht geklappt – bitte den Text markieren und selbst kopieren.");
+  }
+  const anzahl = utZeilen.length;
+  zeichneRegale(await post("buecher_eingeraeumt", { isbns: utZeilen.map((z) => z.isbn) }));
+  $("#umstell-text-dialog").close();
+  toast(`${anzahl} ${anzahl === 1 ? "Zeile" : "Zeilen"} kopiert und als erledigt markiert`);
+}));
 
 // --- Regalliste exportieren / importieren ---
 let importDatei = null;
