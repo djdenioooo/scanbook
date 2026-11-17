@@ -30,7 +30,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.24.0"
+VERSION = "2.25.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -540,6 +540,10 @@ def init_db():
         if "fest" not in buch_spalten:
             # 1 = selbst in dieses Fach gestellt, der Plan lässt das Buch dort stehen
             cursor.execute("ALTER TABLE buecher ADD COLUMN fest INTEGER DEFAULT 0")
+        # Neuer Platz aus einer importierten Regalliste: Das Buch soll dorthin, steht aber noch am alten Platz
+        for spalte in ("ziel_regal_id", "ziel_fach"):
+            if spalte not in buch_spalten:
+                cursor.execute(f"ALTER TABLE buecher ADD COLUMN {spalte} INTEGER")
 
         # Eigene Genres je Fach: JSON-Liste mit einem Text je Fach ("" = wie das Regal)
         regal_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(regale)")}
@@ -1752,6 +1756,7 @@ def regal_speichern(regal_id, name, faecher, kapazitaet, genres, fach_genres=Non
 def regal_loeschen(regal_id):
     with db_connection() as conn:
         conn.execute("UPDATE buecher SET regal_id = NULL, fach = NULL, fest = 0 WHERE regal_id = ?", (regal_id,))
+        conn.execute("UPDATE buecher SET ziel_regal_id = NULL, ziel_fach = NULL WHERE ziel_regal_id = ?", (regal_id,))
         conn.execute("DELETE FROM regale WHERE id = ?", (regal_id,))
 
 
@@ -1892,12 +1897,12 @@ def regal_plan_berechnen():
     with db_connection() as conn:
         rows = conn.execute('''
             SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach, fest, staffel,
-                   kategorie
+                   kategorie, ziel_regal_id, ziel_fach
             FROM buecher
         ''').fetchall()
     faecher_von = {r["id"]: r["faecher"] for r in regale}
     alle, buecher = [], []
-    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest, staffel, kategorie in rows:
+    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest, staffel, kategorie, ziel_regal, ziel_fach in rows:
         b = {
             "isbn": isbn, "titel": titel or "", "autor": autor or "", "nachname": (nachname or "").lower(),
             # Die Regal-Kategorie zählt wie ein erstes Genre: Ein Regal mit dieser Kategorie bekommt das Buch zuerst
@@ -1909,6 +1914,10 @@ def regal_plan_berechnen():
         b["fest"] = bool(fest and b["ist"] and 1 <= fach <= faecher_von[b["regal_id"]])
         if b["fest"]:
             b["soll"] = b["ist"]
+        # Neuer Platz aus einer importierten Regalliste: zählt wie festgelegt, das Buch muss aber noch umgestellt werden
+        b["ziel"] = (ziel_regal, ziel_fach) if ziel_regal in faecher_von and ziel_fach and 1 <= ziel_fach <= faecher_von[ziel_regal] else None
+        if b["ziel"]:
+            b["fest"], b["soll"] = True, b["ziel"]
         alle.append(b)
         if not b["fest"]:
             buecher.append(b)
@@ -1942,7 +1951,7 @@ def regal_plan_berechnen():
     # der Fächer mit den Genres des Regals. Ein Buch kommt in den Bereich, der zu seinem zuerst
     # eingetragenen Genre passt (bei "Krieg, Geschichte" also zu Krieg, sonst zu Geschichte).
     for regal in regale:
-        regal["fest"] = [sorted((b for b in alle if b["fest"] and b["regal_id"] == regal["id"] and b["fach"] == f),
+        regal["fest"] = [sorted((b for b in alle if b["fest"] and b["soll"] == (regal["id"], f)),
                                 key=lambda b: (b["nachname"], natuerlich(b["serie"]), folge_in_serie(b), natuerlich(b["titel"])))
                          for f in range(1, regal["faecher"] + 1)]
         regal["schon_belegt"] = {f: sum(max(1, b["anzahl"]) for b in fest) for f, fest in enumerate(regal["fest"], 1)}
@@ -2039,7 +2048,14 @@ def buecher_eingeraeumt(isbns):
     with db_connection() as conn:
         for (regal_id, fach), isbn in plaetze:
             conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (regal_id, fach, isbn))
+            ziel_erreicht(conn, plan["buecher"][isbn])
     return len(plaetze)
+
+
+def ziel_erreicht(conn, b):
+    """Ein Buch mit neuem Platz aus der Regalliste steht jetzt dort: ab jetzt ganz normal festgelegt."""
+    if b.get("ziel"):
+        conn.execute("UPDATE buecher SET fest = 1, ziel_regal_id = NULL, ziel_fach = NULL WHERE isbn = ?", (b["isbn"],))
 
 
 def plan_uebernehmen():
@@ -2049,6 +2065,7 @@ def plan_uebernehmen():
         for isbn, b in plan["buecher"].items():
             regal_id, fach = b["soll"] or (None, None)
             conn.execute("UPDATE buecher SET regal_id = ?, fach = ? WHERE isbn = ?", (regal_id, fach, isbn))
+            ziel_erreicht(conn, b)
 
 
 def buecher_festlegen(isbns, regal_id, fach):
@@ -2058,7 +2075,7 @@ def buecher_festlegen(isbns, regal_id, fach):
     if not regal or not 1 <= fach <= regal["faecher"]:
         raise ValueError("Dieses Fach gibt es nicht (mehr).")
     with db_connection() as conn:
-        return sum(conn.execute("UPDATE buecher SET regal_id = ?, fach = ?, fest = 1 WHERE isbn = ?",
+        return sum(conn.execute("UPDATE buecher SET regal_id = ?, fach = ?, fest = 1, ziel_regal_id = NULL, ziel_fach = NULL WHERE isbn = ?",
                                 (regal_id, fach, isbn)).rowcount for isbn in isbns)
 
 
@@ -2066,7 +2083,8 @@ def buecher_freigeben(isbns):
     """Festgelegte Bücher wieder automatisch einsortieren. Sie bleiben vorerst stehen, wo sie sind –
     der Plan schlägt eine Umstellung vor, wenn sie woanders besser hinpassen."""
     with db_connection() as conn:
-        return sum(conn.execute("UPDATE buecher SET fest = 0 WHERE isbn = ? AND fest = 1", (isbn,)).rowcount
+        return sum(conn.execute("UPDATE buecher SET fest = 0, ziel_regal_id = NULL, ziel_fach = NULL "
+                                "WHERE isbn = ? AND (fest = 1 OR ziel_regal_id IS NOT NULL)", (isbn,)).rowcount
                    for isbn in isbns)
 
 
@@ -2119,6 +2137,306 @@ def standorte(plan=None):
         platz = b["ist"] or b["soll"]
         ergebnis[isbn] = (standort_text(plan["regale"], platz), platz[0], not b["ist"]) if platz else ("", None, False)
     return ergebnis
+
+
+# --- REGALLISTE EXPORTIEREN / IMPORTIEREN ---
+# Eine Tabelle mit allen Regalen, Fächern und Büchern (CSV, öffnet sich in Excel). Man kann darin Regal, Fach,
+# Kategorie, Genre, Serie, Staffel und Band ändern (selbst oder z. B. von Claude sortieren lassen) und sie wieder
+# einlesen. Ausleihen, Schüler, Exemplare usw. bleiben dabei unberührt. Bücher mit neuem Platz stehen danach
+# unter „Zu tun“ (von → nach), bis sie umgestellt sind.
+REGALLISTE_KOPF = ["Regal", "Fach", "Fach-Kategorie", "Bücher pro Fach", "Platz", "ISBN", "Titel", "Autor", "Serie",
+                   "Staffel", "Band", "Regal-Kategorie", "Genre", "Exemplare", "Status"]
+REGALLISTE_SPALTEN = {
+    "regal": "regal", "regalname": "regal", "fach": "fach", "fachnr": "fach", "fachnummer": "fach",
+    "isbn": "isbn", "isbn13": "isbn", "code": "isbn", "titel": "titel", "buchtitel": "titel",
+    "autor": "autor", "autoren": "autor", "autor(en)": "autor", "serie": "serie", "reihe": "serie",
+    "staffel": "staffel", "band": "band", "regalkategorie": "kategorie", "kategorie": "kategorie",
+    "genre": "genre", "genres": "genre",
+}
+
+
+def regalliste_daten():
+    """(Kopfzeile, Zeilen): jedes Fach mit seinen Büchern in der Reihenfolge im Regal, leere Fächer als eigene
+    Zeile, am Ende die Bücher ohne Platz."""
+    plan = regal_plan()
+    regale = plan["regale"]
+    with db_connection() as conn:
+        roh = {r[0]: r[1:] for r in conn.execute("SELECT isbn, genre, kategorie FROM buecher")}
+
+    def status(b):
+        if b["ist"] and b["soll"] and b["ist"] != b["soll"]:
+            return f"umstellen (steht noch in {standort_text(regale, b['ist'])})"
+        if not b["ist"]:
+            return "noch einräumen"
+        return "festgelegt" if b["fest"] else "steht drin"
+
+    def buch_spalten(b):
+        genre, kategorie = roh.get(b["isbn"], ("", ""))
+        return [b["isbn"], b["titel"], b["autor"], b["serie"], b["staffel"], b["band"], kategorie or "",
+                ", ".join(genre_liste(genre)), b["anzahl"], status(b)]
+
+    zeilen = []
+    for r in regale:
+        for f, inhalt in enumerate(r["inhalt"], 1):
+            genres = r["fach_genres"][f - 1] or r["genres"]
+            fach = [r["name"], f, ", ".join(genres) or "alle übrigen Bücher", r["fach_kap"][f - 1]]
+            if not inhalt:
+                zeilen.append(fach + ["", "", "", "", "", "", "", "", "", "", "leeres Fach"])
+            for platz, b in enumerate(inhalt, 1):
+                zeilen.append(fach + [platz] + buch_spalten(b))
+    for b, grund in plan["ohne_platz"]:
+        zeilen.append(["", "", "", "", ""] + buch_spalten(b)[:-1]
+                      + ["kein Platz (passende Regale sind voll)" if grund == "voll" else "kein Platz (kein passendes Regal)"])
+    return REGALLISTE_KOPF, zeilen
+
+
+def xlsx_zeilen(daten):
+    """Erstes Tabellenblatt einer Excel-Datei (.xlsx) als Liste von Zeilen (nur Texte und Zahlen)."""
+    import zipfile
+    import io
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(daten)) as z:
+        texte = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(ns + "si"):
+                texte.append("".join(t.text or "" for t in si.iter(ns + "t")))
+        blaetter = sorted(n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+        if not blaetter:
+            raise ValueError("In der Excel-Datei ist kein Tabellenblatt.")
+        blatt = ET.fromstring(z.read("xl/worksheets/sheet1.xml" if "xl/worksheets/sheet1.xml" in blaetter else blaetter[0]))
+    zeilen = []
+    for row in blatt.iter(ns + "row"):
+        zeile = []
+        for c in row.iter(ns + "c"):
+            spalte = 0
+            for buchstabe in re.match(r"[A-Z]*", c.get("r", "")).group(0):
+                spalte = spalte * 26 + ord(buchstabe) - 64
+            spalte = spalte - 1 if spalte else len(zeile)
+            v = c.find(ns + "v")
+            if c.get("t") == "s" and v is not None:
+                wert = texte[int(v.text)]
+            elif c.get("t") == "inlineStr":
+                wert = "".join(t.text or "" for t in c.iter(ns + "t"))
+            else:
+                wert = v.text if v is not None and v.text else ""
+                if re.fullmatch(r"-?\d+\.0+", wert):
+                    wert = wert.split(".")[0]
+            zeile += [""] * (spalte - len(zeile)) + [wert]
+        zeilen.append(zeile)
+    return zeilen
+
+
+def regalliste_lesen(daten):
+    """Zeilen aus einer CSV- oder Excel-Datei (Bytes) oder aus Text (z. B. aus Excel kopiert)."""
+    if isinstance(daten, bytes):
+        if daten[:2] == b"PK":
+            try:
+                return xlsx_zeilen(daten)
+            except (KeyError, ET.ParseError, ValueError, IndexError) as e:
+                raise ValueError(f"Die Excel-Datei lässt sich nicht lesen ({e}). Speichere sie bitte als CSV.")
+        try:
+            daten = daten.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            daten = daten.decode("cp1252", errors="replace")  # Excel speichert „CSV (Trennzeichen-getrennt)“ so
+    zeilen = [z for z in daten.lstrip("﻿").splitlines() if z.strip()]
+    if not zeilen:
+        return []
+    trenner = max("\t;,", key=zeilen[0].count)
+    return list(csv.reader(zeilen, delimiter=trenner))
+
+
+def _regal_spalte(name):
+    return REGALLISTE_SPALTEN.get(re.sub(r"[\s\-_.]", "", str(name or "").strip().lower()))
+
+
+def regalliste_importieren(daten, uebernehmen=False):
+    """Liest eine (bearbeitete) Regalliste ein. Ohne uebernehmen wird nur gezeigt, was sich ändern würde.
+    Bücher werden über die ISBN gefunden (sonst über Titel und Autor). Ein neuer Platz wird als Ziel gemerkt:
+    Das Buch erscheint unter „Zu tun“ (von → nach) und bleibt danach fest in diesem Fach."""
+    zeilen = regalliste_lesen(daten)
+    if not zeilen:
+        raise ValueError("Die Datei ist leer.")
+    kopf = [_regal_spalte(z) for z in zeilen[0]]
+    if "isbn" not in kopf and "titel" not in kopf:
+        raise ValueError("In der ersten Zeile fehlen die Spaltennamen (mindestens „ISBN“ oder „Titel“). "
+                         "Bitte eine Datei nehmen, die mit „Regalliste exportieren“ erstellt wurde.")
+    spalten = {}
+    for i, feld in enumerate(kopf):
+        if feld:
+            spalten.setdefault(feld, i)
+
+    plan = regal_plan()
+    regale = plan["regale"]
+    regal_nach_name = {}
+    for r in regale:
+        regal_nach_name.setdefault(" ".join(r["name"].split()).lower(), r)
+    with db_connection() as conn:
+        db = {r[0]: {"isbn": r[0], "titel": r[1] or "", "autor": r[2] or "", "autoren": r[3] or "", "kategorie": r[4] or "",
+                     "genre": r[5] or "", "serie": r[6] or "", "staffel": r[7] or "", "band": r[8] or ""}
+              for r in conn.execute("SELECT isbn, titel, autor_formatiert, autoren, kategorie, genre, serie, staffel, band FROM buecher")}
+    nach_code = {}
+    for isbn in db:
+        nach_code.setdefault(re.sub(r"[^0-9A-Z]", "", isbn.upper()), isbn)
+    nach_titel = {}
+    for b in db.values():
+        nach_titel.setdefault(b["titel"].strip().lower(), []).append(b)
+    namen = kategorie_namen()
+
+    def lose(name):
+        """Ohne Satzzeichen vergleichen: „Krimi - Thriller - Grusel“ = „Krimi · Thriller · Grusel“."""
+        return re.sub(r"[^0-9a-zäöüß]", "", str(name or "").lower().replace("&", "").replace(" und ", ""))
+    nach_lose = {lose(n): n for n in namen}
+
+    def wert(zeile, feld):
+        i = spalten.get(feld)
+        return " ".join(str(zeile[i]).split()) if i is not None and i < len(zeile) else None
+
+    def buch_finden(zeile):
+        code = wert(zeile, "isbn") or ""
+        if code:
+            for versuch in (code, re.sub(r"[^0-9A-Z]", "", code.upper()), normalize_isbn(code)):
+                if versuch in db:
+                    return db[versuch]
+                if versuch and versuch in nach_code:
+                    return db[nach_code[versuch]]
+        titel = (wert(zeile, "titel") or "").lower()
+        kandidaten = nach_titel.get(titel, [])
+        autor = (wert(zeile, "autor") or "").lower()
+        if len(kandidaten) > 1 and autor:
+            kandidaten = [b for b in kandidaten if autor in (b["autor"].lower(), b["autoren"].lower())]
+        return kandidaten[0] if len(kandidaten) == 1 else None
+
+    aenderungen, fehler, gesehen = [], [], set()
+    neue_belegung = {}
+    for nr, zeile in enumerate(zeilen[1:], 2):
+        if not (wert(zeile, "isbn") or wert(zeile, "titel")):
+            continue  # Zeile für ein leeres Fach
+        b = buch_finden(zeile)
+        beschreibung = wert(zeile, "titel") or wert(zeile, "isbn")
+        if not b:
+            fehler.append(f"Zeile {nr}: „{beschreibung}“ gibt es nicht im Katalog – übersprungen.")
+            continue
+        if b["isbn"] in gesehen:
+            fehler.append(f"Zeile {nr}: „{b['titel']}“ steht mehrmals in der Liste – nur die erste Zeile zählt.")
+            continue
+        gesehen.add(b["isbn"])
+        p = plan["buecher"].get(b["isbn"], {})
+        aenderung = {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "felder": {}}
+
+        # Platz
+        regal_text, fach_text = wert(zeile, "regal") or "", wert(zeile, "fach") or ""
+        if regal_text or fach_text:
+            regal = regal_nach_name.get(regal_text.lower())
+            fach = re.search(r"\d+", fach_text)
+            fach = int(fach.group(0)) if fach else 0
+            if not regal:
+                fehler.append(f"Zeile {nr}: Regal „{regal_text}“ gibt es nicht – Platz von „{b['titel']}“ bleibt, wie er ist."
+                              if regal_text else f"Zeile {nr}: Bei „{b['titel']}“ fehlt das Regal – Platz bleibt, wie er ist.")
+            elif not 1 <= fach <= regal["faecher"]:
+                fehler.append(f"Zeile {nr}: „{regal['name']}“ hat kein Fach „{fach_text}“ (1–{regal['faecher']}) – "
+                              f"Platz von „{b['titel']}“ bleibt, wie er ist.")
+            else:
+                neu = (regal["id"], fach)
+                neue_belegung.setdefault(neu, []).append(p.get("anzahl", 1))
+                aenderung["datei_platz"] = neu
+                if neu != p.get("soll"):
+                    aenderung["platz"] = neu
+                    aenderung["von"] = standort_text(regale, p.get("ist")) or "noch nicht eingeräumt"
+                    aenderung["nach"] = standort_text(regale, neu)
+
+        # Kategorie und Buchangaben
+        kat = wert(zeile, "kategorie")
+        if kat is not None and lose(kat) != lose(b["kategorie"]):
+            gefunden = kategorie_finden(kat, namen) or nach_lose.get(lose(kat), "")
+            if kat and not gefunden:
+                fehler.append(f"Zeile {nr}: Kategorie „{kat}“ steht nicht in der Liste der Regal-Kategorien – "
+                              f"bei „{b['titel']}“ bleibt „{b['kategorie'] or 'keine'}“.")
+            else:
+                aenderung["felder"]["kategorie"] = (b["kategorie"], gefunden)
+        genre = wert(zeile, "genre")
+        if genre is not None and [g.lower() for g in genre_liste(genre)] != [g.lower() for g in genre_liste(b["genre"])]:
+            aenderung["felder"]["genre"] = (", ".join(genre_liste(b["genre"])), ", ".join(genre_liste(genre)))
+        for feld, normal in (("serie", str.strip), ("staffel", staffel_normalisieren), ("band", band_normalisieren)):
+            neu_wert = wert(zeile, feld)
+            if neu_wert is not None and normal(neu_wert) != normal(b[feld]):
+                aenderung["felder"][feld] = (b[feld], normal(neu_wert))
+        if "platz" in aenderung or aenderung["felder"]:
+            aenderungen.append(aenderung)
+        aenderung.setdefault("datei_platz", None)
+
+    # Hinweis, wenn in ein Fach mehr Bücher sollen, als hineinpassen
+    warnungen = []
+    ziele = {a["platz"] for a in aenderungen if "platz" in a}
+    for r in regale:
+        for f in range(1, r["faecher"] + 1):
+            if (r["id"], f) in ziele and sum(neue_belegung[(r["id"], f)]) > r["fach_kap"][f - 1]:
+                warnungen.append(f"{r['name']}, Fach {f}: {sum(neue_belegung[(r['id'], f)])} Bücher laut Liste, "
+                                 f"Platz für {r['fach_kap'][f - 1]}. Andere Bücher aus diesem Fach rutschen dann weiter.")
+
+    ergebnis = {"zeilen": len(zeilen) - 1, "buecher": len(gesehen), "aenderungen": aenderungen,
+                "umstellen": sum(1 for a in aenderungen if "platz" in a),
+                "angaben": sum(1 for a in aenderungen if a["felder"]), "fehler": fehler, "warnungen": warnungen,
+                "uebernommen": False, "backup": ""}
+    if not uebernehmen or not aenderungen:
+        return ergebnis
+
+    ergebnis["backup"] = os.path.basename(erstelle_backup("vor_import"))
+    with db_connection() as conn:
+        for a in aenderungen:
+            # Der Platz aus der Datei zählt – auch wenn sich nur die Kategorie geändert hat, bleibt das Buch dort
+            if a["datei_platz"]:
+                p = plan["buecher"].get(a["isbn"], {})
+                if a["datei_platz"] == p.get("ist"):
+                    # Steht schon dort: einfach dort lassen
+                    conn.execute("UPDATE buecher SET fest = 1, ziel_regal_id = NULL, ziel_fach = NULL WHERE isbn = ?", (a["isbn"],))
+                else:
+                    conn.execute("UPDATE buecher SET ziel_regal_id = ?, ziel_fach = ? WHERE isbn = ?", (*a["datei_platz"], a["isbn"]))
+            for feld, (_, neu_wert) in a["felder"].items():
+                conn.execute(f"UPDATE buecher SET {feld} = ? WHERE isbn = ?", (neu_wert, a["isbn"]))
+    ergebnis["uebernommen"] = True
+    return ergebnis
+
+
+def regalliste_exportieren():
+    kopf, zeilen = regalliste_daten()
+    exportiere_csv("regalliste", kopf, zeilen)
+
+
+def regalliste_import_menue():
+    print("\nDie Datei muss mit „Regalliste exportieren“ erstellt worden sein (CSV oder Excel).")
+    print("Geändert werden nur Regal, Fach, Regal-Kategorie, Genre, Serie, Staffel und Band – Ausleihen bleiben, wie sie sind.")
+    pfad = input("Pfad zur Datei (oder Datei hier hineinziehen, [ENTER] = abbrechen): ").strip().strip('"').strip("'")
+    if not pfad:
+        return
+    try:
+        with open(pfad, "rb") as f:
+            daten = f.read()
+        ergebnis = regalliste_importieren(daten)
+    except (OSError, ValueError) as e:
+        print(f"❌ {e}")
+        return
+    regalliste_ergebnis_zeigen(ergebnis)
+    if ergebnis["aenderungen"] and ja_nein("\nSo übernehmen? (Vorher wird automatisch eine Sicherung gemacht.)"):
+        ergebnis = regalliste_importieren(daten, uebernehmen=True)
+        print(f"✅ Übernommen. Sicherung: {ergebnis['backup']}")
+        if ergebnis["umstellen"]:
+            print("📦 Die Bücher mit neuem Platz stehen im Einräumplan (Punkt 5) unter „Umstellen“.")
+
+
+def regalliste_ergebnis_zeigen(ergebnis):
+    print(f"\n{ergebnis['buecher']} Bücher in der Liste gefunden.")
+    if not ergebnis["aenderungen"]:
+        print("Nichts geändert – alles ist schon so wie in der Liste.")
+    for a in ergebnis["aenderungen"][:200]:
+        teile = [f"{a['von']} → {a['nach']}"] if "platz" in a else []
+        teile += [f"{feld.capitalize()}: „{alt}“ → „{neu}“" for feld, (alt, neu) in a["felder"].items()]
+        print(f"  • {a['titel']}: {'; '.join(teile)}")
+    if len(ergebnis["aenderungen"]) > 200:
+        print(f"  … und {len(ergebnis['aenderungen']) - 200} weitere")
+    for w in ergebnis["warnungen"]:
+        print(f"⚠️ {w}")
+    for f in ergebnis["fehler"]:
+        print(f"❌ {f}")
 
 
 def zahl_eingabe(prompt, standard):
@@ -2238,8 +2556,10 @@ def regale_menue():
         print("6. Alles eingeräumt – Plan übernehmen")
         print("7. Bücher selbst in ein Fach stellen (scannen)")
         print("8. Festgelegte Bücher wieder automatisch einsortieren (scannen)")
-        print("9. Zurück zum Hauptmenü")
-        wahl = input("\nWähle eine Option (1-9): ").strip()
+        print("9. Regalliste exportieren (alle Regale mit allen Büchern, für Excel)")
+        print("10. Regalliste importieren (geänderte Plätze und Kategorien übernehmen)")
+        print("11. Zurück zum Hauptmenü")
+        wahl = input("\nWähle eine Option (1-11): ").strip()
 
         if wahl == "1":
             regal_formular()
@@ -2267,6 +2587,12 @@ def regale_menue():
         elif wahl == "8":
             fach_einraeumen(plan, freigeben=True)
         elif wahl == "9":
+            regalliste_exportieren()
+            warte()
+        elif wahl == "10":
+            regalliste_import_menue()
+            warte()
+        elif wahl == "11":
             return
         else:
             print("Ungültige Eingabe.")
@@ -3198,7 +3524,9 @@ def exportiere_csv(praefix, kopfzeile, zeilen):
 
 
 def export_daten(typ):
-    """Liefert (Kopfzeile, Zeilen) für 'katalog', 'ausleihen' oder 'mahnliste'."""
+    """Liefert (Kopfzeile, Zeilen) für 'katalog', 'ausleihen', 'mahnliste' oder 'regalliste'."""
+    if typ == "regalliste":
+        return regalliste_daten()
     with db_connection() as conn:
         if typ == "katalog":
             zeilen = conn.execute('''
