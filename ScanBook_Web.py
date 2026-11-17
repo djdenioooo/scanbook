@@ -73,7 +73,8 @@ def tage_bis(iso_datum):
 def buchdaten_aus(body):
     return sb.neue_buchdaten(*(text(body, feld) for feld, _ in sb.BUCH_FELDER),
                              **{feld: text(body, feld) for feld, _ in sb.SERIEN_FELDER},
-                             **{feld: text(body, feld) for feld in sb.ZUSATZ_FELDER})
+                             **{feld: text(body, feld) for feld in sb.ZUSATZ_FELDER},
+                             kategorie=text(body, sb.KATEGORIE_FELD))
 
 
 def fehlende_felder(daten):
@@ -88,17 +89,18 @@ def api_info(_):
         "schulname": sb.get_einstellung("schulname"),
         "standard_leihdauer": sb.get_einstellung_int("standard_leihdauer", 14),
         "einraeumen_bestaetigen": sb.get_einstellung(sb.EINRAEUMEN_BESTAETIGEN) == "1",
+        "kategorien": sb.kategorien(),
     }
 
 
 def api_books(params):
     suche = params.get("q", "").strip()
-    sql = f"SELECT {sb.BUCH_SPALTEN}, autoren, verlag, cover_url FROM buecher"
+    sql = f"SELECT {sb.BUCH_SPALTEN}, autoren, verlag, cover_url, kategorie FROM buecher"
     werte = ()
     if suche:
         muster = f"%{sb.normalize_isbn(suche) or suche}%"
-        sql += " WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ? OR verlag LIKE ? OR serie LIKE ?"
-        werte = (muster,) * 6
+        sql += " WHERE titel LIKE ? OR autoren LIKE ? OR genre LIKE ? OR isbn LIKE ? OR verlag LIKE ? OR serie LIKE ? OR kategorie LIKE ?"
+        werte = (muster,) * 7
     with sb.db_connection() as conn:
         rows = conn.execute(sql + " ORDER BY autor_nachname, titel", werte).fetchall()
         codes = {}
@@ -115,7 +117,7 @@ def api_books(params):
             "autor": r[0], "titel": r[1], "jahr": r[2], "genre": r[3], "gesamt": r[4],
             "verfuegbar": r[5], "isbn": r[6], "serie": r[7] or "", "band": r[8] or "", "staffel": r[9] or "", "autoren": r[10], "verlag": r[11],
             "standort": ort, "geplant": geplant, "regal": regal_name.get(regal_id, ""), "regal_nr": regal_nr.get(regal_id, -1),
-            "cover_url": r[12] or "", "codes": " ".join(codes.get(r[6], [])),
+            "cover_url": r[12] or "", "codes": " ".join(codes.get(r[6], [])), "kategorie": r[13] or "",
         })
     return buecher
 
@@ -312,7 +314,7 @@ def api_book_update(body):
     if not text(body, "titel"):
         raise ApiFehler("Bitte einen Titel eingeben.")
     daten = buchdaten_aus(body)
-    felder = [f for f, _ in sb.BUCH_FELDER + sb.SERIEN_FELDER] + ["beschreibung"]
+    felder = [f for f, _ in sb.BUCH_FELDER + sb.SERIEN_FELDER] + ["beschreibung", sb.KATEGORIE_FELD]
     sb.buch_aktualisieren(isbn, {f: daten[f] for f in felder})
     return buch_oder_fehler(isbn)
 
@@ -552,7 +554,8 @@ def gast_book(params):
 
 def gast_info(_):
     return {"version": sb.VERSION, "bib_name": sb.get_einstellung("bib_name", "Schulbibliothek"),
-            "schulname": sb.get_einstellung("schulname"), "standard_leihdauer": 0, "einraeumen_bestaetigen": False}
+            "schulname": sb.get_einstellung("schulname"), "standard_leihdauer": 0, "einraeumen_bestaetigen": False,
+            "kategorien": sb.kategorien()}
 
 
 GAST_ROUTEN = {"books": gast_books, "book": gast_book, "info": gast_info}
@@ -600,7 +603,7 @@ def backups_im_hintergrund():
 # --- REGALE ---
 def regal_buch(regale, b):
     return {"isbn": b["isbn"], "titel": b["titel"], "autor": b["autor"], "serie": b["serie"], "band": b["band"],
-            "staffel": b["staffel"], "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]),
+            "staffel": b["staffel"], "anzahl": b["anzahl"], "genre": ", ".join(b["genres"]), "kategorie": b["kategorie"],
             "neu": not b["ist"], "von": sb.standort_text(regale, b["ist"]) if b["ist"] != b["soll"] else "",
             "fest": b["fest"], "nach": sb.standort_text(regale, b["soll"])}
 
@@ -618,7 +621,9 @@ def api_regale(_):
         "umstellen": [regal_buch(regale, b) for b in sb.umstellungen(plan)],
         "einraeumen": len(sb.noch_einzuraeumen(plan)),
         "ohne_platz": [dict(regal_buch(regale, b), grund=grund) for b, grund in plan["ohne_platz"]],
+        "ohne_kategorie": sum(1 for b in plan["buecher"].values() if not b["kategorie"]),
         "genres": sb.alle_genres(),
+        "kategorien": sb.kategorien(),
     }
 
 
@@ -638,6 +643,28 @@ def api_regal_save(body):
     fach_kap = [positive_zahl(k, 0) for k in fach_kap] if isinstance(fach_kap, list) else None
     sb.regal_speichern(regal_id, name, faecher, kapazitaet, sb.genre_liste(text(body, "genres")), fach_genres, fach_kap)
     return api_regale(None)
+
+
+# --- REGAL-KATEGORIEN ---
+def api_kategorien_save(body):
+    liste = body.get("kategorien")
+    if not isinstance(liste, list) or not all(isinstance(k, dict) for k in liste):
+        raise ApiFehler("Die Kategorien fehlen.")
+    try:
+        return {"kategorien": sb.kategorien_speichern(liste)}
+    except ValueError as e:
+        raise ApiFehler(str(e))
+
+
+def api_kategorie_zuordnung(_):
+    return {"gruppen": sb.kategorie_zuordnung(), "kategorien": sb.kategorien()}
+
+
+def api_kategorien_zuordnen(body):
+    zuordnung = body.get("zuordnung")
+    if not isinstance(zuordnung, dict):
+        raise ApiFehler("Die Zuordnung fehlt.")
+    return {"geaendert": sb.kategorien_zuordnen(zuordnung)}
 
 
 def api_regal_delete(body):
@@ -1429,6 +1456,14 @@ def druck_regale(params):
             raise ApiFehler("Dieses Regal gibt es nicht (mehr).", 404)
     bib = sb.get_einstellung("bib_name", "Schulbibliothek")
     datum = date.today().strftime("%d.%m.%Y")
+    farben = {k["name"].lower(): k["farbe"] for k in sb.kategorien()}
+
+    def mit_farbe(genres):
+        """Genres als Text, Regal-Kategorien mit ihrem Farbpunkt davor."""
+        return ", ".join(
+            (f'<span style="display:inline-block;width:.7em;height:.7em;border-radius:50%;margin-right:3px;'
+             f'background:{farben[g.lower()]};print-color-adjust:exact;-webkit-print-color-adjust:exact"></span>'
+             if g.lower() in farben else "") + html.escape(g) for g in genres)
 
     def zeile(b):
         mit_serie = b["serie"] and b["band"] and b["serie"].lower() not in b["titel"].lower()
@@ -1438,7 +1473,7 @@ def druck_regale(params):
                    f'steht noch in {sb.standort_text(plan["regale"], b["ist"])}' if b["ist"] != b["soll"] else "")
         return (f'<tr><td class="haken">☐</td><td>{html.escape(titel)}'
                 f'{f"""<div class="hinweis">{html.escape(hinweis)}</div>""" if hinweis else ""}</td>'
-                f'<td>{html.escape(b["autor"])}</td><td>{html.escape(", ".join(b["genres"]))}</td>'
+                f'<td>{html.escape(b["autor"])}</td><td>{mit_farbe(b["genres"])}</td>'
                 f'<td class="anz">{b["anzahl"]}</td></tr>')
 
     seiten, gesamt = [], 0
@@ -1449,7 +1484,7 @@ def druck_regale(params):
             gesamt += n
             genres = r["fach_genres"][nr - 1] or r["genres"]
             zeilen.append(f'<tr class="fach"><td colspan="5">Fach {nr}<span class="sub">{n}/{r["fach_kap"][nr - 1]} Bücher'
-                          f'{" · " + html.escape(", ".join(genres)) if genres else ""}</span></td></tr>')
+                          f'{" · " + mit_farbe(genres) if genres else ""}</span></td></tr>')
             zeilen += [zeile(b) for b in fach] or ['<tr class="leer"><td></td><td colspan="4">leer</td></tr>']
         seiten.append(f"""<h1>{html.escape(r["name"])}</h1>
 <div class="unter">{html.escape(bib)} · {r["faecher"]} Fächer · Stand {datum}</div>
@@ -1544,6 +1579,7 @@ GET_ROUTEN = {
     "stats": api_stats,
     "settings": api_settings,
     "regale": api_regale,
+    "kategorie_zuordnung": api_kategorie_zuordnung,
     "update_check": api_update_check,
     "schueler": api_schueler,
     "code": api_code,
@@ -1570,6 +1606,8 @@ POST_ROUTEN = {
     "backup_ordner": api_backup_ordner,
     "regal_save": api_regal_save,
     "regal_delete": api_regal_delete,
+    "kategorien": api_kategorien_save,
+    "kategorien_zuordnen": api_kategorien_zuordnen,
     "regal_move": api_regal_move,
     "regale_uebernehmen": api_regale_uebernehmen,
     "buecher_eingeraeumt": api_buecher_eingeraeumt,
@@ -2161,6 +2199,22 @@ dialog.breit { width: min(760px, calc(100vw - 32px)); }
 .auswahl-leiste b { margin-right: auto; }
 @media (max-width: 860px) { .auswahl-leiste { bottom: calc(72px + env(safe-area-inset-bottom)); } }
 .fach-wahl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Regal-Kategorien: Farbpunkt vor dem Namen, Auswahlfeld mit Punkt */
+.kat-punkt { display: inline-block; width: .7em; height: .7em; border-radius: 50%; margin-right: 5px; vertical-align: .02em; flex: none; background: var(--kat, transparent); }
+.kat-feld { position: relative; }
+.kat-feld select { width: 100%; padding-left: 32px; }
+.kat-feld .kat-punkt { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); margin: 0; pointer-events: none; }
+.kat-feld .kat-punkt.leer { box-shadow: inset 0 0 0 1.5px var(--muted); }
+.kat-name { white-space: nowrap; }
+.genre-klein { display: block; font-size: 12px; color: var(--muted); }
+.kat-liste { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0 10px; font-size: 14px; }
+.kat-liste span { white-space: nowrap; }
+.kat-liste .sub { color: var(--muted); font-size: 12px; margin-left: 3px; }
+.kat-zeilen { display: grid; grid-template-columns: 44px 1fr auto; gap: 8px 10px; align-items: center; margin: 12px 0; }
+.kat-zeilen input[type="color"] { width: 44px; height: 36px; padding: 2px; border-radius: 9px; cursor: pointer; }
+.zuordnung-liste select { width: 100%; min-width: 180px; }
+.fach-genres .fach-kat { grid-column: 2 / span 2; }
+#katalog-kategorie { max-width: 240px; }
 .legende { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 6px; }
 .legende .buch-chip { cursor: default; }
 .aufgaben li { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
@@ -2284,7 +2338,8 @@ td.titel-zelle { min-width: 220px; }
         <button class="btn" type="submit">Hinzufügen</button>
       </form>
       <form id="kategorie-form" class="row hidden" style="margin-top:10px">
-        <input id="kategorie-feld" class="grow" placeholder="Feste Kategorie für alle neuen Bücher, z. B. Manga (leer = aus)" autocomplete="off">
+        <span class="kat-feld grow"><i class="kat-punkt leer"></i><select id="feste-regal-kategorie" aria-label="Feste Regal-Kategorie für alle neuen Bücher"></select></span>
+        <input id="kategorie-feld" class="grow" placeholder="Festes Genre, z. B. Manga (leer = aus)" autocomplete="off">
         <button class="btn secondary" type="submit">Merken</button>
       </form>
       <div class="platz-box hidden" id="kategorie-box"></div>
@@ -2312,7 +2367,9 @@ td.titel-zelle { min-width: 220px; }
           <div class="full"><label for="nb-autoren">Autor(en), mit Komma getrennt</label><input id="nb-autoren" name="autoren"></div>
           <div><label for="nb-verlag">Verlag</label><input id="nb-verlag" name="verlag"></div>
           <div><label for="nb-erscheinungsjahr">Erscheinungsjahr</label><input id="nb-erscheinungsjahr" name="erscheinungsjahr"></div>
-          <div class="full"><label for="nb-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="nb-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
+          <div class="full"><label for="nb-kategorie">Regal-Kategorie (bestimmt das Regal)</label>
+            <span class="kat-feld"><i class="kat-punkt leer"></i><select id="nb-kategorie" name="kategorie" class="kat-wahl"></select></span></div>
+          <div class="full"><label for="nb-genre">Genre (mehrere mit Komma – für die Suche; ohne Kategorie bestimmt das erste den Platz)</label><input id="nb-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
           <div class="full"><label for="nb-serie">Serie (leer = keine)</label><input id="nb-serie" name="serie" list="serien-liste" autocomplete="off"></div>
           <div><label for="nb-staffel-wahl">Staffel</label><select id="nb-staffel-wahl" class="staffel-wahl"></select>
             <input id="nb-staffel" name="staffel" class="staffel-neu hidden" placeholder="Neue Staffel, z. B. 2" autocomplete="off"></div>
@@ -2343,6 +2400,7 @@ td.titel-zelle { min-width: 220px; }
       <div class="toolbar">
         <div class="chips" id="katalog-filter" style="margin:0"></div>
         <div class="chips hidden" id="regal-filter" style="margin:0"></div>
+        <select id="katalog-kategorie" class="hidden" aria-label="Nach Regal-Kategorie filtern"></select>
         <label class="check" style="margin-left:auto"><input type="checkbox" id="serien-gruppieren" checked> Serien zusammenfassen</label>
         <div class="segment" id="katalog-ansicht" style="margin:0"><button type="button" data-ansicht="cover">Cover</button><button type="button" data-ansicht="liste">Liste</button></div>
       </div>
@@ -2353,7 +2411,7 @@ td.titel-zelle { min-width: 220px; }
       </div>
       <div class="table-wrap">
         <table id="katalog-tabelle">
-          <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Genre</th><th>Standort</th><th>Verfügbar</th></tr></thead>
+          <thead><tr><th>Titel</th><th>Autor</th><th>Jahr</th><th>Kategorie / Genre</th><th>Standort</th><th>Verfügbar</th></tr></thead>
           <tbody id="katalog-body"></tbody>
         </table>
         <div class="cover-wand" id="katalog-wand"></div>
@@ -2370,6 +2428,15 @@ td.titel-zelle { min-width: 220px; }
       <ul class="log aufgaben" id="regal-umstellen"></ul>
       <div class="actions"><button class="btn" type="button" id="regal-uebernehmen">Erledigt – so eingeräumt</button></div>
     </div>
+    <div class="card" id="kategorien-karte">
+      <div class="row">
+        <h2 class="grow" style="margin:0">🏷️ Regal-Kategorien</h2>
+        <button class="btn secondary" type="button" id="kategorien-bearbeiten">Liste bearbeiten</button>
+        <button class="btn" type="button" id="kategorien-zuordnen">Bücher ohne Kategorie zuordnen</button>
+      </div>
+      <p class="hint" style="margin-top:8px" id="kategorien-hint"></p>
+      <div class="kat-liste" id="kategorien-liste"></div>
+    </div>
     <div class="card">
       <div class="row">
         <h2 class="grow" style="margin:0">Regale</h2>
@@ -2382,7 +2449,7 @@ td.titel-zelle { min-width: 220px; }
         <input id="regal-suche" class="grow" type="search" placeholder="Kategorie suchen, z. B. Manga, Krimi, Sachbuch … (auch Regalname oder Buchtitel)" autocomplete="off" aria-label="Kategorie in den Regalen suchen">
         <span class="sub" id="regal-suche-info" style="color:var(--muted)"></span>
       </div>
-      <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und trage ein, welche Genres hineinkommen. Ein Regal ohne Genres nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
+      <p class="hint" style="margin-top:6px">Lege deine Regale mit Fächern an und wähle bei „Bearbeiten“, welche Regal-Kategorie hineinkommt (für das ganze Regal oder je Fach). Ein Regal ohne Kategorie nimmt alle übrigen Bücher auf. ScanBook sortiert innerhalb eines Regals nach Kategorie bzw. Genre, dann nach Autor; Bände einer Serie stehen zusammen. Beim Scannen siehst du sofort, wo ein neues Buch hingehört.</p>
       <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span><span>Grüne und gelbe Bücher antippen, sobald sie an ihrem Platz stehen.</span></div>
       <div id="regale-liste"></div>
       <div class="auswahl-leiste hidden" id="auswahl-leiste">
@@ -2631,7 +2698,9 @@ td.titel-zelle { min-width: 220px; }
       <div class="full"><label for="ed-autoren">Autor(en), mit Komma getrennt</label><input id="ed-autoren" name="autoren"></div>
       <div><label for="ed-verlag">Verlag</label><input id="ed-verlag" name="verlag"></div>
       <div><label for="ed-erscheinungsjahr">Erscheinungsjahr</label><input id="ed-erscheinungsjahr" name="erscheinungsjahr"></div>
-      <div class="full"><label for="ed-genre">Genre (mehrere mit Komma – das erste bestimmt den Platz im Regal)</label><input id="ed-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
+      <div class="full"><label for="ed-kategorie">Regal-Kategorie (bestimmt das Regal)</label>
+        <span class="kat-feld"><i class="kat-punkt leer"></i><select id="ed-kategorie" name="kategorie" class="kat-wahl"></select></span></div>
+      <div class="full"><label for="ed-genre">Genre (mehrere mit Komma – für die Suche; ohne Kategorie bestimmt das erste den Platz)</label><input id="ed-genre" name="genre" placeholder="z. B. Krieg, Geschichte"></div>
       <div class="full"><label for="ed-serie">Serie (leer = keine)</label><input id="ed-serie" name="serie" list="serien-liste" autocomplete="off"></div>
       <div><label for="ed-staffel-wahl">Staffel</label><select id="ed-staffel-wahl" class="staffel-wahl"></select>
         <input id="ed-staffel" name="staffel" class="staffel-neu hidden" placeholder="Neue Staffel, z. B. 2" autocomplete="off"></div>
@@ -2724,18 +2793,50 @@ td.titel-zelle { min-width: 220px; }
       <div class="full"><label for="rg-name">Name</label><input id="rg-name" name="name" placeholder="z. B. Regal 1 oder Wohnzimmer links" autocomplete="off"></div>
       <div><label for="rg-faecher">Anzahl Fächer</label><input id="rg-faecher" name="faecher" type="number" min="1"></div>
       <div><label for="rg-kapazitaet">Bücher pro Fach</label><input id="rg-kapazitaet" name="kapazitaet" type="number" min="1"></div>
-      <div class="full"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
+      <div class="full"><label for="rg-kat">Regal-Kategorie</label>
+        <span class="kat-feld"><i class="kat-punkt leer"></i><select id="rg-kat" data-fuer="rg-genres"></select></span></div>
+      <div class="full rg-genres-zeile"><label for="rg-genres">Genres, mit Komma getrennt (leer = alle übrigen Bücher)</label><input id="rg-genres" name="genres" autocomplete="off"></div>
     </div>
     <details id="rg-fach-details">
-      <summary>Einzelne Fächer: eigene Genres und Anzahl Bücher</summary>
-      <p class="hint">Leer = wie das Regal. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer. Bei „Bücher“ kannst du für schmale Bücher wie Mangas mehr eintragen (oder für dicke weniger).</p>
+      <summary>Einzelne Fächer: eigene Kategorie und Anzahl Bücher</summary>
+      <p class="hint">„Wie das Regal“ = das Fach bekommt, was das Regal bekommt. Ein Fach mit eigenen Genres bekommt genau diese Bücher – ist es voll, kommen sie in die übrigen Fächer. Bei „Bücher“ kannst du für schmale Bücher wie Mangas mehr eintragen (oder für dicke weniger).</p>
       <div class="fach-genres" id="rg-fach-genres"></div>
     </details>
-    <p class="hint" style="margin:10px 0 0">Genre antippen, um es ins ausgewählte Feld zu übernehmen:</p>
-    <div class="chips" id="rg-genre-chips"></div>
+    <p class="hint hidden" id="rg-chips-hint" style="margin:10px 0 0">Genre antippen, um es ins ausgewählte Feld zu übernehmen:</p>
+    <div class="chips hidden" id="rg-genre-chips"></div>
     <div class="actions">
       <button class="btn" type="submit">Speichern</button>
       <button class="btn secondary" type="button" id="rg-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- KATEGORIEN-DIALOG -->
+<dialog id="kategorien-dialog">
+  <form id="kategorien-form" class="dlg-body">
+    <h2>Regal-Kategorien</h2>
+    <p class="hint">Diese Liste erscheint beim Erfassen, Bearbeiten und bei den Regalen als Auswahl. Wenn du einen Namen änderst, ändert er sich auch bei allen Büchern und Regalen. Farbe antippen, um sie zu ändern.</p>
+    <div class="kat-zeilen" id="kat-zeilen"></div>
+    <button class="btn small secondary" type="button" id="kat-neu">＋ Kategorie hinzufügen</button>
+    <div class="actions">
+      <button class="btn" type="submit">Speichern</button>
+      <button class="btn secondary" type="button" id="kat-close" style="margin-left:auto">Abbrechen</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- KATEGORIEN ZUORDNEN -->
+<dialog id="zuordnung-dialog" class="breit">
+  <form id="zuordnung-form" class="dlg-body">
+    <h2>Bücher ohne Kategorie zuordnen</h2>
+    <p class="hint" id="zo-info"></p>
+    <div class="table-wrap mail-liste zuordnung-liste"><table>
+      <thead><tr><th>Bisheriges Genre</th><th class="num">Bücher</th><th>wird zu</th></tr></thead>
+      <tbody id="zo-body"></tbody>
+    </table></div>
+    <div class="actions">
+      <button class="btn" type="submit">Zuordnung übernehmen</button>
+      <button class="btn secondary" type="button" id="zo-close" style="margin-left:auto">Abbrechen</button>
     </div>
   </form>
 </dialog>
@@ -2919,6 +3020,45 @@ const FELDER = ["titel", "autoren", "verlag", "erscheinungsjahr", "genre"];
 const SERIEN_FELDER = ["serie", "staffel", "band"];
 const LEERWERTE = ["", "Unbekannt", "Unbekannter Titel", "N/A", "Keine Angabe"];
 let info = { standard_leihdauer: 14 };
+
+// --- Regal-Kategorien (feste Liste, kommt mit „info“) ---
+let kategorienListe = [];
+function katFinden(name) {
+  const klein = String(name || "").trim().toLowerCase();
+  return klein ? kategorienListe.find((k) => k.name.toLowerCase() === klein) : undefined;
+}
+const katFarbe = (name) => katFinden(name)?.farbe || "";
+function katPunkt(name) {
+  const farbe = katFarbe(name);
+  return farbe ? `<i class="kat-punkt" style="--kat:${farbe}"></i>` : "";
+}
+// Genres als HTML; Regal-Kategorien bekommen ihren Farbpunkt
+function genresMitFarbe(genres, trenner = ", ") {
+  return genres.map((g) => `<span class="kat-name">${katPunkt(g)}${esc(g)}</span>`).join(trenner);
+}
+function katOptionen(aktuell, leer = "– keine Kategorie –") {
+  const unbekannt = aktuell && !katFinden(aktuell) ? [`<option value="${esc(aktuell)}">${esc(aktuell)} (nicht mehr in der Liste)</option>`] : [];
+  return `<option value="">${esc(leer)}</option>` + kategorienListe.map((k) => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("") + unbekannt.join("");
+}
+// Auswahlfeld füllen und den Farbpunkt daneben passend setzen
+function katWahl(sel, aktuell, leer) {
+  sel.innerHTML = katOptionen(aktuell, leer);
+  sel.value = katFinden(aktuell)?.name ?? (aktuell || "");
+  katPunktSetzen(sel);
+}
+function katPunktSetzen(sel) {
+  const punkt = sel.closest(".kat-feld")?.querySelector(".kat-punkt");
+  if (!punkt) return;
+  const farbe = katFarbe(sel.value);
+  punkt.classList.toggle("leer", !farbe);
+  punkt.style.setProperty("--kat", farbe || "transparent");
+}
+document.addEventListener("change", (e) => { if (e.target.closest?.(".kat-feld")) katPunktSetzen(e.target); });
+function setzeKategorien(liste) {
+  kategorienListe = Array.isArray(liste) ? liste : [];
+  for (const sel of document.querySelectorAll("select.kat-wahl")) katWahl(sel, sel.value);
+  zeigeFesteKategorie?.();
+}
 
 // --- Helfer ---
 function esc(wert) {
@@ -3116,6 +3256,7 @@ async function ladeInfo() {
   $("#version").textContent = "Version " + info.version;
   $("#co-tage").placeholder = info.standard_leihdauer;
   $("#einraeumen-bestaetigen").checked = info.einraeumen_bestaetigen;
+  setzeKategorien(info.kategorien);
 }
 
 // --- Scannen ---
@@ -3143,6 +3284,8 @@ function zeigeNeuesBuch(isbn, daten, fehlend, hinweis) {
     form.genre.classList.remove("missing");
     fehlend = fehlend.filter((f) => f !== "genre");
   }
+  // Feste Regal-Kategorie geht vor, sonst der Vorschlag aus dem Genre
+  katWahl(form.kategorie, (katFinden(festeRegalKategorie) && festeRegalKategorie) || daten?.kategorie || "");
   for (const f of [...SERIEN_FELDER, "beschreibung", "cover_url"]) form[f].value = daten?.[f] ?? "";
   staffelAuswahl(form);
   if (!katalogGeladen) katalogHolen().then(() => staffelAuswahl(form)).catch(() => {});
@@ -3201,6 +3344,7 @@ $("#einraeumen-bestaetigen").addEventListener("change", (e) => versuche(async ()
 // Versteckt: Tippen auf „Bücher scannen“ öffnet ein Feld für eine feste Kategorie.
 // Sie kommt bei jedem neuen Buch vorne ins Genre, bis sie wieder ausgeschaltet wird (gemerkt in diesem Browser).
 let festeKategorie = speicherLesen("scanbook-feste-kategorie", "");
+let festeRegalKategorie = speicherLesen("scanbook-feste-regal-kategorie", "");
 function festeKategorien() {
   return festeKategorie.split(",").map((g) => g.trim()).filter(Boolean);
 }
@@ -3212,30 +3356,41 @@ function mitFesterKategorie(genre) {
 }
 function zeigeFesteKategorie() {
   const box = $("#kategorie-box");
-  box.classList.toggle("hidden", !festeKategorie);
-  if (festeKategorie) box.innerHTML = `🔖 Feste Kategorie <b>${esc(festeKategorie)}</b> – kommt bei jedem neuen Buch vorne ins Genre.
+  const regalKat = katFinden(festeRegalKategorie);
+  box.classList.toggle("hidden", !festeKategorie && !regalKat);
+  const teile = [];
+  if (regalKat) teile.push(`Regal-Kategorie <b class="kat-name">${katPunkt(regalKat.name)}${esc(regalKat.name)}</b>`);
+  if (festeKategorie) teile.push(`Genre <b>${esc(festeKategorie)}</b>`);
+  if (teile.length) box.innerHTML = `🔖 Fest für jedes neue Buch: ${teile.join(" und ")}.
     <button class="btn small secondary" type="button" id="kategorie-aus" style="margin-left:8px">Aus</button>`;
 }
-function setzeFesteKategorie(wert) {
+function setzeFesteKategorie(wert, regalKat = "") {
   festeKategorie = wert;
   festeKategorie = festeKategorien().join(", ");
+  festeRegalKategorie = regalKat;
   speicherSchreiben("scanbook-feste-kategorie", festeKategorie);
+  speicherSchreiben("scanbook-feste-regal-kategorie", festeRegalKategorie);
   zeigeFesteKategorie();
-  toast(festeKategorie ? `„${festeKategorie}“ kommt jetzt vorne in jedes neue Buch` : "Feste Kategorie aus");
+  const was = [festeRegalKategorie && `Kategorie „${festeRegalKategorie}“`, festeKategorie && `Genre „${festeKategorie}“`].filter(Boolean);
+  toast(was.length ? `${was.join(" und ")} gilt jetzt für jedes neue Buch` : "Feste Kategorie aus");
   $("#scan-isbn").focus();
 }
 $("#scan-titel").addEventListener("click", () => {
   const form = $("#kategorie-form");
   form.classList.toggle("hidden");
-  if (!form.classList.contains("hidden")) { $("#kategorie-feld").value = festeKategorie; $("#kategorie-feld").focus(); }
+  if (!form.classList.contains("hidden")) {
+    $("#kategorie-feld").value = festeKategorie;
+    katWahl($("#feste-regal-kategorie"), festeRegalKategorie, "Feste Regal-Kategorie: keine");
+    $("#feste-regal-kategorie").focus();
+  }
 });
 $("#kategorie-form").addEventListener("submit", (e) => {
   e.preventDefault();
   e.target.classList.add("hidden");
-  setzeFesteKategorie($("#kategorie-feld").value);
+  setzeFesteKategorie($("#kategorie-feld").value, $("#feste-regal-kategorie").value);
 });
 $("#kategorie-box").addEventListener("click", (e) => {
-  if (e.target.id === "kategorie-aus") setzeFesteKategorie("");
+  if (e.target.id === "kategorie-aus") setzeFesteKategorie("", "");
 });
 zeigeFesteKategorie();
 
@@ -3358,10 +3513,15 @@ function buchZeile(b, alsBand = false) {
         <td class="titel-zelle">${titel}<div class="sub">${verlag}${esc(b.isbn)}</div>${b.standort ? `<div class="ort-mobil">${ortHtml(b.standort, b.geplant)}</div>` : ""}</td>
         <td>${esc(b.autor)}</td>
         <td class="num">${esc(b.jahr)}</td>
-        <td>${esc(b.genre)}</td>
+        <td>${katGenreHtml(b.kategorie, b.genre)}</td>
         <td>${ortHtml(b.standort, b.geplant)}</td>
         <td class="num"><span class="badge ${b.verfuegbar > 0 ? "ok" : "danger"}">${b.verfuegbar} von ${b.gesamt}</span></td>
       </tr>`;
+}
+function katGenreHtml(kategorie, genre) {
+  const g = LEERWERTE.includes(genre) ? "" : genre;
+  if (!kategorie) return esc(g);
+  return `<span class="kat-name">${katPunkt(kategorie)}${esc(kategorie)}</span>${g ? `<span class="genre-klein">${esc(g)}</span>` : ""}`;
 }
 function ortHtml(text, geplant = false) {
   if (!text) return "";
@@ -3382,12 +3542,13 @@ function serienZeilen(g, offen) {
   const verfuegbar = g.baende.reduce((n, b) => n + b.verfuegbar, 0);
   const gesamt = g.baende.reduce((n, b) => n + b.gesamt, 0);
   const genres = [...new Set(g.baende.map((b) => b.genre).filter((x) => !LEERWERTE.includes(x)))];
+  const kategorien = [...new Set(g.baende.map((b) => b.kategorie).filter(Boolean))];
   return `
       <tr class="clickable serie-zeile${offen ? " offen" : ""}" data-serie="${esc(g.schluessel)}">
         <td class="titel-zelle"><span class="pfeil">▸</span> <b>📚 ${esc(g.serie)}</b><div class="sub">${g.baende.length} Bände${staffelAnzahl(g.baende) > 1 ? ` · ${staffelAnzahl(g.baende)} Staffeln` : ""} · ${offen ? "zuklappen" : "aufklappen"}</div></td>
         <td>${esc(autoren.length > 2 ? autoren.slice(0, 2).join(", ") + " u. a." : autoren.join(", "))}</td>
         <td class="num">${jahre.length ? (von === bis ? von : `${von}–${bis}`) : ""}</td>
-        <td>${esc(genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
+        <td>${katGenreHtml(kategorien[0] || "", genres.length > 1 ? genres[0] + " …" : genres[0] || "")}</td>
         <td>${serienOrt(g.baende)}</td>
         <td class="num"><span class="badge ${verfuegbar > 0 ? "ok" : "danger"}">${verfuegbar} von ${gesamt}</span></td>
       </tr>` + (offen ? mitStaffeln(g.baende, (t) => `<tr class="staffel-zeile"><td colspan="6">${esc(t)}</td></tr>`, (b) => buchZeile(b, true)) : "");
@@ -3413,7 +3574,7 @@ function buchKachel(b, alsBand = false) {
   return `
       <button class="kachel${alsBand ? " band" : ""}" type="button" data-isbn="${esc(b.isbn)}" title="${esc(b.titel)}">
         ${coverHtml(b, b.titel, b.autor, b.band ? `${!alsBand && /^\d+$/.test(b.staffel) ? `St. ${b.staffel} · ` : ""}Bd. ${b.band}` : "")}
-        <div class="kachel-titel">${esc(b.titel)}</div>
+        <div class="kachel-titel">${katPunkt(b.kategorie)}${esc(b.titel)}</div>
         <div class="kachel-sub"><i class="punkt${b.verfuegbar > 0 ? "" : " weg"}"></i>${da}</div>
         ${b.standort ? `<div class="kachel-sub" title="${esc(b.standort)}">📍 ${esc(b.standort)}${b.geplant ? " (geplant)" : ""}</div>` : ""}
       </button>`;
@@ -3425,14 +3586,14 @@ function serienKacheln(g, offen) {
   return `
       <button class="kachel serie" type="button" data-serie="${esc(g.schluessel)}" title="${esc(g.serie)}">
         <div class="stapel" style="${coverFarbe(g.serie)}">${coverHtml({ ...erster, genre: "" }, g.serie, erster.autor, `${g.baende.length} Bände`)}</div>
-        <div class="kachel-titel">📚 ${esc(g.serie)}</div>
+        <div class="kachel-titel">${katPunkt(erster.kategorie)}📚 ${esc(g.serie)}</div>
         <div class="kachel-sub"><i class="punkt${verfuegbar > 0 ? "" : " weg"}"></i>${verfuegbar} von ${gesamt} da · ${offen ? "zuklappen" : "aufklappen"}</div>
       </button>` + (offen ? mitStaffeln(g.baende, (t) => `<div class="staffel-trenner">${esc(t)}</div>`, (b) => buchKachel(b, true)) +
         (staffelAnzahl(g.baende) ? `<div class="staffel-trenner ende"></div>` : "") : "");
 }
 
 // Der Katalog wird einmal geladen und dann im Browser durchsucht – das geht ohne Wartezeit
-let katalog = [], katalogGeladen = false, katalogFilter = "alle", regalFilter = "alle";
+let katalog = [], katalogGeladen = false, katalogFilter = "alle", regalFilter = "alle", kategorieFilter = "alle";
 let katalogAnsicht = speicherLesen("katalogAnsicht", "cover") === "liste" ? "liste" : "cover";
 const katalogZiel = () => $(katalogAnsicht === "cover" ? "#katalog-wand" : "#katalog-body");
 // Suchtext vereinheitlichen: Groß/Klein, Umlaute (ü = ue), Akzente, ß, Bindestriche und Satzzeichen.
@@ -3448,7 +3609,7 @@ function suchForm(text, umlautAlsE = true) {
 // „Müller“ steht im Suchtext als „mueller“ und „muller“ – so passt jede Schreibweise
 function suchText(b) {
   if (b._such === undefined) {
-    const roh = [b.titel, b.autoren, b.autor, b.genre, b.isbn, b.verlag, b.serie, b.staffel && `staffel ${b.staffel}`, b.band && `band ${b.band}`, b.standort, b.codes].join(" ");
+    const roh = [b.titel, b.autoren, b.autor, b.kategorie, b.genre, b.isbn, b.verlag, b.serie, b.staffel && `staffel ${b.staffel}`, b.band && `band ${b.band}`, b.standort, b.codes].join(" ");
     const mitE = suchForm(roh);
     const ohneE = suchForm(roh, false);
     b._such = mitE === ohneE ? mitE : `${mitE} | ${ohneE}`;
@@ -3464,11 +3625,13 @@ function passtZurSuche(b, worte) {
 }
 const passtZumFilter = (b) =>
   (katalogFilter === "alle" || (katalogFilter === "da" ? b.verfuegbar > 0 : b.verfuegbar === 0)) &&
-  (regalFilter === "alle" || (regalFilter === "ohne" ? !b.regal : "r:" + b.regal === regalFilter));
+  (regalFilter === "alle" || (regalFilter === "ohne" ? !b.regal : "r:" + b.regal === regalFilter)) &&
+  (kategorieFilter === "alle" || (kategorieFilter === "ohne" ? !b.kategorie : b.kategorie.toLowerCase() === kategorieFilter));
 function zeichneKatalog(behalten = false) {
   const suche = $("#katalog-suche").value.trim().toLowerCase();
   const worte = suchWorte(suche);
   zeichneRegalFilter();
+  zeichneKategorieFilter();
   const treffer = worte.length ? katalog.filter((b) => passtZurSuche(b, worte)) : katalog;
   const liste = treffer.filter(passtZumFilter);
   // Ein aktiver Filter (z. B. ein Regal oder „Verfügbar“) versteckt sonst still Treffer – darauf hinweisen
@@ -3510,7 +3673,7 @@ function zeichneKatalog(behalten = false) {
     const offen = Boolean(suche) || offeneSerien.has(e.schluessel);
     return wand ? serienKacheln(e, offen) : serienZeilen(e, offen);
   };
-  const hinweis = suche || katalogFilter !== "alle" || regalFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“.";
+  const hinweis = suche || katalogFilter !== "alle" || regalFilter !== "alle" || kategorieFilter !== "alle" ? "Keine Treffer." : "Der Katalog ist leer. Scanne dein erstes Buch unter „Erfassen“.";
   const leer = wand ? `<div class="empty">${hinweis}</div>` : `<tr><td colspan="6" class="empty">${hinweis}</td></tr>`;
   $(wand ? "#katalog-body" : "#katalog-wand").innerHTML = "";
   stueckweise(katalogZiel(), $("#katalog-mehr"), eintraege, zeile, leer, behalten);
@@ -3529,6 +3692,25 @@ function zeichneRegalFilter() {
   const chips = [["alle", "Alle Regale"], ...regale.map((r) => ["r:" + r, `📍 ${r}`]), ...(ohne ? [["ohne", `Ohne Platz · ${ohne}`]] : [])];
   box.innerHTML = chips.map(([k, t]) =>
     `<button class="chip ${k === regalFilter ? "active" : ""}" type="button" data-regal="${esc(k)}">${esc(t)}</button>`).join("");
+}
+
+// Kategorie-Filter: Auswahlmenü mit Anzahl Bücher je Kategorie (nur, wenn es Kategorien gibt)
+function zeichneKategorieFilter() {
+  const sel = $("#katalog-kategorie");
+  const zahl = new Map();
+  for (const b of katalog) { const k = (b.kategorie || "").toLowerCase(); zahl.set(k, (zahl.get(k) || 0) + 1); }
+  const namen = [...kategorienListe.map((k) => k.name)];
+  for (const b of katalog) if (b.kategorie && !namen.some((n) => n.toLowerCase() === b.kategorie.toLowerCase())) namen.push(b.kategorie);
+  const zeigen = namen.length > 0 && katalog.length > 0;
+  sel.classList.toggle("hidden", !zeigen);
+  if (!zeigen) { kategorieFilter = "alle"; return; }
+  const ohne = zahl.get("") || 0;
+  sel.innerHTML = `<option value="alle">Alle Kategorien</option>` +
+    namen.map((n) => `<option value="${esc(n.toLowerCase())}">● ${esc(n)} · ${zahl.get(n.toLowerCase()) || 0}</option>`).join("") +
+    (ohne ? `<option value="ohne">Ohne Kategorie · ${ohne}</option>` : "");
+  if (![...sel.options].some((o) => o.value === kategorieFilter)) kategorieFilter = "alle";
+  sel.value = kategorieFilter;
+  sel.style.color = katFarbe(kategorieFilter) || "";
 }
 
 // Vorschläge für das Serien-Feld, damit derselbe Name immer gleich geschrieben wird
@@ -3591,6 +3773,11 @@ $("#katalog-versteckt").addEventListener("click", (e) => {
   if (!e.target.closest("#filter-zuruecksetzen")) return;
   katalogFilter = "alle";
   regalFilter = "alle";
+  kategorieFilter = "alle";
+  zeichneKatalog();
+});
+$("#katalog-kategorie").addEventListener("change", (e) => {
+  kategorieFilter = e.target.value;
   zeichneKatalog();
 });
 $("#katalog-filter").addEventListener("click", (e) => {
@@ -3686,7 +3873,7 @@ async function oeffneVorschau(isbn) {
     const daten = [
       ["Standort", b.standort ? (b.standort_soll ? `${b.standort} (umstellen nach ${b.standort_soll})` : b.standort + (b.platz.fest ? " 📌" : ""))
         : (b.standort_soll ? `${b.standort_soll} (noch nicht eingeräumt)` : "")],
-      ["Serie", serieText(b.serie, b.band, b.staffel)], ["Genre", b.genre], ["Verlag", b.verlag],
+      ["Serie", serieText(b.serie, b.band, b.staffel)], ["Regal-Kategorie", b.kategorie], ["Genre", b.genre], ["Verlag", b.verlag],
       ["Erschienen", b.erscheinungsjahr], ["ISBN", isbn],
     ].filter(([, w]) => !leer(w));
     $("#pv-daten").innerHTML = daten.map(([k, w]) => `<dt>${k}</dt><dd>${esc(w)}</dd>`).join("");
@@ -3827,6 +4014,7 @@ async function oeffneBearbeiten(isbn) {
     const form = $("#edit-form");
     for (const f of FELDER) form[f].value = LEERWERTE.includes(b[f]) ? "" : b[f];
     for (const f of [...SERIEN_FELDER, "beschreibung"]) form[f].value = b[f] || "";
+    katWahl(form.kategorie, b.kategorie || "");
     staffelAuswahl(form);
     $("#edit-hint").textContent = `ISBN ${isbn} · Bestand: ${b.anzahl_verfuegbar}/${b.anzahl_gesamt} verfügbar`;
     $("#edit-dialog").showModal();
@@ -3885,14 +4073,14 @@ function buchChip(b) {
   const klasse = (b.neu ? "neu" : b.von ? "umstellen" : "") + (b.fest ? " fest" : "") + (auswahl.has(b.isbn) ? " gewaehlt" : "");
   const tipp = [b.autor, b.genre, b.neu ? "noch nicht eingeräumt" : b.von ? `steht noch in ${b.von}` : "",
     b.fest ? "selbst festgelegt" : ""].filter(Boolean).join(" · ");
-  return `<span class="buch-chip ${klasse}" data-isbn="${esc(b.isbn)}" title="${esc(tipp)}">${esc(titel)}</span>`;
+  return `<span class="buch-chip ${klasse}" data-isbn="${esc(b.isbn)}" title="${esc(tipp)}">${katPunkt(b.kategorie)}${esc(titel)}</span>`;
 }
 function regalGenreText(r) {
-  const eigene = r.fach_genres.map((g, f) => (g.length ? `Fach ${f + 1}: ${g.join(", ")}` : "")).filter(Boolean);
+  const eigene = r.fach_genres.map((g, f) => (g.length ? `Fach ${f + 1}: ${genresMitFarbe(g)}` : "")).filter(Boolean);
   const rest = r.fach_genres.some((g) => !g.length);
   const teile = [...eigene];
-  if (rest) teile.push((eigene.length ? "sonst " : "") + (r.genres.length ? r.genres.join(", ") : "alle übrigen Bücher"));
-  return esc(teile.join(" · "));
+  if (rest) teile.push((eigene.length ? "sonst " : "") + (r.genres.length ? genresMitFarbe(r.genres) : "alle übrigen Bücher"));
+  return teile.join(" · ");
 }
 // Regal-Suche: alle Wörter müssen vorkommen, Umlaute und ß egal (wie im Katalog)
 function regalSuchTreffer(text, worte) {
@@ -3941,7 +4129,7 @@ function zeichneRegale(d) {
         return suche && !nameTreffer && !genreTreffer && regalSuchTreffer(`${b.genre} ${b.titel} ${b.serie || ""} ${b.autor || ""}`, worte)
           ? html.replace('class="buch-chip ', 'class="buch-chip treffer ') : html;
       };
-      return `<div class="fach ${genreTreffer ? "treffer" : ""}"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${genres.length ? `<span class="fach-genre ${eigene.length ? "" : "geerbt"}">${esc(genres.join(", "))}</span>` : ""}
+      return `<div class="fach ${genreTreffer ? "treffer" : ""}"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${genres.length ? `<span class="fach-genre ${eigene.length ? "" : "geerbt"}">${genresMitFarbe(genres, "<br>")}</span>` : ""}
           <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button></div>
         <div><div class="balken ${n >= kap ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / kap))}%"></div></div>
         <div class="fach-buecher">${fach.map(chip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
@@ -3975,6 +4163,7 @@ function zeichneRegale(d) {
   $("#regal-umstellen").innerHTML = d.umstellen.map((b) =>
     `<li data-isbn="${esc(b.isbn)}" style="cursor:pointer" title="Antippen, wenn umgestellt">↪️ <b>${esc(b.titel)}</b><span class="pfad">${esc(b.von)} → ${esc(b.nach)}</span></li>`).join("");
 
+  zeichneKategorienKarte(d);
   $("#ohne-platz").classList.toggle("hidden", !d.ohne_platz.length);
   $("#ohne-platz-liste").innerHTML = d.ohne_platz.map((b) =>
     `<li><b>${esc(b.titel)}</b><span class="pfad">${b.grund === "voll" ? "passende Regale sind voll" : `kein Regal für: ${esc(b.genre || "ohne Genre")}`}</span></li>`).join("");
@@ -3990,11 +4179,40 @@ function zeichneFachGenres(werte, kapWerte) {
   const altKap = kapWerte || [...box.querySelectorAll("input[data-kap]")].map((i) => i.value);
   const anzahl = Math.min(50, Math.max(1, Number($("#rg-faecher").value) || 1));
   const standard = Number($("#rg-kapazitaet").value) || "";
-  box.innerHTML = `<span></span><span class="kopf">Genres</span><span class="kopf">Bücher</span>` + Array.from({ length: anzahl }, (_, f) =>
-    `<span>Fach ${f + 1}</span><input data-fach="${f}" placeholder="wie das Regal" autocomplete="off" value="${esc(alt[f] || "")}">
-     <input data-kap="${f}" type="number" min="1" placeholder="${standard}" aria-label="Bücher in Fach ${f + 1}" value="${esc(altKap[f] || "")}">`).join("");
+  box.innerHTML = `<span></span><span class="kopf">Kategorie</span><span class="kopf">Bücher</span>` + Array.from({ length: anzahl }, (_, f) =>
+    `<span>Fach ${f + 1}</span><span class="kat-feld"><i class="kat-punkt leer"></i><select data-kat="${f}" data-fuer-fach="${f}" aria-label="Kategorie für Fach ${f + 1}"></select></span>
+     <input data-kap="${f}" type="number" min="1" placeholder="${standard}" aria-label="Bücher in Fach ${f + 1}" value="${esc(altKap[f] || "")}">
+     <input data-fach="${f}" class="fach-kat hidden" placeholder="Eigene Genres, mit Komma getrennt" autocomplete="off" value="${esc(alt[f] || "")}">`).join("");
+  box.querySelectorAll("select[data-kat]").forEach((sel) => katFeldAuswahl(sel, box.querySelector(`input[data-fach="${sel.dataset.kat}"]`), "wie das Regal"));
   if (genreFeld && !genreFeld.isConnected) genreFeld = $("#rg-genres");
 }
+// Kategorie-Auswahl für ein Regal oder Fach: eine Kategorie aus der Liste, „wie das Regal“ (leer) oder eigene Genres.
+// Das Textfeld daneben enthält den gespeicherten Wert und ist nur bei „Eigene Genres …“ sichtbar.
+function katFeldAuswahl(sel, feld, leer) {
+  const wert = feld.value.trim();
+  const kat = wert && !wert.includes(",") ? katFinden(wert) : undefined;
+  sel.innerHTML = `<option value="">${esc(leer)}</option>` + kategorienListe.map((k) => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("") +
+    `<option value="__eigene">Eigene Genres …</option>`;
+  sel.value = !wert ? "" : kat ? kat.name : "__eigene";
+  zeigeEigeneGenres(sel, feld);
+}
+function zeigeEigeneGenres(sel, feld) {
+  const eigene = sel.value === "__eigene";
+  (feld.closest(".rg-genres-zeile") || feld).classList.toggle("hidden", !eigene);
+  katPunktSetzen(sel);
+  // Die Genre-Chips helfen nur bei „Eigene Genres …“
+  const irgendwo = [...$("#regal-form").querySelectorAll("select")].some((s) => s.value === "__eigene");
+  $("#rg-chips-hint").classList.toggle("hidden", !irgendwo);
+  $("#rg-genre-chips").classList.toggle("hidden", !irgendwo);
+}
+$("#regal-form").addEventListener("change", (e) => {
+  const sel = e.target;
+  if (sel.id !== "rg-kat" && sel.dataset.kat === undefined) return;
+  const feld = sel.id === "rg-kat" ? $("#rg-genres") : $(`#rg-fach-genres input[data-fach="${sel.dataset.kat}"]`);
+  if (sel.value !== "__eigene") feld.value = sel.value;
+  zeigeEigeneGenres(sel, feld);
+  if (sel.value === "__eigene") { feld.focus(); genreFeld = feld; genreChips(); }
+});
 function genreChips() {
   const feld = genreFeld || $("#rg-genres");
   const gewaehlt = feld.value.split(",").map((g) => g.trim().toLowerCase()).filter(Boolean);
@@ -4012,6 +4230,7 @@ function oeffneRegal(r) {
   const fachGenres = (r?.fach_genres || []).map((g) => g.join(", "));
   const fachKap = (r?.fach_kapazitaet || []).map((k) => k || "");
   zeichneFachGenres(fachGenres, fachKap);
+  katFeldAuswahl($("#rg-kat"), form.genres, "Keine – alle übrigen Bücher");
   $("#rg-fach-details").open = fachGenres.some(Boolean) || fachKap.some(Boolean);
   genreFeld = $("#rg-genres");
   genreChips();
@@ -4055,6 +4274,86 @@ $("#regal-form").addEventListener("submit", (e) => {
     toast("Regal gespeichert");
   });
 });
+// --- Regal-Kategorien: Liste, bearbeiten, alte Bücher zuordnen ---
+function zeichneKategorienKarte(d) {
+  if (d.kategorien) setzeKategorien(d.kategorien);
+  const zahl = new Map();
+  for (const b of d.regale.flatMap((r) => r.inhalt.flat()).concat(d.ohne_platz)) {
+    const k = (b.kategorie || "").toLowerCase();
+    zahl.set(k, (zahl.get(k) || 0) + 1);
+  }
+  const ohne = d.ohne_kategorie ?? 0;
+  $("#kategorien-liste").innerHTML = kategorienListe.length
+    ? kategorienListe.map((k) => `<span>${katPunkt(k.name)}${esc(k.name)}<span class="sub">${zahl.get(k.name.toLowerCase()) || 0}</span></span>`).join("")
+    : `<span class="sub" style="color:var(--muted)">Noch keine Kategorien.</span>`;
+  $("#kategorien-hint").textContent = ohne
+    ? `${ohne} ${ohne === 1 ? "Buch hat" : "Bücher haben"} noch keine Regal-Kategorie. „Zuordnen“ schlägt anhand des Genres eine vor. Damit die Bücher nach Kategorie einsortiert werden, wähle bei „Bearbeiten“ für jedes Regal oder Fach eine Kategorie.`
+    : "Alle Bücher haben eine Regal-Kategorie. Wähle bei „Bearbeiten“ für jedes Regal oder Fach eine Kategorie, dann sortiert ScanBook die Bücher passend ein.";
+  $("#kategorien-zuordnen").classList.toggle("hidden", !ohne || !kategorienListe.length);
+  $("#kategorien-zuordnen").textContent = `${ohne} ${ohne === 1 ? "Buch" : "Bücher"} ohne Kategorie zuordnen`;
+}
+function katZeile(k = { name: "", farbe: "" }, nr = 0) {
+  const farbe = k.farbe || ["#d6457f", "#7b4fd6", "#e07020", "#2f8fd6", "#2e9d5b", "#d6402f", "#1b9a9a", "#5d8a2e"][nr % 8];
+  return `<input type="color" value="${esc(farbe)}" aria-label="Farbe">
+    <input class="kat-name-feld" value="${esc(k.name)}" data-alt="${esc(k.name)}" maxlength="40" placeholder="Name der Kategorie" autocomplete="off">
+    <button class="btn small secondary kat-weg" type="button" title="Kategorie aus der Liste nehmen">✕</button>`;
+}
+$("#kategorien-bearbeiten").addEventListener("click", () => {
+  $("#kat-zeilen").innerHTML = kategorienListe.map((k, i) => katZeile(k, i)).join("");
+  $("#kategorien-dialog").showModal();
+});
+$("#kat-neu").addEventListener("click", () => {
+  const box = $("#kat-zeilen");
+  box.insertAdjacentHTML("beforeend", katZeile(undefined, box.querySelectorAll(".kat-name-feld").length));
+  [...box.querySelectorAll(".kat-name-feld")].pop().focus();
+});
+$("#kat-zeilen").addEventListener("click", (e) => {
+  const weg = e.target.closest(".kat-weg");
+  if (!weg) return;
+  const name = weg.previousElementSibling, farbe = name.previousElementSibling;
+  if (name.dataset.alt && !confirm(`„${name.dataset.alt}“ aus der Liste nehmen? Bücher mit dieser Kategorie behalten sie, bis du eine neue auswählst.`)) return;
+  farbe.remove(); name.remove(); weg.remove();
+});
+$("#kat-close").addEventListener("click", () => $("#kategorien-dialog").close());
+$("#kategorien-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if ([...e.target.querySelectorAll(".kat-name-feld")].some((i) => i.value.includes(","))) {
+    toast("Bitte kein Komma im Namen – nimm z. B. „·“ oder „&“.", true);
+    return;
+  }
+  const liste = [...e.target.querySelectorAll(".kat-name-feld")].map((i) => ({ name: i.value, farbe: i.previousElementSibling.value, alt: i.dataset.alt }));
+  versuche(async () => {
+    const r = await post("kategorien", { kategorien: liste });
+    setzeKategorien(r.kategorien);
+    $("#kategorien-dialog").close();
+    toast("Kategorien gespeichert");
+    katalogGeladen = false;
+    ladeRegale();
+  });
+});
+$("#kategorien-zuordnen").addEventListener("click", () => versuche(async () => {
+  const d = await get("kategorie_zuordnung");
+  setzeKategorien(d.kategorien);
+  const summe = d.gruppen.reduce((n, g) => n + g.anzahl, 0);
+  $("#zo-info").textContent = `${summe} ${summe === 1 ? "Buch hat" : "Bücher haben"} noch keine Regal-Kategorie. Sie sind nach ihrem ersten Genre zusammengefasst. ScanBook hat schon passende Kategorien vorgeschlagen – bitte prüfen und bei Bedarf ändern. „Nicht zuordnen“ lässt die Bücher, wie sie sind.`;
+  $("#zo-body").innerHTML = d.gruppen.map((g, i) => `<tr><td>${g.genre ? esc(g.genre) : `<i style="color:var(--muted)">ohne Genre</i>`}</td><td class="num">${g.anzahl}</td>
+    <td><span class="kat-feld"><i class="kat-punkt leer"></i><select data-genre="${esc(g.genre)}" aria-label="Kategorie für ${esc(g.genre || "Bücher ohne Genre")}">${katOptionen("", "– nicht zuordnen –")}</select></span></td></tr>`).join("");
+  $("#zo-body").querySelectorAll("select").forEach((sel, i) => { sel.value = d.gruppen[i].vorschlag || ""; katPunktSetzen(sel); });
+  $("#zuordnung-dialog").showModal();
+}));
+$("#zo-close").addEventListener("click", () => $("#zuordnung-dialog").close());
+$("#zuordnung-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const zuordnung = Object.fromEntries([...$("#zo-body").querySelectorAll("select")].filter((s) => s.value).map((s) => [s.dataset.genre, s.value]));
+  versuche(async () => {
+    const r = await post("kategorien_zuordnen", { zuordnung });
+    $("#zuordnung-dialog").close();
+    toast(`${r.geaendert} ${r.geaendert === 1 ? "Buch hat" : "Bücher haben"} jetzt eine Regal-Kategorie`);
+    katalogGeladen = false;
+    ladeRegale();
+  });
+});
+
 function zeigeAuswahl() {
   const n = auswahl.size;
   $("#auswahl-zahl").textContent = n ? `${n} ${n === 1 ? "Buch" : "Bücher"} ausgewählt` : "Bücher antippen, um sie auszuwählen";

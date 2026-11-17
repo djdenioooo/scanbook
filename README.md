@@ -139,6 +139,17 @@ Soll ein Buch an einem bestimmten Platz stehen, stellst du es selbst dorthin. Es
 - **Per Scan direkt am Regal:** „Per Scan einräumen“ (oder „Scannen“ neben einem Fach), Fach wählen und die Bücher scannen, die dort stehen sollen (ISBN oder Mediencode). Terminal: Menüpunkt 16, dann 7.
 - **Wieder automatisch:** löst das 📌, dann sortiert ScanBook das Buch wieder selbst ein (Terminal: Punkt 8).
 
+### Regal-Kategorien
+
+Statt Genres einzutippen, wählt man eine **Regal-Kategorie** aus einer festen Liste. Am Anfang sind 12 Kategorien für eine Schulbücherei eingetragen (Freundschaft & Liebe, Fantasy & Science-Fiction, Abenteuer & Action, Krimi · Thriller · Grusel, Alltag & Erwachsenwerden, Humor & Lustiges, Historische Romane, Tiere & Natur, Comics · Manga · Graphic Novels, Klassiker & Weltliteratur, Fremdsprachige Bücher, Sachbücher & Lernen), jede mit eigener Farbe.
+
+- **Beim Erfassen und Bearbeiten** gibt es das Auswahlmenü „Regal-Kategorie“. Beim Scannen schlägt ScanBook anhand des Genres schon eine passende vor. Tippt man auf „Bücher scannen“, lässt sich auch eine feste Regal-Kategorie für alle folgenden Bücher wählen.
+- **Bei den Regalen** wählt man im Regal-Dialog die Kategorie für das ganze Regal oder unter „Einzelne Fächer“ für jedes Fach. „Eigene Genres …“ erlaubt weiterhin frei eingetippte Genres.
+- **Die Kategorie geht vor dem Genre:** Ein Buch kommt zuerst in ein Regal oder Fach mit seiner Kategorie. Bücher ohne Kategorie werden wie bisher nach Genre einsortiert.
+- **Alte Bücher zuordnen:** Im Tab „Regale“ unter „Regal-Kategorien“ fasst „Bücher ohne Kategorie zuordnen“ die Bücher nach ihrem ersten Genre zusammen und schlägt je Genre eine Kategorie vor. Prüfen, ändern, „Zuordnung übernehmen“.
+- **Liste bearbeiten:** Namen und Farben ändern, Kategorien hinzufügen oder entfernen. Ein geänderter Name gilt auch für alle Bücher und Regale. Namen dürfen kein Komma enthalten.
+- Im Katalog zeigt ein Farbpunkt die Kategorie, oben lässt sich nach Kategorie filtern. Die Regalliste zum Drucken und der Katalog-Export enthalten die Kategorie ebenfalls. Im Terminal fragt ScanBook beim Erfassen und Bearbeiten nach der Nummer der Kategorie.
+
 **Kategorie suchen:** Über den Regalen steht ein Suchfeld. Tippe eine Kategorie ein (z. B. „Manga“ oder „Fantasy“), dann siehst du nur noch die Fächer, in die diese Kategorie gehört oder in denen solche Bücher stehen. Groß-/Kleinschreibung und Umlaute sind egal („Maerchen“ findet „Märchen“). Auch Regalnamen und Buchtitel werden gefunden. Esc leert die Suche.
 
 „Als Liste drucken“ (oben im Tab „Regale“) erzeugt eine Druckseite mit allen Regalen: jedes Regal auf einer eigenen Seite, darin Fach für Fach die Bücher mit Titel, Autor, Genre und Anzahl, dazu ein Kästchen zum Abhaken. Bücher, die noch eingeräumt oder umgestellt werden müssen, sind vermerkt. Mit „Drucken“ neben einem Regal druckst du nur dieses eine.

@@ -30,7 +30,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.23.0"
+VERSION = "2.24.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -75,6 +75,10 @@ SERIEN_FELDER = [
     ("staffel", "Staffel"),
     ("band", "Band"),
 ]
+
+# Regal-Kategorie: eine Auswahl aus einer festen Liste (siehe kategorien()). Sie bestimmt vor dem Genre,
+# in welches Regal ein Buch kommt. Leer = noch keine Kategorie, dann zählt wie früher das Genre.
+KATEGORIE_FELD = "kategorie"
 
 # Angaben, die online gefunden werden (Beschreibung lässt sich im Browser auch von Hand ändern)
 ZUSATZ_FELDER = ["beschreibung", "cover_url"]
@@ -520,7 +524,7 @@ def init_db():
 
         # Spalten nachrüsten, die ältere Versionen noch nicht hatten
         buch_spalten = {row[1] for row in cursor.execute("PRAGMA table_info(buecher)")}
-        for spalte in ("serie", "band", "staffel", "beschreibung", "cover_url"):
+        for spalte in ("serie", "band", "staffel", "beschreibung", "cover_url", "kategorie"):
             if spalte not in buch_spalten:
                 cursor.execute(f"ALTER TABLE buecher ADD COLUMN {spalte} TEXT DEFAULT ''")
         if "nachgeladen" not in buch_spalten:
@@ -910,9 +914,10 @@ def genre_ermitteln(begriffe, klassen=(), schlagwoerter=()):
 
 
 def neue_buchdaten(titel, autoren, verlag, jahr, genre, serie=None, band=None, beschreibung=None, cover_url=None,
-                   staffel=None):
+                   staffel=None, kategorie=None):
     serie = (serie or "").strip()
     return {
+        'kategorie': kategorie_bereinigen(kategorie),
         'titel': titel or 'Unbekannter Titel',
         'autoren': autoren or 'Unbekannt',
         'verlag': verlag or 'N/A',
@@ -1301,6 +1306,7 @@ def fetch_book_data(isbn):
         return None
     genres = genres_zusammenfuehren(*(sichere or [g for g in unsichere if g][:1]))
     daten['genre'] = ', '.join(genres) or 'Keine Angabe'
+    daten['kategorie'] = kategorie_vorschlag(genres)
     daten.pop('_genres', None)
     daten.pop('_genre_sicher', None)
     return daten
@@ -1316,6 +1322,7 @@ def serie_text(serie, band, staffel=""):
 def zeige_buchdaten(daten):
     for feld, label in BUCH_FELDER:
         print(f"   {label + ':':<18} {daten[feld]}")
+    print(f"   {'Regal-Kategorie:':<18} {daten.get('kategorie') or '–'}")
     if daten.get('serie'):
         print(f"   {'Serie:':<18} {serie_text(daten['serie'], daten['band'], daten.get('staffel'))}")
     if daten.get('beschreibung'):
@@ -1347,6 +1354,7 @@ def buchdaten_bearbeiten(daten):
             daten[feld] = {"band": band_normalisieren, "staffel": staffel_normalisieren}.get(feld, str)(neu)
     if not daten['serie']:
         daten['band'] = daten['staffel'] = ""
+    kategorie_abfragen(daten)
 
 
 def buch_speichern(isbn, daten, anzahl=1, nachgeladen=False):
@@ -1356,20 +1364,20 @@ def buch_speichern(isbn, daten, anzahl=1, nachgeladen=False):
         conn.execute('''
             INSERT INTO buecher
             (isbn, titel, autoren, autor_nachname, autor_formatiert, verlag, erscheinungsjahr, genre,
-             anzahl_gesamt, anzahl_verfuegbar, serie, band, staffel, beschreibung, cover_url, nachgeladen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             anzahl_gesamt, anzahl_verfuegbar, serie, band, staffel, beschreibung, cover_url, nachgeladen, kategorie)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             isbn, daten['titel'], daten['autoren'], sort_key, formatiert,
             daten['verlag'], daten['erscheinungsjahr'], daten['genre'], anzahl, anzahl,
             daten.get('serie', ''), daten.get('band', ''), daten.get('staffel', ''), daten.get('beschreibung', ''),
-            daten.get('cover_url', ''), int(nachgeladen),
+            daten.get('cover_url', ''), int(nachgeladen), daten.get('kategorie', ''),
         ))
     print(f"✨ NEU HINZUGEFÜGT: {daten['titel']} ({formatiert}) – {anzahl}x")
 
 
 def buch_aktualisieren(isbn, daten):
     """Speichert die bearbeitbaren Felder, die in 'daten' vorkommen."""
-    felder = [f for f, _ in BUCH_FELDER + SERIEN_FELDER if f in daten] + [f for f in ZUSATZ_FELDER if f in daten]
+    felder = [f for f, _ in BUCH_FELDER + SERIEN_FELDER if f in daten] + [f for f in ZUSATZ_FELDER + [KATEGORIE_FELD] if f in daten]
     werte = [daten[f] for f in felder]
     if "autoren" in daten:
         sort_key, formatiert = get_sort_name(daten['autoren'])
@@ -1384,7 +1392,7 @@ def lade_buch(isbn):
         cursor = conn.cursor()
         cursor.execute('''
             SELECT titel, autoren, verlag, erscheinungsjahr, genre, anzahl_gesamt, anzahl_verfuegbar,
-                   serie, band, beschreibung, cover_url, nachgeladen, staffel
+                   serie, band, beschreibung, cover_url, nachgeladen, staffel, kategorie
             FROM buecher WHERE isbn = ?
         ''', (isbn,))
         row = cursor.fetchone()
@@ -1395,6 +1403,7 @@ def lade_buch(isbn):
     daten['serie'], daten['band'], daten['beschreibung'], daten['cover_url'] = (w or "" for w in row[7:11])
     daten['nachgeladen'] = bool(row[11])
     daten['staffel'] = row[12] or ""
+    daten['kategorie'] = row[13] or ""
     return daten
 
 
@@ -1457,6 +1466,214 @@ def alle_nachladen(fortschritt=None, pause=0.5):
         if nr < len(isbns):
             time.sleep(pause)  # Online-Quellen nicht mit Anfragen überhäufen
     return len(isbns), ergaenzt
+
+
+# --- REGAL-KATEGORIEN ---
+# Eine kurze, feste Liste (z. B. 12 Kategorien einer Schulbücherei), aus der man beim Erfassen auswählt.
+# Die Liste steht in den Einstellungen und lässt sich im Tab „Regale“ ändern. Namen enthalten kein Komma,
+# weil Regale ihre Genres und Kategorien mit Komma getrennt speichern.
+KATEGORIEN_EINSTELLUNG = "regal_kategorien"
+KATEGORIE_MAX_LAENGE = 40
+STANDARD_KATEGORIEN = [
+    ("Freundschaft & Liebe", "#d6457f"),
+    ("Fantasy & Science-Fiction", "#7b4fd6"),
+    ("Abenteuer & Action", "#e07020"),
+    ("Krimi · Thriller · Grusel", "#4a4e69"),
+    ("Alltag & Erwachsenwerden", "#2f8fd6"),
+    ("Humor & Lustiges", "#d4a20f"),
+    ("Historische Romane", "#8a5a3b"),
+    ("Tiere & Natur", "#2e9d5b"),
+    ("Comics · Manga · Graphic Novels", "#d6402f"),
+    ("Klassiker & Weltliteratur", "#5a6b7d"),
+    ("Fremdsprachige Bücher", "#1b9a9a"),
+    ("Sachbücher & Lernen", "#5d8a2e"),
+]
+# Farben für neue Kategorien, die jemand selbst anlegt
+KATEGORIE_FARBEN = [f for _, f in STANDARD_KATEGORIEN]
+
+# Genre (klein geschrieben) -> Standard-Kategorie, für Vorschläge. Speziellere Muster zuerst:
+# „Liebesgeschichte“ ist Liebe, nicht Sachbuch; „Naturwissenschaften“ ist Sachbuch, nicht Natur.
+KATEGORIE_MUSTER = [
+    (r"comic|manga|graphic novel|bilder ?geschichte|cartoon", "Comics · Manga · Graphic Novels"),
+    (r"englisch|english|französisch|french|spanisch|spanish|italienisch|türkisch|russisch|arabisch|polnisch|"
+     r"ukrainisch|latein|fremdsprach|zweisprachig|bilingual", "Fremdsprachige Bücher"),
+    (r"krimi|thriller|detektiv|crime|mystery|horror|grusel|gespenst|geister|vampir|spannung", "Krimi · Thriller · Grusel"),
+    (r"fantasy|science.?fiction|sci-?fi|dystop|utopi|magie|zauber|drache|märchen|elfen", "Fantasy & Science-Fiction"),
+    (r"histori|mittelalter|krieg|nationalsozialismus|holocaust|antike|ritter", "Historische Romane"),
+    (r"humor|lustig|witz|satire|komisch|comedy", "Humor & Lustiges"),
+    (r"liebe|romance|romantik|freundschaft", "Freundschaft & Liebe"),
+    (r"naturwissenschaft", "Sachbücher & Lernen"),
+    (r"\btier|pferd|pony|hund|katze|natur|umwelt|dinosaurier|animal", "Tiere & Natur"),
+    (r"abenteuer|adventure|action|pirat|western|survival", "Abenteuer & Action"),
+    (r"alltag|erwachsen|coming.of.age|pubertät|familie|schulgeschichte|jugendroman", "Alltag & Erwachsenwerden"),
+    (r"klassiker|weltliteratur|^literatur$|lyrik|gedicht|^drama$|theater|novelle|ballade", "Klassiker & Weltliteratur"),
+    (r"sachbuch|wissen|lexikon|ratgeber|biogra|schulbuch|lern|übung|mathematik|^geschichte$|politik|wirtschaft|"
+     r"informatik|technik|kunst|musik|sport|religion|philosoph|psycholog|gesundheit|kochbuch|reisen|sprache|"
+     r"gesellschaft|pädagogik|recht|haushalt|garten|atlas|wörterbuch", "Sachbücher & Lernen"),
+]
+
+
+def kategorie_bereinigen(name):
+    """Leerzeichen zusammenfassen, Kommas entfernen (sie trennen Genres), Länge begrenzen."""
+    name = " ".join(str(name or "").replace(",", " ").split())
+    return name[:KATEGORIE_MAX_LAENGE].strip()
+
+
+def kategorien():
+    """Die Liste der Regal-Kategorien: [{"name": …, "farbe": "#rrggbb"}, …]. Noch nie gespeichert = Standardliste."""
+    text = get_einstellung(KATEGORIEN_EINSTELLUNG, "")
+    if not text:
+        return [{"name": n, "farbe": f} for n, f in STANDARD_KATEGORIEN]
+    try:
+        werte = json.loads(text)
+    except ValueError:
+        werte = None
+    if not isinstance(werte, list):
+        return [{"name": n, "farbe": f} for n, f in STANDARD_KATEGORIEN]
+    liste = []
+    for nr, k in enumerate(werte):
+        if isinstance(k, dict) and kategorie_bereinigen(k.get("name")):
+            farbe = str(k.get("farbe") or "")
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", farbe):
+                farbe = KATEGORIE_FARBEN[nr % len(KATEGORIE_FARBEN)]
+            liste.append({"name": kategorie_bereinigen(k["name"]), "farbe": farbe.lower()})
+    return liste
+
+
+def kategorie_namen():
+    return [k["name"] for k in kategorien()]
+
+
+def kategorie_finden(name, namen=None):
+    """Der Name, wie er in der Liste steht (Groß/Klein egal), sonst ""."""
+    klein = kategorie_bereinigen(name).lower()
+    return next((n for n in (namen if namen is not None else kategorie_namen()) if n.lower() == klein), "") if klein else ""
+
+
+def regal_genres(kategorie, genre):
+    """Genres, nach denen ein Buch einsortiert wird: zuerst die Regal-Kategorie, dann die eingetragenen Genres."""
+    kategorie = (kategorie or "").strip()
+    genres = genre_liste(genre)
+    if not kategorie:
+        return genres
+    return [kategorie] + [g for g in genres if g.lower() != kategorie.lower()]
+
+
+def kategorie_vorschlag(genres, namen=None):
+    """Passende Kategorie zu den Genres eines Buchs (das zuerst eingetragene Genre zählt zuerst), sonst ""."""
+    namen = namen if namen is not None else kategorie_namen()
+    for genre in genres:
+        direkt = kategorie_finden(genre, namen)
+        if direkt:
+            return direkt
+        klein = genre.strip().lower()
+        for muster, name in KATEGORIE_MUSTER:
+            if re.search(muster, klein):
+                treffer = kategorie_finden(name, namen)
+                if treffer:
+                    return treffer
+                break  # Die Standard-Kategorie gibt es nicht (mehr) – nicht in einer falschen landen
+    return ""
+
+
+def _genre_text_umbenennen(text, alt, neu):
+    liste = genre_liste(text)
+    return ", ".join(neu if g.lower() == alt.lower() else g for g in liste)
+
+
+def kategorien_speichern(liste):
+    """Speichert die Kategorien. liste = [{"name", "farbe", "alt"}]; "alt" = bisheriger Name: Bücher und
+    Regale mit dem alten Namen bekommen den neuen. Gelöschte Kategorien bleiben bei den Büchern stehen
+    (sie zählen dann wie ein Genre), bis man eine neue auswählt."""
+    neue, gesehen = [], set()
+    for nr, k in enumerate(liste):
+        name = kategorie_bereinigen(k.get("name"))
+        if not name:
+            continue
+        if name.lower() in gesehen:
+            raise ValueError(f"Die Kategorie „{name}“ steht doppelt in der Liste.")
+        gesehen.add(name.lower())
+        farbe = str(k.get("farbe") or "").lower()
+        if not re.fullmatch(r"#[0-9a-f]{6}", farbe):
+            farbe = KATEGORIE_FARBEN[nr % len(KATEGORIE_FARBEN)]
+        neue.append({"name": name, "farbe": farbe, "alt": kategorie_bereinigen(k.get("alt"))})
+    umbenannt = [(k["alt"], k["name"]) for k in neue if k["alt"] and k["alt"] != k["name"]]
+    with db_connection() as conn:
+        for alt, neu in umbenannt:
+            conn.execute("UPDATE buecher SET kategorie = ? WHERE kategorie = ? COLLATE NOCASE", (neu, alt))
+            for regal_id, genres, fach_genres in conn.execute("SELECT id, genres, fach_genres FROM regale").fetchall():
+                try:
+                    faecher = json.loads(fach_genres or "[]")
+                except ValueError:
+                    faecher = []
+                faecher = [_genre_text_umbenennen(g, alt, neu) if isinstance(g, str) else g for g in faecher] \
+                    if isinstance(faecher, list) else faecher
+                conn.execute("UPDATE regale SET genres = ?, fach_genres = ? WHERE id = ?",
+                             (_genre_text_umbenennen(genres, alt, neu),
+                              json.dumps(faecher, ensure_ascii=False) if fach_genres else fach_genres, regal_id))
+    set_einstellung(KATEGORIEN_EINSTELLUNG, json.dumps([{"name": k["name"], "farbe": k["farbe"]} for k in neue],
+                                                       ensure_ascii=False))
+    return kategorien()
+
+
+def kategorie_abfragen(daten):
+    """Terminal: Regal-Kategorie aus der Liste wählen ([ENTER] = Vorschlag behalten, '-' = keine)."""
+    namen = kategorie_namen()
+    if not namen:
+        return
+    print("   Regal-Kategorie:")
+    for nr, name in enumerate(namen, 1):
+        print(f"     {nr:>2}. {name}")
+    aktuell = daten.get('kategorie') or ""
+    wahl = input(f"   Nummer [{aktuell or 'keine'}] ('-' = keine): ").strip()
+    if wahl == "-":
+        daten['kategorie'] = ""
+    elif wahl.isdigit() and 1 <= int(wahl) <= len(namen):
+        daten['kategorie'] = namen[int(wahl) - 1]
+    elif wahl:
+        print("   ℹ️ Unbekannte Nummer – Kategorie bleibt unverändert.")
+
+
+def kategorie_zuordnung():
+    """Für Bücher ohne Regal-Kategorie: je zuerst eingetragenem Genre die Anzahl Bücher und ein Vorschlag."""
+    namen = kategorie_namen()
+    with db_connection() as conn:
+        rows = conn.execute("SELECT genre FROM buecher WHERE COALESCE(kategorie, '') = ''").fetchall()
+    gruppen = {}
+    for (genre,) in rows:
+        genres = genre_liste(genre)
+        erstes = genres[0] if genres else ""
+        g = gruppen.setdefault(erstes.lower(), {"genre": erstes, "anzahl": 0, "stimmen": {}})
+        g["anzahl"] += 1
+        # Passt das erste Genre zu nichts, entscheiden die übrigen Genres der Bücher (Mehrheit)
+        vorschlag = kategorie_vorschlag(genres, namen)
+        if vorschlag:
+            g["stimmen"][vorschlag] = g["stimmen"].get(vorschlag, 0) + 1
+    ergebnis = []
+    for g in gruppen.values():
+        direkt = kategorie_vorschlag([g["genre"]], namen) if g["genre"] else ""
+        mehrheit = max(g["stimmen"].items(), key=lambda x: x[1])[0] if g["stimmen"] else ""
+        ergebnis.append({"genre": g["genre"], "anzahl": g["anzahl"], "vorschlag": direkt or mehrheit})
+    ergebnis.sort(key=lambda g: (not g["genre"], -g["anzahl"], g["genre"].lower()))
+    return ergebnis
+
+
+def kategorien_zuordnen(zuordnung):
+    """zuordnung = {erstes Genre: Kategorie}. Gilt nur für Bücher, die noch keine Kategorie haben.
+    Liefert die Anzahl geänderter Bücher."""
+    namen = kategorie_namen()
+    regeln = {str(g).strip().lower(): kategorie_finden(k, namen) for g, k in zuordnung.items()}
+    regeln = {g: k for g, k in regeln.items() if k}
+    geaendert = 0
+    with db_connection() as conn:
+        rows = conn.execute("SELECT isbn, genre FROM buecher WHERE COALESCE(kategorie, '') = ''").fetchall()
+        for isbn, genre in rows:
+            genres = genre_liste(genre)
+            kategorie = regeln.get(genres[0].lower() if genres else "")
+            if kategorie:
+                conn.execute("UPDATE buecher SET kategorie = ? WHERE isbn = ?", (kategorie, isbn))
+                geaendert += 1
+    return geaendert
 
 
 # --- REGALE & STANDORTE ---
@@ -1674,15 +1891,17 @@ def regal_plan_berechnen():
     regale = lade_regale()
     with db_connection() as conn:
         rows = conn.execute('''
-            SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach, fest, staffel
+            SELECT isbn, titel, autor_formatiert, autor_nachname, genre, serie, band, anzahl_gesamt, regal_id, fach, fest, staffel,
+                   kategorie
             FROM buecher
         ''').fetchall()
     faecher_von = {r["id"]: r["faecher"] for r in regale}
     alle, buecher = [], []
-    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest, staffel in rows:
+    for isbn, titel, autor, nachname, genre, serie, band, anzahl, regal_id, fach, fest, staffel, kategorie in rows:
         b = {
             "isbn": isbn, "titel": titel or "", "autor": autor or "", "nachname": (nachname or "").lower(),
-            "genres": genre_liste(genre), "serie": (serie or "").strip(), "band": band or "", "staffel": staffel or "", "anzahl": anzahl or 1,
+            # Die Regal-Kategorie zählt wie ein erstes Genre: Ein Regal mit dieser Kategorie bekommt das Buch zuerst
+            "genres": regal_genres(kategorie, genre), "kategorie": (kategorie or "").strip(), "serie": (serie or "").strip(), "band": band or "", "staffel": staffel or "", "anzahl": anzahl or 1,
             "regal_id": regal_id if regal_id in faecher_von else None, "fach": fach, "soll": None,
         }
         b["ist"] = (b["regal_id"], fach) if b["regal_id"] and fach else None
@@ -2143,6 +2362,8 @@ def scan_and_add():
 
             zeige_buchdaten(daten)
             fehlende_felder_abfragen(daten)
+            if not daten.get('kategorie'):
+                kategorie_abfragen(daten)
 
             wahl = input("💾 [ENTER] = speichern, 'ä' = ändern, 'n' = verwerfen: ").strip().lower()
             if wahl == 'n':
@@ -2186,6 +2407,8 @@ def manuelle_eingabe(isbn=None):
     if daten['serie']:
         daten['staffel'] = staffel_normalisieren(input("   Staffel (leer = keine): ").strip())
         daten['band'] = band_normalisieren(input("   Band-Nummer: ").strip())
+    daten['kategorie'] = kategorie_vorschlag(genre_liste(daten['genre']))
+    kategorie_abfragen(daten)
     anzahl_input = input("   Anzahl Exemplare [1]: ").strip()
     anzahl = int(anzahl_input) if anzahl_input.isdigit() and int(anzahl_input) > 0 else 1
 
@@ -2274,7 +2497,7 @@ def manage_book():
 
         if wahl == "1":
             buchdaten_bearbeiten(daten)
-            buch_aktualisieren(isbn, {f: daten[f] for f, _ in BUCH_FELDER + SERIEN_FELDER})
+            buch_aktualisieren(isbn, {**{f: daten[f] for f, _ in BUCH_FELDER + SERIEN_FELDER}, KATEGORIE_FELD: daten["kategorie"]})
             print("✅ Buchdaten gespeichert!")
 
         elif wahl == "2":
@@ -2979,7 +3202,7 @@ def export_daten(typ):
     with db_connection() as conn:
         if typ == "katalog":
             zeilen = conn.execute('''
-                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, genre, serie, staffel, band, anzahl_gesamt, anzahl_verfuegbar
+                SELECT isbn, titel, autoren, verlag, erscheinungsjahr, kategorie, genre, serie, staffel, band, anzahl_gesamt, anzahl_verfuegbar
                 FROM buecher ORDER BY autor_nachname, titel
             ''').fetchall()
             orte = standorte()
@@ -2988,7 +3211,7 @@ def export_daten(typ):
                 text, _, geplant = orte.get(isbn, ("", None, False))
                 return f"{text} (geplant)" if text and geplant else text
             zeilen = [(*z, ort(z[0])) for z in zeilen]
-            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Genre", "Serie", "Staffel", "Band", "Exemplare", "Verfügbar",
+            return ["ISBN", "Titel", "Autor(en)", "Verlag", "Jahr", "Regal-Kategorie", "Genre", "Serie", "Staffel", "Band", "Exemplare", "Verfügbar",
                     "Standort"], zeilen
 
         sql = '''
