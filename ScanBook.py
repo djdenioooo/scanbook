@@ -28,7 +28,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.26.2"
+VERSION = "2.27.0"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -2081,6 +2081,36 @@ def buecher_freigeben(isbns):
     with db_connection() as conn:
         return sum(conn.execute("UPDATE buecher SET fest = 0, ziel_regal_id = NULL, ziel_fach = NULL "
                                 "WHERE isbn = ? AND (fest = 1 OR ziel_regal_id IS NOT NULL)", (isbn,)).rowcount
+                   for isbn in isbns)
+
+
+def buecher_hier_festlegen(isbns):
+    """Bücher bleiben in dem Fach, in dem ScanBook sie gerade zeigt. Steht ein Buch noch woanders
+    (gelb) oder ist es neu (grün), bleibt es bis zur Bestätigung „zu tun“ und ist danach festgelegt.
+    Liefert die Anzahl der Bücher, die einen Platz haben."""
+    plan = regal_plan()
+    geaendert = 0
+    with db_connection() as conn:
+        for isbn in isbns:
+            b = plan["buecher"].get(isbn)
+            if not b or not b["soll"]:
+                continue
+            if b["ist"] == b["soll"]:
+                conn.execute("UPDATE buecher SET fest = 1, ziel_regal_id = NULL, ziel_fach = NULL WHERE isbn = ?", (isbn,))
+            else:
+                conn.execute("UPDATE buecher SET ziel_regal_id = ?, ziel_fach = ? WHERE isbn = ?", (*b["soll"], isbn))
+            geaendert += 1
+    return geaendert
+
+
+def buecher_kategorie_setzen(isbns, kategorie):
+    """Gibt mehreren Büchern dieselbe Regal-Kategorie ("" = keine). Liefert die Anzahl."""
+    if kategorie:
+        kategorie = kategorie_finden(kategorie, kategorie_namen())
+        if not kategorie:
+            raise ValueError("Diese Kategorie gibt es nicht (mehr).")
+    with db_connection() as conn:
+        return sum(conn.execute("UPDATE buecher SET kategorie = ? WHERE isbn = ?", (kategorie or "", isbn)).rowcount
                    for isbn in isbns)
 
 

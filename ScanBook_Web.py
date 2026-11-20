@@ -710,9 +710,9 @@ def api_umstell_text(params):
 
 
 def api_buecher_eingeraeumt(body):
-    """Einzelne Bücher als eingeräumt bzw. umgestellt bestätigen."""
-    sb.buecher_eingeraeumt(isbn_liste(body))
-    return api_regale(None)
+    """Einzelne oder mehrere Bücher als eingeräumt bzw. umgestellt bestätigen."""
+    n = sb.buecher_eingeraeumt(isbn_liste(body))
+    return dict(api_regale(None), geaendert=n)
 
 
 def isbn_liste(body):
@@ -741,6 +741,21 @@ def api_buecher_festlegen(body):
 def api_buecher_freigeben(body):
     sb.buecher_freigeben(isbn_liste(body))
     return api_regale(None)
+
+
+def api_buecher_hier_festlegen(body):
+    """Ausgewählte Bücher bleiben fest in dem Fach, in dem sie gerade angezeigt werden."""
+    n = sb.buecher_hier_festlegen(isbn_liste(body))
+    return dict(api_regale(None), geaendert=n)
+
+
+def api_buecher_kategorie(body):
+    """Mehreren Büchern auf einmal dieselbe Regal-Kategorie geben."""
+    try:
+        n = sb.buecher_kategorie_setzen(isbn_liste(body), text(body, "kategorie"))
+    except ValueError as e:
+        raise ApiFehler(str(e))
+    return dict(api_regale(None), geaendert=n)
 
 
 def api_fach_scan(body):
@@ -1716,6 +1731,8 @@ POST_ROUTEN = {
     "einraeumen_bestaetigen": api_einraeumen_bestaetigen,
     "buecher_festlegen": api_buecher_festlegen,
     "buecher_freigeben": api_buecher_freigeben,
+    "buecher_hier_festlegen": api_buecher_hier_festlegen,
+    "buecher_kategorie": api_buecher_kategorie,
     "fach_scan": api_fach_scan,
     "regalliste_import": api_regalliste_import,
     "update_install": api_update_install,
@@ -2299,7 +2316,23 @@ dialog.breit { width: min(760px, calc(100vw - 32px)); }
 .buch-chip.treffer { box-shadow: inset 0 0 0 2px var(--accent); }
 .auswahl-leiste { position: sticky; bottom: 16px; z-index: 5; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
   margin-top: 14px; padding: 10px 14px; border-radius: 14px; background: var(--surface); box-shadow: 0 6px 24px rgba(0, 0, 0, .18), 0 0 0 .5px var(--border); }
+.auswahl-leiste { flex-direction: column; align-items: stretch; gap: 8px; }
+.aw-zeile { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.aw-zeile + .aw-zeile { border-top: .5px solid var(--border); padding-top: 8px; }
 .auswahl-leiste b { margin-right: auto; }
+.aw-label { color: var(--muted); font-size: 13px; min-width: 110px; }
+.fach-alle { display: none; }
+.waehlen .fach-alle { display: inline-flex; }
+.waehlen .fach-scan { display: none; }
+.aw-mehr { display: none; }
+@media (max-width: 860px) {
+  /* Auf dem Handy nur die wichtigsten Knöpfe, Verschieben und Kategorie hinter „Mehr“ */
+  .aw-mehr { display: inline-flex; }
+  .auswahl-leiste:not(.offen) .aw-extra { display: none; }
+  .aw-label { min-width: 0; width: 100%; }
+  .auswahl-leiste .fach-wahl { flex-wrap: nowrap; }
+  .auswahl-leiste select { min-width: 0; }
+}
 @media (max-width: 860px) { .auswahl-leiste { bottom: calc(72px + env(safe-area-inset-bottom)); } }
 .fach-wahl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 /* Regal-Kategorien: Farbpunkt vor dem Namen, Auswahlfeld mit Punkt */
@@ -2545,7 +2578,7 @@ td.titel-zelle { min-width: 220px; }
       <div class="row">
         <h2 class="grow" style="margin:0">Regale</h2>
         <button class="btn secondary" type="button" id="regale-drucken">Als Liste drucken</button>
-        <button class="btn secondary" type="button" id="regal-waehlen" title="Bücher auswählen und selbst in ein anderes Fach stellen">Verschieben</button>
+        <button class="btn secondary" type="button" id="regal-waehlen" title="Mehrere Bücher antippen und dann für alle auf einmal etwas ändern">Mehrere auswählen</button>
         <button class="btn secondary" type="button" id="regal-scan" title="Fach wählen und die Bücher scannen, die dort stehen sollen">Per Scan einräumen</button>
         <button class="btn" type="button" id="regal-neu">Regal hinzufügen</button>
       </div>
@@ -2557,11 +2590,28 @@ td.titel-zelle { min-width: 220px; }
       <div class="legende"><span><span class="buch-chip neu">Titel</span> neu einräumen</span><span><span class="buch-chip umstellen">Titel</span> umstellen</span><span><span class="buch-chip fest">Titel</span> selbst festgelegt, bleibt in diesem Fach</span><span>Grüne und gelbe Bücher antippen, sobald sie an ihrem Platz stehen.</span></div>
       <div id="regale-liste"></div>
       <div class="auswahl-leiste hidden" id="auswahl-leiste">
-        <b id="auswahl-zahl">Bücher antippen, um sie auszuwählen</b>
-        <span class="fach-wahl"><select id="aw-regal" aria-label="Regal"></select><select id="aw-fach" aria-label="Fach"></select></span>
-        <button class="btn small" type="button" id="aw-verschieben">Hierhin stellen</button>
-        <button class="btn small secondary" type="button" id="aw-freigeben" title="ScanBook sortiert diese Bücher wieder selbst ein">Wieder automatisch</button>
-        <button class="btn small secondary" type="button" id="aw-ende">Fertig</button>
+        <div class="aw-zeile">
+          <b id="auswahl-zahl">Bücher antippen, um sie auszuwählen</b>
+          <button class="btn small secondary" type="button" id="aw-alle" title="Alle Bücher auswählen, die gerade zu sehen sind (z. B. nach einer Suche)">Alle sichtbaren</button>
+          <button class="btn small secondary" type="button" id="aw-keine">Keine</button>
+          <button class="btn small secondary" type="button" id="aw-ende">Fertig</button>
+        </div>
+        <div class="aw-zeile aw-aktionen">
+          <button class="btn small" type="button" id="aw-eingeraeumt" title="Die Bücher stehen jetzt an ihrem Platz (grün/gelb wird normal)">✓ Steht drin</button>
+          <button class="btn small secondary" type="button" id="aw-fest" title="Die Bücher bleiben in dem Fach, in dem sie gerade angezeigt werden">📌 Fest an diesem Platz</button>
+          <button class="btn small secondary" type="button" id="aw-freigeben" title="ScanBook sortiert diese Bücher wieder selbst ein">↺ Automatisch</button>
+          <button class="btn small secondary aw-mehr" type="button" id="aw-mehr" aria-expanded="false">Mehr ▾</button>
+        </div>
+        <div class="aw-zeile aw-extra">
+          <span class="aw-label">Verschieben nach</span>
+          <span class="fach-wahl"><select id="aw-regal" aria-label="Regal"></select><select id="aw-fach" aria-label="Fach"></select></span>
+          <button class="btn small" type="button" id="aw-verschieben">Hierhin stellen</button>
+        </div>
+        <div class="aw-zeile aw-extra">
+          <span class="aw-label">Regal-Kategorie</span>
+          <select id="aw-kat" aria-label="Regal-Kategorie für die ausgewählten Bücher"></select>
+          <button class="btn small secondary" type="button" id="aw-kat-setzen">Ändern</button>
+        </div>
       </div>
     </div>
     <div class="card hidden" id="ohne-platz">
@@ -4250,6 +4300,7 @@ function zeichneRegale(d) {
     const alle = new Set(d.regale.flatMap((r) => r.inhalt.flat().map((b) => b.isbn)));
     for (const isbn of auswahl) if (!alle.has(isbn)) auswahl.delete(isbn);
     fachAuswahl($("#aw-regal"), $("#aw-fach"), d.regale);
+    awKategorienFuellen();
     zeigeAuswahl();
   }
   $("#regale-liste").innerHTML = anzahl ? d.regale.map((r, i) => {
@@ -4278,7 +4329,8 @@ function zeichneRegale(d) {
           ? html.replace('class="buch-chip ', 'class="buch-chip treffer ') : html;
       };
       return `<div class="fach ${genreTreffer ? "treffer" : ""}"><div class="fach-nr">Fach ${f + 1}<span class="sub">${n}/${kap}</span>${genres.length ? `<span class="fach-genre ${eigene.length ? "" : "geerbt"}">${genresMitFarbe(genres, "<br>")}</span>` : ""}
-          <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button></div>
+          <button class="btn small secondary fach-scan" type="button" data-scan-regal="${r.id}" data-scan-fach="${f + 1}" title="Bücher scannen, die in dieses Fach sollen">Scannen</button>
+          ${fach.length ? `<button class="btn small secondary fach-alle" type="button" data-alle-regal="${r.id}" data-alle-fach="${f}" title="Alle Bücher in diesem Fach auswählen bzw. abwählen">Ganzes Fach</button>` : ""}</div>
         <div><div class="balken ${n >= kap ? "voll" : ""}"><div style="width:${Math.min(100, Math.round(100 * n / kap))}%"></div></div>
         <div class="fach-buecher">${fach.map(chip).join("") || `<span class="sub" style="color:var(--muted)">leer</span>`}</div></div></div>`;
     }).join("");
@@ -4505,8 +4557,50 @@ $("#zuordnung-form").addEventListener("submit", (e) => {
 function zeigeAuswahl() {
   const n = auswahl.size;
   $("#auswahl-zahl").textContent = n ? `${n} ${n === 1 ? "Buch" : "Bücher"} ausgewählt` : "Bücher antippen, um sie auszuwählen";
-  $("#aw-verschieben").disabled = $("#aw-freigeben").disabled = !n;
+  ["#aw-verschieben", "#aw-freigeben", "#aw-eingeraeumt", "#aw-fest", "#aw-kat-setzen", "#aw-keine"].forEach((id) => { $(id).disabled = !n; });
 }
+const buecherText = (n) => `${n} ${n === 1 ? "Buch" : "Bücher"}`;
+// Auswahl ändern und die Chips neu markieren, ohne die Regale neu zu zeichnen
+function markiereAuswahl() {
+  $("#regale-liste").querySelectorAll(".buch-chip[data-isbn]").forEach((c) => c.classList.toggle("gewaehlt", auswahl.has(c.dataset.isbn)));
+  zeigeAuswahl();
+}
+function awKategorienFuellen() {
+  const sel = $("#aw-kat"), alt = sel.value;
+  sel.innerHTML = `<option value="">Keine Kategorie</option>` +
+    (regalDaten.kategorien || []).map((k) => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("");
+  if ([...sel.options].some((o) => o.value === alt)) sel.value = alt;
+}
+$("#aw-alle").addEventListener("click", () => {
+  $("#regale-liste").querySelectorAll(".buch-chip[data-isbn]").forEach((c) => auswahl.add(c.dataset.isbn));
+  markiereAuswahl();
+});
+$("#aw-keine").addEventListener("click", () => { auswahl.clear(); markiereAuswahl(); });
+$("#aw-mehr").addEventListener("click", () => {
+  const offen = $("#auswahl-leiste").classList.toggle("offen");
+  $("#aw-mehr").textContent = offen ? "Weniger ▴" : "Mehr ▾";
+  $("#aw-mehr").setAttribute("aria-expanded", offen);
+});
+$("#aw-eingeraeumt").addEventListener("click", () => versuche(async () => {
+  const d = await post("buecher_eingeraeumt", { isbns: [...auswahl] });
+  auswahl.clear();
+  zeichneRegale(d);
+  toast(d.geaendert ? `✓ ${buecherText(d.geaendert)} als eingeräumt gespeichert` : "Die Bücher standen schon an ihrem Platz");
+}));
+$("#aw-fest").addEventListener("click", () => versuche(async () => {
+  const d = await post("buecher_hier_festlegen", { isbns: [...auswahl] });
+  auswahl.clear();
+  zeichneRegale(d);
+  toast(`📌 ${buecherText(d.geaendert)} bleiben jetzt fest in ihrem Fach`);
+}));
+$("#aw-kat-setzen").addEventListener("click", () => versuche(async () => {
+  const kat = $("#aw-kat").value;
+  const d = await post("buecher_kategorie", { isbns: [...auswahl], kategorie: kat });
+  auswahl.clear();
+  zeichneRegale(d);
+  katalogGeladen = false;
+  toast(`${buecherText(d.geaendert)}: Regal-Kategorie ${kat ? `„${kat}“` : "entfernt"}`);
+}));
 $("#regal-waehlen").addEventListener("click", () => {
   waehlen = !waehlen;
   auswahl.clear();
@@ -4650,6 +4744,12 @@ $("#regale-liste").addEventListener("click", (e) => {
     return zeigeAuswahl();
   }
   if (d.isbn) return e.target.matches(".neu, .umstellen") ? fragEingeraeumt(d.isbn) : oeffneVorschau(d.isbn);
+  if (d.alleRegal) {
+    const fach = regalDaten.regale.find((r) => r.id === Number(d.alleRegal)).inhalt[Number(d.alleFach)];
+    const alleDrin = fach.every((b) => auswahl.has(b.isbn));
+    fach.forEach((b) => (alleDrin ? auswahl.delete(b.isbn) : auswahl.add(b.isbn)));
+    return markiereAuswahl();
+  }
   if (d.scanRegal) return oeffneFachScan(Number(d.scanRegal), Number(d.scanFach));
   if (d.drucken) return drucken("regale", { regal: d.drucken });
   if (d.bearbeiten) return oeffneRegal(regalDaten.regale.find((r) => r.id === Number(d.bearbeiten)));
