@@ -28,7 +28,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 # 🏷️ PROGRAMMVERSION – bei jeder neuen Version auf GitHub erhöhen, sonst wird kein Update erkannt!
-VERSION = "2.26.1"
+VERSION = "2.26.2"
 
 # 🔑 OPTIONAL: GOOGLE API KEY ALS UMGEBUNGSVARIABLE SETZEN (ohne Schlüssel gibt es weniger Abfragen pro Tag).
 # Keinen Schlüssel hier eintragen – die Datei ist öffentlich auf GitHub!
@@ -1965,18 +1965,29 @@ def regal_plan_berechnen():
         bereich = bereich_fuer(regal, b)
         return bereich is not None and bool(bereich["genres"])
 
+    def ohne_kategorie(regal):
+        """Regal ohne jede Kategorie/Genres (auch in keinem Fach): nimmt wirklich alle übrigen Bücher."""
+        return not regal["bereiche"] and regal["rest"] is not None and not regal["rest"]["genres"]
+
+    def nimmt_ueberlauf(regal, b):
+        """Bücher, deren passendes Regal voll ist, kommen nur in ein Regal, das über ein Genre passt, oder in ein
+        Regal ganz ohne Kategorie – nicht in die freien Fächer eines Regals mit einer anderen Kategorie."""
+        return genau_passend(regal, b) or ohne_kategorie(regal)
+
     def erstes_regal(b):
         # Das Regal für das zuerst eingetragene Genre; bei gleichem Genre das vordere Regal
         passend = [(rang(bereich_fuer(regal, b)["genres"], b), nr) for nr, regal in enumerate(regale) if genau_passend(regal, b)]
         if passend:
             return min(passend)[1]
-        return next((nr for nr, regal in enumerate(regale) if nimmt_auf(regal, b)), None)
+        # Kein passendes Regal: lieber ein Regal ganz ohne Kategorie als freie Fächer in einem Kategorie-Regal
+        return next((nr for nr, regal in enumerate(regale) if ohne_kategorie(regal)),
+                    next((nr for nr, regal in enumerate(regale) if nimmt_auf(regal, b)), None))
 
     zuordnung = {b["isbn"]: erstes_regal(b) for b in buecher}
     uebrig = []
     for nr, regal in enumerate(regale):
-        hierher = [b for b in buecher if zuordnung[b["isbn"]] == nr] + [b for b in uebrig if nimmt_auf(regal, b)]
-        uebrig = [b for b in uebrig if not nimmt_auf(regal, b)]
+        hierher = [b for b in buecher if zuordnung[b["isbn"]] == nr] + [b for b in uebrig if nimmt_ueberlauf(regal, b)]
+        uebrig = [b for b in uebrig if not nimmt_ueberlauf(regal, b)]
         je_bereich = {}
         for b in hierher:
             je_bereich.setdefault(id(bereich_fuer(regal, b)), []).append(b)
